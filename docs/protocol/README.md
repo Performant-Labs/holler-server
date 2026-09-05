@@ -1,6 +1,6 @@
 # Protocols Holler uses
 
-**This page is the single index.** Specs live here or at the linked external document. ADRs decide *why*; this page lists *what is on which wire*.
+**This page is the single index.** Specs live here or at the linked external document. ADRs decide *why*; this page lists *what is on which wire*. How the hops fit together: [talk.md](talk.md).
 
 GitHub copy: [#39](https://github.com/Performant-Labs/holler-server/issues/39).
 
@@ -21,6 +21,8 @@ Holler does **not** invent a cipher, does **not** speak MCP on the circuit, and 
 There is no Holler v0. ACP v2 is a **draft**; do not pin it (ADR 0012).
 
 ## What each protocol is for
+
+See **[How server and client talk](talk.md)** for interrupt and `say` (including the hop diagram).
 
 ```
 meta-O --CLI--> holler-server  <== Holler v1 / wss ==>  holler-client
