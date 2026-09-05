@@ -16,3 +16,13 @@ path = "src/lib.rs"
 [[test]]
 name = "wire_selftest"
 path = "tests/wire/selftest.rs"
+
+# Issue #28: the protocol v1 codec test (auto-discoverable, pinned here
+# for consistency with the canary).
+[[test]]
+name = "proto_test"
+path = "tests/proto_test.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

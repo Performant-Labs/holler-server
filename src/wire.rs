@@ -1,4 +1,4 @@
-//! Placeholder module for the wire protocol (issue #28).
+//! Placeholder module for the wire layer (issue #28).
 //!
-//! The canary (issue #41) only needs `cargo test` to work;
-//! the real protocol types land with #28.
+//! Transport concerns (WebSocket frame I/O, reconnection) live here.
+//! The typed protocol envelope + JSON codec lives in [`crate::proto`].
