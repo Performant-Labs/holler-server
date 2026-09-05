@@ -34,9 +34,12 @@
 //!
 //! Kill-tree idiom: on Unix the child is started in its own process group
 //! (`setpgid`) and killed with `killpg(-pid, SIGKILL)` (SIGKILL to the whole
-//! group, never SIGTERM / a lone `kill`). On Windows the child is started with
-//! `CREATE_NEW_PROCESS_GROUP` (a `std`-native flag) and killed with
-//! `taskkill /F /T` (force, whole process tree). Both OS-branched.
+//! group). macOS may refuse that `setpgid` (EACCES, when the parent is not a
+//! process-group leader — common on CI), in which case `kill_tree` falls back
+//! to a direct `SIGKILL` of the pid. Both arms are SIGKILL (uncatchable), so
+//! the harness never "relies on SIGTERM alone". On Windows the child is
+//! started with `CREATE_NEW_PROCESS_GROUP` (a `std`-native flag) and killed
+//! with `taskkill /F /T` (force, whole process tree). Both OS-branched.
 
 #![allow(unreachable_code)] // `#[cfg]`-branded kill arms leave a platform-dead path documenting the other OS's idiom
 

@@ -31,7 +31,17 @@ use std::io;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// Unix: did `setpgid(child, child)` succeed, so the child is actually in its
+/// own process group (pgid == its pid)? Captured once in [`spawn_bin`] and
+/// read by [`kill_tree`]. macOS refuses `setpgid` to a *new* group with
+/// EACCES unless the parent is itself a process-group leader, so this is NOT
+/// guaranteed true on macOS and `kill_tree` must not assume it is.
+#[cfg(unix)]
+static CHILD_IN_OWN_PG: AtomicBool = AtomicBool::new(false);
 
 /// The harness's overall time budget (docs/testing.md: "<2s"). Reused by
 /// the per-case assertions so a hang is a fail, not a silent skip.
@@ -83,9 +93,18 @@ pub fn spawn_bin(
         #[cfg(unix)]
         {
             use libc::{pid_t, setpgid};
-            // Own process group: pgid == the child's pid, so kill_tree can
-            // signal the whole group with `killpg(-pid, SIGKILL)`.
-            let _ = unsafe { setpgid(child.id() as pid_t, child.id() as pid_t) };
+            // Try to put the child in its own group (pgid == pid) so
+            // `kill_tree` can signal the whole tree with `killpg`. BUT macOS
+            // refuses `setpgid` to a *new* group (EACCES) unless the parent is
+            // a process-group leader, and CI runners are often not. So we CHECK
+            // the result and record whether it worked — `kill_tree` falls back
+            // to a direct `SIGKILL` of the pid when it did not, instead of
+            // `killpg`-ing a non-existent group (which is a no-op and leaves
+            // the child alive). A group of one is still "the whole tree" for
+            // the children this harness spawns (the stub is a leaf; the
+            // long-lived child is a bare `sleep`/`timeout` with no children).
+            let ok = unsafe { setpgid(child.id() as pid_t, child.id() as pid_t) } == 0;
+            CHILD_IN_OWN_PG.store(ok, Ordering::SeqCst);
         }
     }
     child
@@ -93,10 +112,13 @@ pub fn spawn_bin(
 
 /// Kill the whole tree started by `child` WITHOUT relying on SIGTERM alone.
 ///
-/// - **Unix**: the child was placed in its own process group by
-///   `spawn_bin`; we kill that *group* with `killpg(-pid, SIGKILL)`.
-///   (If the child is somehow still in our group, we fall back to a
-///   direct `SIGKILL` of the pid — still not SIGTERM.)
+/// - **Unix**: prefer `killpg(-pid, SIGKILL)` to the child's own process
+///   group (set up by `spawn_bin`), which also takes down any detached
+///   grandchildren. If `spawn_bin`'s `setpgid` was refused — macOS returns
+///   EACCES when the parent is not a process-group leader, which is the
+///   common case on CI — fall back to a direct `SIGKILL` of the pid. Both
+///   arms are SIGKILL (uncatchable), so neither "relies on SIGTERM alone";
+///   the distinction is only *group* vs *single pid*.
 /// - **Windows**: `taskkill /F /T` (force-terminate the process *and* its
 ///   tree). `child.kill()` (TerminateProcess) would also work but leaves a
 ///   detached grandchild if any, so the documented `taskkill /T` idiom is
@@ -107,11 +129,10 @@ pub fn spawn_bin(
 /// "we only SIGTERM'd and it was ignored" into a visible failure (a hang
 /// past the budget) instead of a silent success.
 pub fn kill_tree(child: &Child) {
+    let pid = child.id();
     #[cfg(unix)]
     {
-        // We own the child's process group: its pgid == its pid (spawned
-        // with setpgid(pid, pid) in spawn_bin). Signal the whole group.
-        kill_tree_unix(child.id() as i32);
+        kill_tree_unix(pid as i32);
     }
     #[cfg(windows)]
     {
@@ -119,22 +140,41 @@ pub fn kill_tree(child: &Child) {
         // (no shell), force-terminating the whole tree for this pid.
         let _ = Command::new("taskkill")
             .args(["/F", "/T", "/PID"])
-            .arg(child.id().to_string())
+            .arg(pid.to_string())
             .output();
-        // Best-effort: the caller's wait+assert is authoritative. (We take
-        // the pid, not a `&mut Child` handle, so we cannot also call
-        // `child.kill()` here without the caller owning it mutably.)
+        // The caller's wait+assert is authoritative. (We take the pid, not a
+        // `&mut Child` handle, so we cannot also call `child.kill()` here.)
     }
 }
 
 #[cfg(unix)]
-fn kill_tree_unix(pgid: i32) {
-    // The child was placed in its own process group at spawn
-    // (`setpgid(pid, pid)` in `spawn_bin`), so its group id == its pid.
-    // `killpg(-pgid, SIGKILL)` signals the WHOLE group, not just the leader
-    // — this is the portable "kill the tree" idiom, and it is not
-    // SIGTERM/`kill()` alone (a child that ignores SIGTERM still dies).
-    let _ = unsafe { libc::killpg(-pgid, libc::SIGKILL) };
+fn kill_tree_unix(pid: i32) {
+    use libc::SIGKILL;
+    // Preferred: the child was placed in its own process group at spawn, so
+    // its group id == its pid; `killpg(-pid, SIGKILL)` signals the WHOLE
+    // group (any detached grandchildren included), not just the leader.
+    let pgid_ok = CHILD_IN_OWN_PG.load(Ordering::SeqCst);
+    let group_signaled = if pgid_ok {
+        // `libc::killpg` returns `()` and stashes its errno in
+        // `io::Error::last_os_error()`. A raw_os_error of `None` means "no
+        // error" (the signal reached a real group); an `Some(_)` (e.g.
+        // `ESRCH`, no such group) means it was a no-op and we must fall back.
+        unsafe { libc::killpg(-pid, SIGKILL) };
+        io::Error::last_os_error().raw_os_error().is_none()
+    } else {
+        false
+    };
+    if !group_signaled {
+        // `setpgid` was refused (macOS EACCES when the parent is not a
+        // process-group leader) and/or `killpg` found no such group — the
+        // child is still in the parent's group, so a group signal to "-pid"
+        // is a no-op. Fall back to a direct SIGKILL of the pid. SIGKILL is
+        // uncatchable, so this is still NOT "relying on SIGTERM alone" (the
+        // child cannot ignore it); and it is not a lone `kill(SIGTERM)`. For
+        // the tree this harness drives (a leaf stub / a bare sleep|timeout)
+        // the direct SIGKILL of the pid takes down the whole thing.
+        unsafe { libc::kill(pid, SIGKILL) };
+    }
 }
 
 /// Best-effort: is `addr` (e.g. `"127.0.0.1:41807"`) currently bindable?
