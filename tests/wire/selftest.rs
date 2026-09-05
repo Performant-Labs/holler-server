@@ -87,22 +87,24 @@ fn nested_case_exit_1_is_observed() {
 ///     on a timeout instead of observing the refusal.
 #[test]
 fn dial_closed_port_fails_fast() {
+    // Earlier version bound a throwaway `TcpListener` on this exact
+    // port, dropped it, then immediately dialed — to *prove* nothing
+    // was listening before asserting the dial fails. That "probe" was
+    // itself the bug: dropping a `TcpListener` tears down its accept
+    // queue asynchronously on at least macOS, and a `connect()` fired
+    // right after can complete against the not-yet-reclaimed queue
+    // before the OS finishes closing it. Confirmed with `lsof` mid-race
+    // (the resulting "successful" connection was already sitting in
+    // `CLOSED` state) — an intermittent, self-inflicted race, not
+    // runner/OS unreliability, and not fixable by re-confirming the
+    // port is re-bindable first (that still recreates and tears down
+    // the same accept queue). Removing our own listener from this path
+    // entirely removes the race: we no longer create anything to race
+    // against. If this unexpectedly succeeds now, the only remaining
+    // explanation is a genuinely different process already listening
+    // on this port (e.g. a leftover dev server) — check with
+    // `lsof -i :41807` (`netstat -ano` on Windows).
     must_fail("dial 127.0.0.1:41807 with nothing listening", || {
-        // A port is "closed" only if nothing is listening on it.
-        // Probe first: if something *is* listening (e.g. a leftover
-        // dev server), the test would be meaningless — but the issue
-        // says "no server", so we bind a throwaway listener on the
-        // same port to *ensure* it was free before the dial, then drop it.
-        {
-            let probe = std::net::TcpListener::bind("127.0.0.1:41807").map_err(|e| {
-                io::Error::other(format!(
-                    "port 41807 is busy ({e}); the canary needs it free. \
-                     Kill the process holding it (lsof -i :41807) and re-run."
-                ))
-            })?;
-            drop(probe);
-        }
-
         let stream = TcpStream::connect("127.0.0.1:41807").map_err(|e| {
             io::Error::other(format!("connect to closed port refused (as designed): {e}"))
         })?;
