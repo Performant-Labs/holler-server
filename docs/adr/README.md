@@ -9,7 +9,7 @@ Architecture decision records for holler-server.
 | 0001 | #2 | Talk circuit, not a multiplexer |
 | 0002 | #3 | Remote body is holler-client, not Herdr |
 | 0003 | #4 | Join token, then a client credential |
-| 0004 | #5 | WebSocket transport; Tailscale is not the app protocol |
+| 0004 | #5 | WebSocket transport; listen port 41807 |
 | 0005 | #6 | Interrupt is a control frame; the session survives |
 | 0006 | #7 | Presence is status |
 | 0007 | #8 | Address sessions, not hosts |
