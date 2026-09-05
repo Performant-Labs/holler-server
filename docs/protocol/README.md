@@ -2,7 +2,7 @@
 
 **This page is the single index.** Specs live here or at the linked external document. ADRs decide *why*; this page lists *what is on which wire*.
 
-GitHub copy: the **protocol index** issue on this repo (search title “Protocol index”).
+GitHub copy: [#39](https://github.com/Performant-Labs/holler-server/issues/39).
 
 Holler does **not** invent a cipher, does **not** speak MCP on the circuit, and does **not** use IETF RFC 8994 (a different “ACP”).
 
