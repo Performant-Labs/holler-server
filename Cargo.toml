@@ -33,6 +33,11 @@ path = "tests/proto_test.rs"
 name = "stub-acp"
 path = "tests/wire/stub_acp.rs"
 
+# Issue #29: first CLI entry point in this crate (`holler token ...`).
+[[bin]]
+name = "holler"
+path = "src/main.rs"
+
 # Issue #40: the OS-portable process harness scaffold (the #31 e2e slots
 # into this). Nested under tests/wire/, so it is not auto-discovered — pin
 # it so `cargo test` runs it.
@@ -43,6 +48,24 @@ path = "tests/wire/first_talk.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Issue #29: first CLI entry point in this crate (`holler token ...`).
+# clap's derive API scales cleanly to the sibling subcommands #35 adds
+# later (status/support/roster/say) without restructuring this shape.
+clap = { version = "4", features = ["derive"] }
+# Issue #29 (ADR 0010): CSPRNG for the 256-bit join secret and token_id.
+# Lower-level than the `rand` crate (no RNG-trait ceremony) since all we
+# need is raw OS entropy.
+getrandom = "0.2"
+# Issue #29 (ADR 0010): HMAC-SHA-256(pepper, secret) at rest.
+hmac = "0.12"
+sha2 = "0.10"
+# Issue #29: real timestamp arithmetic for TTL/expires/last_seen (unlike
+# the wire codec's opaque, never-parsed `ts` — this genuinely needs to
+# compute and compare RFC3339 instants). `time` chosen over `chrono` for
+# its smaller dependency footprint; only the `formatting`/`parsing`
+# features are enabled (no `local-offset`, which is unsound in
+# multi-threaded processes and unneeded since everything here is UTC).
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 
 # Test-only dependencies. `libc` is used by the first_talk harness to kill
 # a child's whole process group on Unix (`setpgid` at spawn, `killpg` +
@@ -50,3 +73,4 @@ serde_json = "1"
 # idiom. Not needed by the stub (serde_json covers it) or the lib.
 [dev-dependencies]
 libc = "0.2"
+tempfile = "3"
