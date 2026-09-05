@@ -4,7 +4,7 @@ How to set up a machine to **work on** Holler (server + client), not how to run 
 
 Holler is two processes and a CLI. There is no web UI. You do **not** need Playwright, Herdr on the client box, Tailscale, or IPv6.
 
-**Language is Rust** (edition 2021+, `cargo`). Tokio for async, rustls for TLS, official ACP crate [`agent-client-protocol`](https://github.com/agentclientprotocol/rust-sdk) on the body hop. Pin ACP **v1** types, not the v2 draft.
+**Language is Rust** ([ADR 0013](adr/ADR-0013.md)): we want the **official ACP** SDK. Edition 2021+, `cargo`. Tokio, rustls, crate [`agent-client-protocol`](https://github.com/agentclientprotocol/rust-sdk) on the body hop. Pin ACP **v1** types, not the v2 draft.
 
 ## What you need
 
