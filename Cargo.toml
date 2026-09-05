@@ -23,6 +23,30 @@ path = "tests/wire/selftest.rs"
 name = "proto_test"
 path = "tests/proto_test.rs"
 
+# Issue #40: the ACP stub (ADR 0012: a tiny fake agent speaking ACP v1 /
+# JSON-RPC 2.0 over stdio). Pinned like the tests above because it lives
+# under tests/wire/, not src/, so it is not auto-discovered. Builds to
+# `stub-acp` (cargo appends `.exe` on Windows). The harness
+# (tests/wire/first_talk.rs) locates the built binary and spawns it
+# directly — no `CARGO_BIN_EXE_stub_acp` (see common/mod.rs for why).
+[[bin]]
+name = "stub-acp"
+path = "tests/wire/stub_acp.rs"
+
+# Issue #40: the OS-portable process harness scaffold (the #31 e2e slots
+# into this). Nested under tests/wire/, so it is not auto-discovered — pin
+# it so `cargo test` runs it.
+[[test]]
+name = "first_talk"
+path = "tests/wire/first_talk.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Test-only dependencies. `libc` is used by the first_talk harness to kill
+# a child's whole process group on Unix (`setpgid` at spawn, `killpg` +
+# `SIGKILL` at kill) — the portable "kill the tree, not just SIGTERM"
+# idiom. Not needed by the stub (serde_json covers it) or the lib.
+[dev-dependencies]
+libc = "0.2"
