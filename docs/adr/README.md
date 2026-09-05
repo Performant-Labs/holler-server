@@ -14,6 +14,7 @@ Architecture decision records for holler-server.
 | 0006 | #7 | Presence is status |
 | 0007 | #8 | Address sessions, not hosts |
 | 0008 | #9 | v1 body is OpenCode via ACP |
-| 0009–0025 | #10–#26 | reserved |
+| 0009 | #10 | Protocol is Holler v1 |
+| 0010–0025 | #11–#26 | reserved |
 
 Issue #1 is the project brief, not an ADR.
