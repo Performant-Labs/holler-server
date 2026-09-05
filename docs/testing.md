@@ -13,9 +13,11 @@ A **process-level wire harness** that uses the **same WebSocket path as producti
 | **ACP stub** | Tiny fake agent on **stdio** (ACP v1): `session/prompt` → canned `session/update`; `session/cancel` → turn ends. Not OpenCode. |
 | Runner | Spawns the three, drives `holler … --json`, asserts stdout |
 
-That is the e2e analogue: **subprocess + JSON assertions**, in the repo’s normal test runner (Go `testing`, pytest, etc.). Not Playwright, not Cypress, not a browser WebSocket client.
+That is the e2e analogue: **`cargo test` + subprocess + JSON assertions**. Not Playwright, not Cypress, not a browser WebSocket client.
 
-**Must pass on Linux, macOS, and Windows.** The required harness is TCP **`127.0.0.1:41807`** + process stdio — not bash, not Unix sockets, not `#!/bin/sh` as the only runner. Bind **`127.0.0.1`**, not `localhost` (`localhost` is often `::1` on Windows while the default listen is IPv4). Spawn via the language’s process API (`os/exec`, `subprocess`, …). On Windows the stub is `stub-acp.exe`. Kill the tree without relying on `SIGTERM` alone. A Unix-only bats extra is optional and **not** the required e2e.
+**Language is Rust.** Spawn with `std::process::Command` / `tokio::process`. On Windows the stub is `stub-acp.exe`. Kill the tree without relying on `SIGTERM` alone.
+
+**Must pass on Linux, macOS, and Windows.** The required harness is TCP **`127.0.0.1:41807`** + process stdio — not bash, not Unix sockets, not `#!/bin/sh` as the only runner. Bind **`127.0.0.1`**, not `localhost` (`localhost` is often `::1` on Windows while the default listen is IPv4). A Unix-only bats extra is optional and **not** the required e2e.
 
 IPv6: optional extra case `--listen [::1]:41807` and `ws://[::1]:41807`. **Skip** if `::1` is not available. Do not fail the required matrix when IPv6 is off.
 
@@ -40,7 +42,7 @@ If this is green while broken, later e2e is theater.
 - Dial `127.0.0.1:41807` with **no server**: must fail fast, not hang.
 - Linux, macOS, Windows. Not Playwright.
 
-Lives in `tests/wire/selftest/` (or equivalent). Does **not** require a working Holler binary yet.
+Lives in `tests/wire/selftest/` and is run with **`cargo test`**. Does **not** require a working `holler` binary yet.
 
 ## When it comes on
 

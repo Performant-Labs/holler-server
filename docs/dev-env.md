@@ -4,7 +4,7 @@ How to set up a machine to **work on** Holler (server + client), not how to run 
 
 Holler is two processes and a CLI. There is no web UI. You do **not** need Playwright, Herdr on the client box, Tailscale, or IPv6.
 
-Implementation language is not pinned yet. This page is the **runtime shape** the binaries will expect. When the first code lands ([#28](https://github.com/Performant-Labs/holler-server/issues/28) / test canary [#41](https://github.com/Performant-Labs/holler-server/issues/41)), add the toolchain (compiler, `make`/`go test`/…) in the section below.
+**Language is Rust** (edition 2021+, `cargo`). Tokio for async, rustls for TLS, official ACP crate [`agent-client-protocol`](https://github.com/agentclientprotocol/rust-sdk) on the body hop. Pin ACP **v1** types, not the v2 draft.
 
 ## What you need
 
@@ -13,7 +13,7 @@ Implementation language is not pinned yet. This page is the **runtime shape** th
 | OS | Linux, macOS, or Windows | same |
 | Git | yes | yes |
 | Both repos | yes (docs + issues live in both) | yes |
-| Compiler / test runner | — | whatever #28/#41 pick; **not** bash-only |
+| Compiler / test runner | Rust (`rustup`, `cargo`) | `cargo test` on Linux, macOS, Windows |
 | OpenCode | no | only for the **acceptance gate**, not for the wire harness |
 | Herdr | no | only on the hub, for the gate |
 | Tailscale | no | optional underlay |
@@ -73,13 +73,17 @@ Omitted port is **41807**. IPv6: `--listen [::1]:41807` and `--server ws://[::1]
 
 **Fail-fast canary** (no `holler` binary required): [server #41](https://github.com/Performant-Labs/holler-server/issues/41) — `tests/wire/selftest/`. If that is green while the runner swallows failures, stop.
 
-## Toolchain (fill in when code exists)
+## Toolchain
 
-- Language / commands to build `holler` on Linux, macOS, Windows
-- How CI runs #41 then `tests/wire/` on all three OSes
-- Where the HMAC pepper lives in a dev checkout
+```bash
+rustup toolchain install stable
+cd holler-server && cargo test
+cd ../holler-client && cargo test
+```
 
-Until then: edit docs and issues; do not assume a package manager.
+- CI: GitHub Actions matrix `ubuntu-latest`, `macos-latest`, `windows-latest`; run the [#41](https://github.com/Performant-Labs/holler-server/issues/41) canary first, then `tests/wire/`.
+- Body ACP: official Rust SDK, v1 only.
+- HMAC pepper: env or mode-0600 file (ADR 0010); name lands with tokens (#29).
 
 ## Don’t
 
