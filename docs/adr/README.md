@@ -16,6 +16,7 @@ Architecture decision records for holler-server.
 | 0008 | #9 | v1 body is OpenCode via ACP |
 | 0009 | #10 | Protocol is Holler v1 |
 | 0010 | #11 | Tokens hashed at rest; TLS on the wire |
-| 0011–0025 | #12–#26 | reserved |
+| 0011 | #12 | New harnesses are config, not Holler releases |
+| 0012–0025 | #13–#26 | reserved |
 
 Issue #1 is the project brief, not an ADR.
