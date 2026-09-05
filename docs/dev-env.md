@@ -75,7 +75,10 @@ Omitted port is **41807**. IPv6: `--listen [::1]:41807` and `--server ws://[::1]
 
 ## Toolchain
 
+There is **no Python `venv`**. Isolation is **Cargo** (`Cargo.toml` + `target/` per repo). `rustup` installs `rustc` and `cargo` on the machine; each project’s dependencies live in that repo’s `target/`, not in a virtualenv.
+
 ```bash
+# https://rustup.rs — rustc + cargo (Linux, macOS, Windows)
 rustup toolchain install stable
 cd holler-server && cargo test
 cd ../holler-client && cargo test
