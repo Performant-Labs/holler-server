@@ -75,9 +75,7 @@ fn run_token(command: TokenCommands) -> Result<(), TokenError> {
             println!("token_id: {}", minted.token_id);
             println!("secret:   {}", minted.secret);
             println!("expires:  {}", minted.expires);
-            println!(
-                "\nThis secret is shown once and is not stored. Save it now."
-            );
+            println!("\nThis secret is shown once and is not stored. Save it now.");
             Ok(())
         }
         TokenCommands::List { json } => {
@@ -105,7 +103,14 @@ fn run_token(command: TokenCommands) -> Result<(), TokenError> {
 }
 
 fn print_table(views: &[holler_server::token::TokenView]) {
-    const HEADERS: [&str; 6] = ["TOKEN_ID", "STATE", "MACHINE", "LABEL", "LAST_SEEN", "EXPIRES"];
+    const HEADERS: [&str; 6] = [
+        "TOKEN_ID",
+        "STATE",
+        "MACHINE",
+        "LABEL",
+        "LAST_SEEN",
+        "EXPIRES",
+    ];
     let rows: Vec<[&str; 6]> = views
         .iter()
         .map(|v| {

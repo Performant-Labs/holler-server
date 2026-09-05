@@ -63,7 +63,11 @@ fn mint_list_delete_ping_flow() {
     assert!(!list_stdout.contains(&secret));
 
     // list --json never contains the secret either
-    let list_json_out = env.cmd().args(["token", "list", "--json"]).output().unwrap();
+    let list_json_out = env
+        .cmd()
+        .args(["token", "list", "--json"])
+        .output()
+        .unwrap();
     assert!(list_json_out.status.success());
     let list_json_stdout = String::from_utf8(list_json_out.stdout).unwrap();
     assert!(list_json_stdout.contains(&token_id));
@@ -81,7 +85,11 @@ fn mint_list_delete_ping_flow() {
     assert!(delete_stdout.contains("invalidated"));
 
     // ping on the now-deleted (invalidated) token: error contract.
-    let ping_out = env.cmd().args(["token", "ping", &token_id]).output().unwrap();
+    let ping_out = env
+        .cmd()
+        .args(["token", "ping", &token_id])
+        .output()
+        .unwrap();
     assert!(!ping_out.status.success());
     let ping_stderr = String::from_utf8(ping_out.stderr).unwrap();
     assert!(ping_stderr.to_lowercase().contains("error"));

@@ -73,7 +73,9 @@ impl fmt::Display for TokenError {
                 write!(f, "invalid --ttl {s:?} (expected e.g. 30m, 24h, 7d)")
             }
             TokenError::NotFound(id) => write!(f, "no such token: {id}"),
-            TokenError::Unbound(id) => write!(f, "token {id} has not been redeemed; nothing to ping"),
+            TokenError::Unbound(id) => {
+                write!(f, "token {id} has not been redeemed; nothing to ping")
+            }
             TokenError::Disconnected(id) => write!(f, "token {id} is bound but not connected"),
             TokenError::Io(e) => write!(f, "token store I/O error: {e}"),
             TokenError::Serde(e) => write!(f, "token store is corrupt: {e}"),
@@ -491,9 +493,7 @@ mod tests {
         // (e.g. a developer's shell exporting it); this test requires
         // it to be genuinely absent to prove the fail-closed path.
         if std::env::var(PEPPER_ENV).is_ok() {
-            panic!(
-                "{PEPPER_ENV} is set in the test environment; unset it to run this test"
-            );
+            panic!("{PEPPER_ENV} is set in the test environment; unset it to run this test");
         }
 
         let err = store.mint(None, DEFAULT_TTL).unwrap_err();
@@ -544,7 +544,9 @@ mod tests {
     fn delete_on_unused_invalidates() {
         let dir = tempfile::tempdir().unwrap();
         let store = store_in(dir.path());
-        let minted = store.mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL).unwrap();
+        let minted = store
+            .mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL)
+            .unwrap();
 
         let new_state = store.delete(&minted.token_id).unwrap();
         assert_eq!(new_state, DisplayState::Invalidated);
@@ -557,7 +559,9 @@ mod tests {
     fn delete_on_bound_revokes() {
         let dir = tempfile::tempdir().unwrap();
         let store = store_in(dir.path());
-        let minted = store.mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL).unwrap();
+        let minted = store
+            .mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL)
+            .unwrap();
 
         // No redeem flow exists yet (#30); force the record to `Bound`
         // directly to exercise the revoke transition.
@@ -614,9 +618,13 @@ mod tests {
     fn ping_unused_token_errors() {
         let dir = tempfile::tempdir().unwrap();
         let store = store_in(dir.path());
-        let minted = store.mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL).unwrap();
+        let minted = store
+            .mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL)
+            .unwrap();
 
-        let err = store.ping(&minted.token_id, &AlwaysDisconnected).unwrap_err();
+        let err = store
+            .ping(&minted.token_id, &AlwaysDisconnected)
+            .unwrap_err();
         assert!(matches!(err, TokenError::Unbound(_)));
     }
 
@@ -632,13 +640,17 @@ mod tests {
     fn ping_bound_but_disconnected_fails() {
         let dir = tempfile::tempdir().unwrap();
         let store = store_in(dir.path());
-        let minted = store.mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL).unwrap();
+        let minted = store
+            .mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL)
+            .unwrap();
 
         let mut records = store.load().unwrap();
         records[0].state = StoredState::Bound;
         store.save(&records).unwrap();
 
-        let err = store.ping(&minted.token_id, &AlwaysDisconnected).unwrap_err();
+        let err = store
+            .ping(&minted.token_id, &AlwaysDisconnected)
+            .unwrap_err();
         assert!(matches!(err, TokenError::Disconnected(_)));
     }
 
@@ -656,7 +668,9 @@ mod tests {
     fn ping_bound_and_connected_reports_hostname_and_rtt() {
         let dir = tempfile::tempdir().unwrap();
         let store = store_in(dir.path());
-        let minted = store.mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL).unwrap();
+        let minted = store
+            .mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL)
+            .unwrap();
 
         let mut records = store.load().unwrap();
         records[0].state = StoredState::Bound;
