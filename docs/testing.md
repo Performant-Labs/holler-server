@@ -13,7 +13,9 @@ A **process-level wire harness** that uses the **same WebSocket path as producti
 | **ACP stub** | Tiny fake agent on **stdio** (ACP v1): `session/prompt` → canned `session/update`; `session/cancel` → turn ends. Not OpenCode. |
 | Runner | Spawns the three, drives `holler … --json`, asserts stdout |
 
-That is the e2e analogue: **subprocess + JSON assertions**, in the repo’s normal test runner (Go `testing`, pytest, bats, … — pick whatever the implementation language is). Optional bats for extra shell cases. Not Playwright, not Cypress, not a browser WebSocket client.
+That is the e2e analogue: **subprocess + JSON assertions**, in the repo’s normal test runner (Go `testing`, pytest, etc.). Not Playwright, not Cypress, not a browser WebSocket client.
+
+**Must pass on Linux, macOS, and Windows.** The harness is TCP `127.0.0.1` + process stdio — not bash, not Unix sockets, not `#!/bin/sh` as the only runner. Bind **`127.0.0.1`**, not `localhost` (Windows IPv6). Spawn via the language’s process API (`os/exec`, `subprocess`, …). On Windows the stub is `stub-acp.exe`. Kill the tree without relying on `SIGTERM` alone. A Unix-only bats extra is optional and **not** the required e2e.
 
 ## Same machine, same method as the wire
 
@@ -39,3 +41,5 @@ TLS is not required: loopback `ws` is allowed. Remote/prod still uses `wss`.
 - holler-client: `tests/stub-acp/` — fake ACP agent the runner execs as `command`
 
 Secrets never appear in logs (`--debug=quiet` or `none`; `--json` output must not include join secrets after mint’s one-time print).
+
+CI: run `tests/wire/` on Linux, macOS, and Windows (GitHub Actions matrix is enough).
