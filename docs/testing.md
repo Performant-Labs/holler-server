@@ -30,8 +30,21 @@ runner
 
 TLS is not required: loopback `ws` is allowed. Remote/prod still uses `wss`.
 
+## Test of tests (fail right away)
+
+Own story, **first in the epic**: a canary that proves the runner can **fail**.
+
+If this is green while broken, later e2e is theater.
+
+- A nested case that is **designed to fail** (spawn `exit 1` / `cmd /c exit 1`, or dial a closed port). The outer test **fails immediately** (<2s, no long timeout) if that case was green or if the runner swallowed the error.
+- Dial `127.0.0.1:41807` with **no server**: must fail fast, not hang.
+- Linux, macOS, Windows. Not Playwright.
+
+Lives in `tests/wire/selftest/` (or equivalent). Does **not** require a working Holler binary yet.
+
 ## When it comes on
 
+- **Test of tests:** first. CI must be able to go red.
 - **Design + stub + runner scaffold:** early (after protocol types exist).
 - **First talk:** mint → join → `hello` → `holler status` / `holler token ping` (server story “WebSocket listener”, client story “WebSocket session”).
 - Every later story **adds cases** to this harness (query, roster, say, interrupt). Do not invent a second test stack.
