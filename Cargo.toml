@@ -1,0 +1,18 @@
+[package]
+name = "holler-server"
+version = "0.1.0"
+edition = "2021"
+description = "Talk circuit for the herd"
+license = "Proprietary"
+
+[lib]
+name = "holler_server"
+path = "src/lib.rs"
+
+# Integration tests are auto-discovered only from tests/<name>.rs or
+# tests/<name>/. A file nested deeper (tests/wire/selftest.rs) is NOT
+# discovered. Pin the canary's path explicitly so `cargo test` runs it.
+# Issue #41: "a silent skip is a fail."
+[[test]]
+name = "wire_selftest"
+path = "tests/wire/selftest.rs"
