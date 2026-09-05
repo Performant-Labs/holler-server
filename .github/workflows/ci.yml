@@ -26,6 +26,14 @@ jobs:
         run: cargo test --test wire_selftest
         shell: pwsh
 
+      # Issue #40: the wire harness scaffold (the #31 e2e slots into this).
+      # Mirrors the canary step so a broken #40 harness fails CI on its own,
+      # rather than only surfacing in the full suite. Runs on the full
+      # Linux/macOS/Windows matrix below.
+      - name: Wire harness scaffold (issue #40)
+        run: cargo test --test first_talk
+        shell: pwsh
+
       - name: Full test suite
         run: cargo test
         shell: pwsh
