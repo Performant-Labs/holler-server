@@ -2,6 +2,7 @@
 
 | | |
 | --- | --- |
+| [Dev environment](dev-env.md) | Clone, listen, join, tests (Linux / macOS / Windows) |
 | [How server and client talk](protocol/talk.md) | Two hops: Holler on the wire, ACP to the target |
 | [Testing](testing.md) | Same-machine wire harness + CLI e2e (not Playwright) |
 | [Protocol index](protocol/README.md) | Every protocol Holler uses (Holler v1, ACP v1, TLS, JSON-RPC) |
