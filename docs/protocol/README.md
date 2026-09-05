@@ -11,7 +11,7 @@ Holler does **not** invent a cipher, does **not** speak MCP on the circuit, and 
 | Layer | Protocol | Version we pin | Canonical spec | ADR |
 | --- | --- | --- | --- | --- |
 | **Talk circuit** (server ↔ client) | **Holler** | **v1** | [v1.md](v1.md) | [0009](../adr/ADR-0009.md) |
-| Circuit transport | WebSocket text frames | default TCP **41807** (user-settable) | [v1.md](v1.md) §1 | [0004](../adr/ADR-0004.md) |
+| Circuit transport | WebSocket text frames | default **`127.0.0.1:41807`**; IPv6 via `[::1]` / `[::]` | [v1.md](v1.md) §1 | [0004](../adr/ADR-0004.md) |
 | Circuit confidentiality | TLS 1.3 on `wss` (AES-256-GCM or ChaCha20-Poly1305). Plain `ws` = loopback only | TLS 1.3 | [ADR 0010](../adr/ADR-0010.md) | [0010](../adr/ADR-0010.md) |
 | Pairing / auth | Join token → client credential; secret at rest is HMAC-SHA-256 + pepper | — | [ADR 0003](../adr/ADR-0003.md), [0010](../adr/ADR-0010.md) | [0003](../adr/ADR-0003.md) |
 | **Body** (client → local coding agent) | **Agent Client Protocol (ACP)** | **v1** (stable) | [agentclientprotocol.com](https://agentclientprotocol.com/protocol/v1/overview) · [schema repo](https://github.com/agentclientprotocol/agent-client-protocol) | [0012](../adr/ADR-0012.md), [0008](../adr/ADR-0008.md) |
