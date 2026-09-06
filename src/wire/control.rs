@@ -114,9 +114,17 @@ pub enum QueryReply {
 }
 
 /// Answer to a [`Request::Say`]: the concatenated `reply` text once
-/// `done: true` arrives, or an `error` — the target's own (e.g. a stale
+/// `done: true` arrives, an `error` — the target's own (e.g. a stale
 /// `presence` row) or this server's `unknown_session` when the roster
-/// names no live connection for the session at all.
+/// names no live connection for the session at all — or `Interrupted`
+/// (issue #82): a **different** CLI invocation's `holler interrupt` for
+/// this exact session landed (and was acked) while this `say` was still
+/// waiting on its reply. Kept apart from `Err`'s `unknown_session` (used
+/// for a real dropped connection) on purpose — the server and the
+/// connection are both still alive; only this one turn was cut short on
+/// purpose, and `main.rs`'s `run_say` reports that as its own accurate
+/// message rather than folding it into either "connection is gone" or
+/// "no live server."
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum SayReply {
@@ -125,6 +133,7 @@ pub enum SayReply {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit: Option<i64>,
     },
+    Interrupted,
     Err {
         error: ErrorBody,
     },
@@ -389,6 +398,7 @@ async fn handle_control_conn(
                         {
                             PromptOutcome::Done { text, exit } => SayReply::Ok { text, exit },
                             PromptOutcome::Err(body) => SayReply::Err { error: body },
+                            PromptOutcome::Cancelled => SayReply::Interrupted,
                             PromptOutcome::Disconnected => SayReply::Err {
                                 error: ErrorBody {
                                     code: CODE_UNKNOWN_SESSION.to_string(),
