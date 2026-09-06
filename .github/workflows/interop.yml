@@ -231,16 +231,11 @@ jobs:
   macos-client:
     runs-on: macos-latest
     steps:
-      # TEMPORARY, for this harness's own verification only (issue #94):
-      # pinned to the TLS fix branch (Performant-Labs/holler-client#66)
-      # instead of holler-client's default branch, because holler-client
-      # cannot dial wss:// at all without it (tokio-tungstenite had no TLS
-      # feature enabled — see holler-client#65). Flip `ref` back to the
-      # default branch once #66 merges.
+      # holler-client#65/#66 (the wss:// TLS-backend fix) merged to main
+      # 2026-09-06 -- back to the default branch, no pin needed.
       - uses: actions/checkout@v4
         with:
           repository: Performant-Labs/holler-client
-          ref: fix/65-tls-feature
 
       - name: Install Rust
         run: rustup toolchain install stable
@@ -322,12 +317,11 @@ jobs:
   #     run:
   #       shell: pwsh
   #   steps:
-  #     # TEMPORARY — see the identical note on macos-client above
-  #     # (Performant-Labs/holler-client#65 / #66).
+  #     # holler-client#65/#66 (wss:// TLS backend) merged to main
+  #     # 2026-09-06 -- default branch, no pin needed.
   #     - uses: actions/checkout@v4
   #       with:
   #         repository: Performant-Labs/holler-client
-  #         ref: fix/65-tls-feature
   #
   #     - name: Install Rust
   #       run: rustup toolchain install stable
