@@ -22,6 +22,13 @@ on:
   push:
     branches: [feature/94-interop-harness]
 
+permissions:
+  contents: read
+  # The client jobs poll the Actions API and download an artifact from
+  # this same run (see "Wait for the server's tunnel + join token" below)
+  # — that needs read access to the run's own artifacts/metadata.
+  actions: read
+
 env:
   # A fixed, non-secret pepper (ADR 0009's HMAC pepper for token hashing).
   # This is safe only because this server exists for the lifetime of one
@@ -39,12 +46,22 @@ jobs:
   # interrupt) once both client jobs have had a chance to join — see the
   # module note on `HOLLER_STATE_DIR`'s control channel below for why the
   # verification happens here and not on the client legs themselves.
+  #
+  # Deliberately NOT gated by `needs:` from the client jobs, and the
+  # client jobs are not gated by `needs: linux-server` either — a job
+  # dependent via `needs:` only starts after the needed job *fully
+  # completes*, but this job's own server + tunnel processes die the
+  # instant it completes (a GitHub-hosted runner's VM is destroyed at job
+  # end; this org's self-hosted-linux pool is even more immediate — each
+  # container is single-job-ephemeral and deregisters/exits right after).
+  # So the three jobs run concurrently from the same trigger, and the
+  # tunnel URL + join tokens are handed to the client jobs via an
+  # uploaded artifact (visible to sibling jobs in the same run as soon as
+  # the upload step finishes, unlike a `needs.<job>.outputs` value, which
+  # only resolves after the whole producing job is done) instead of job
+  # outputs.
   linux-server:
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
-    outputs:
-      tunnel_url: ${{ steps.tunnel.outputs.url }}
-      macos_token: ${{ steps.tokens.outputs.macos_token }}
-      windows_token: ${{ steps.tokens.outputs.windows_token }}
     steps:
       - uses: actions/checkout@v4
 
@@ -112,26 +129,41 @@ jobs:
           echo "tunnel url: $url"
           echo "url=$url" >> "$GITHUB_OUTPUT"
 
-      - name: Mint join tokens for the client jobs
-        id: tokens
+      # --ttl 15m: this handoff rides in a downloadable artifact (see
+      # below), not a masked job output, so unlike the tunnel URL itself
+      # (already an accepted, documented public-for-the-run's-duration
+      # exposure) the raw token briefly sits somewhere readable by anyone
+      # who can see this run. A short TTL bounds that window tightly
+      # rather than defaulting to the production 24h.
+      - name: Mint join tokens and publish the handoff artifact
         run: |
-          mac_out=$(./target/release/holler token mint --label macos-client)
+          mac_out=$(./target/release/holler token mint --label macos-client --ttl 15m)
           mac_id=$(echo "$mac_out" | awk -F': *' '/^token_id:/ {print $2}')
           mac_secret=$(echo "$mac_out" | awk -F': *' '/^secret:/ {print $2}')
-          echo "::add-mask::${mac_secret}"
-          echo "macos_token=${mac_id}:${mac_secret}" >> "$GITHUB_OUTPUT"
 
-          win_out=$(./target/release/holler token mint --label windows-client)
+          win_out=$(./target/release/holler token mint --label windows-client --ttl 15m)
           win_id=$(echo "$win_out" | awk -F': *' '/^token_id:/ {print $2}')
           win_secret=$(echo "$win_out" | awk -F': *' '/^secret:/ {print $2}')
-          echo "::add-mask::${win_secret}"
-          echo "windows_token=${win_id}:${win_secret}" >> "$GITHUB_OUTPUT"
 
-      # GitHub Actions has no native "wait until a dependent job is done"
-      # signal for a job that already produced its outputs and is now
-      # just idling — see issue #94's design comment. A fixed, documented
-      # sleep is the accepted answer: budgeted generously for both client
-      # jobs' checkout + build + join + run to reach a live presence
+          cat > /tmp/handoff.json <<EOF
+          {
+            "tunnel_url": "${{ steps.tunnel.outputs.url }}",
+            "macos_token": "${mac_id}:${mac_secret}",
+            "windows_token": "${win_id}:${win_secret}"
+          }
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: interop-handoff
+          path: /tmp/handoff.json
+          retention-days: 1
+
+      # GitHub Actions has no native "wait until a sibling job is done"
+      # signal for a job with nothing left to do but stay alive. A fixed,
+      # documented sleep is the accepted answer (issue #94's design
+      # comment): budgeted generously for both client jobs' checkout +
+      # build + artifact poll + join + run to reach a live presence
       # frame, not real coordination.
       - name: Wait for client jobs to join and start their sessions
         run: sleep 360
@@ -184,7 +216,6 @@ jobs:
           kill "$(cat /tmp/holler-serve.pid)" 2>/dev/null || true
 
   macos-client:
-    needs: linux-server
     runs-on: macos-latest
     steps:
       # TEMPORARY, for this harness's own verification only (issue #94):
@@ -204,13 +235,43 @@ jobs:
       - name: Build holler-client
         run: cargo build --release
 
+      # See the long note on `linux-server` above: this job runs
+      # concurrently with it (no `needs:`), so the tunnel URL and this
+      # job's join token arrive via an artifact linux-server uploads
+      # mid-run, polled for here via the Actions API.
+      - name: Wait for the server's tunnel + join token
+        id: handoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          artifact_id=""
+          for i in $(seq 1 60); do
+            artifact_id=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
+              --jq '.artifacts[] | select(.name=="interop-handoff") | .id' | head -n1)
+            if [ -n "$artifact_id" ]; then break; fi
+            sleep 5
+          done
+          if [ -z "$artifact_id" ]; then
+            echo "::error::interop-handoff artifact never appeared within budget"
+            exit 1
+          fi
+
+          gh run download "${{ github.run_id }}" -n interop-handoff -D /tmp/handoff
+          cat /tmp/handoff/handoff.json
+
+          tunnel_url=$(jq -r .tunnel_url /tmp/handoff/handoff.json)
+          token=$(jq -r .macos_token /tmp/handoff/handoff.json)
+          echo "::add-mask::${token}"
+          echo "tunnel_url=${tunnel_url}" >> "$GITHUB_OUTPUT"
+          echo "token=${token}" >> "$GITHUB_OUTPUT"
+
       - name: Join the tunneled server
         run: |
-          tunnel_url="${{ needs.linux-server.outputs.tunnel_url }}"
+          tunnel_url="${{ steps.handoff.outputs.tunnel_url }}"
           # The tunnel terminates TLS on 443; Holler's own --server default
           # port (41807) does not apply here, so the port must be explicit.
           wss_url="wss://${tunnel_url#https://}:443"
-          ./target/release/holler join --server "$wss_url" --token "${{ needs.linux-server.outputs.macos_token }}"
+          ./target/release/holler join --server "$wss_url" --token "${{ steps.handoff.outputs.token }}"
 
       - name: Write a local sessions.toml (stub-acp fixture, zero-cost)
         run: |
@@ -232,7 +293,6 @@ jobs:
         run: cat run.log || true
 
   windows-client:
-    needs: linux-server
     runs-on: windows-latest
     # Known, already-tracked, pre-existing issue (holler-client#60):
     # holler-client does not compile on Windows at all right now
@@ -257,12 +317,41 @@ jobs:
       - name: Build holler-client
         run: cargo build --release
 
+      # See the long note on `linux-server` (top of this file): this job
+      # runs concurrently with it (no `needs:`), so the tunnel URL and
+      # this job's join token arrive via an artifact linux-server uploads
+      # mid-run, polled for here via the Actions API.
+      - name: Wait for the server's tunnel + join token
+        id: handoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $artifactId = $null
+          for ($i = 0; $i -lt 60; $i++) {
+            $artifacts = gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" | ConvertFrom-Json
+            $match = $artifacts.artifacts | Where-Object { $_.name -eq "interop-handoff" } | Select-Object -First 1
+            if ($match) { $artifactId = $match.id; break }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $artifactId) {
+            Write-Host "::error::interop-handoff artifact never appeared within budget"
+            exit 1
+          }
+
+          gh run download "${{ github.run_id }}" -n interop-handoff -D handoff
+          Get-Content handoff/handoff.json
+
+          $json = Get-Content handoff/handoff.json -Raw | ConvertFrom-Json
+          Write-Host "::add-mask::$($json.windows_token)"
+          echo "tunnel_url=$($json.tunnel_url)" >> $env:GITHUB_OUTPUT
+          echo "token=$($json.windows_token)" >> $env:GITHUB_OUTPUT
+
       - name: Join the tunneled server
         run: |
-          $tunnelUrl = "${{ needs.linux-server.outputs.tunnel_url }}"
+          $tunnelUrl = "${{ steps.handoff.outputs.tunnel_url }}"
           $host_ = $tunnelUrl -replace '^https://', ''
           $wssUrl = "wss://${host_}:443"
-          ./target/release/holler.exe join --server $wssUrl --token "${{ needs.linux-server.outputs.windows_token }}"
+          ./target/release/holler.exe join --server $wssUrl --token "${{ steps.handoff.outputs.token }}"
 
       - name: Write a local sessions.toml (stub-acp fixture, zero-cost)
         run: |
