@@ -19,9 +19,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::proto::{Envelope, ErrorBody, QueryOkBody};
+use crate::proto::{Envelope, ErrorBody, QueryOkBody, ReplyBody};
 use crate::token::ConnectionStatus;
 
 use super::query::HarnessConfirmation;
@@ -36,6 +37,14 @@ pub const PING_TIMEOUT: Duration = Duration::from_secs(3);
 /// [`PING_TIMEOUT`] — both are one round trip over an already-open
 /// loopback socket.
 pub const QUERY_TIMEOUT: Duration = PING_TIMEOUT;
+
+/// How long [`Registry::prompt`] waits between `reply` frames (partial or
+/// final) before giving up. Reset on every partial reply, not a single
+/// deadline for the whole exchange — a session streaming output every few
+/// seconds should not time out just because a full turn takes minutes.
+/// Far more generous than [`QUERY_TIMEOUT`]: a `query` is a local
+/// peer-to-peer round trip, a `prompt` may wait on a real model turn.
+pub const PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The outcome of [`Registry::query`]. `Disconnected` covers every
 /// failure mode uniformly (no such connection, the outbound channel is
@@ -54,6 +63,26 @@ enum PendingQueryReply {
     Err(ErrorBody),
 }
 
+/// The outcome of [`Registry::prompt`]: the concatenated text of every
+/// `reply` frame received up to and including the one with `done: true`
+/// (spec §10: `text` and/or `chunks`, joined in arrival order), the
+/// target's own `error` in place of a reply, or `Disconnected` — covering
+/// "no such connection", "the outbound channel is closed", and "no
+/// `reply` arrived within [`PROMPT_TIMEOUT`]" uniformly, same as
+/// [`QueryOutcome::Disconnected`].
+pub enum PromptOutcome {
+    Done { text: String, exit: Option<i64> },
+    Err(ErrorBody),
+    Disconnected,
+}
+
+/// One event this process's pending `prompt` is waiting on: a `reply`
+/// frame (partial or final) or the target's own `error` in place of one.
+enum PromptEvent {
+    Reply(ReplyBody),
+    Err(ErrorBody),
+}
+
 /// One live connection's outward-facing handle: enough for the registry
 /// to push frames at it (`ping`, `query`) and to answer `holler
 /// status`'s client count / hostnames.
@@ -67,6 +96,12 @@ struct Entry {
     /// Outstanding outbound `query`s this connection has not yet
     /// answered, keyed by the envelope `id` the reply must echo back.
     pending_queries: Mutex<HashMap<String, oneshot::Sender<PendingQueryReply>>>,
+    /// Outstanding outbound `prompt`s this connection has not yet
+    /// finished answering, keyed by the envelope `id` every `reply`
+    /// (partial or final) must echo back. An `mpsc`, not a `oneshot`
+    /// (unlike `pending`/`pending_queries`): a `prompt` may see several
+    /// `done: false` replies before the one that finishes it.
+    pending_prompts: Mutex<HashMap<String, mpsc::UnboundedSender<PromptEvent>>>,
 }
 
 /// Shared, process-wide table of live connections, keyed by `token_id`,
@@ -110,6 +145,7 @@ impl Registry {
                     out_tx,
                     pending: Mutex::new(HashMap::new()),
                     pending_queries: Mutex::new(HashMap::new()),
+                    pending_prompts: Mutex::new(HashMap::new()),
                 },
             )
         };
@@ -377,6 +413,125 @@ impl Registry {
             }
         }
     }
+
+    /// Drive a `prompt` -> `reply`* round trip against `token_id`'s live
+    /// connection (issue #33: routing `holler say <session>` by session
+    /// name via the roster). Unlike [`Registry::query`], the target may
+    /// answer with several `done: false` replies before the one that
+    /// finishes the exchange (spec §10) — this collects `text`/`chunks`
+    /// from every reply, in arrival order, and returns the concatenation
+    /// once `done: true` arrives.
+    pub async fn prompt(
+        &self,
+        token_id: &str,
+        prompt_id: String,
+        session: String,
+        text: String,
+        meta: Option<Value>,
+    ) -> PromptOutcome {
+        let out_tx = {
+            let entries = self.entries.lock().expect("registry mutex poisoned");
+            match entries.get(token_id) {
+                Some(entry) => entry.out_tx.clone(),
+                None => return PromptOutcome::Disconnected,
+            }
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        {
+            let entries = self.entries.lock().expect("registry mutex poisoned");
+            let Some(entry) = entries.get(token_id) else {
+                return PromptOutcome::Disconnected;
+            };
+            let mut pending = entry
+                .pending_prompts
+                .lock()
+                .expect("pending-prompt mutex poisoned");
+            pending.insert(prompt_id.clone(), tx);
+        }
+
+        let envelope = crate::wire::hello::new_prompt_envelope(&prompt_id, session, text, meta);
+        if out_tx.send(envelope).is_err() {
+            self.forget_pending_prompt(token_id, &prompt_id);
+            return PromptOutcome::Disconnected;
+        }
+
+        let mut pieces: Vec<String> = Vec::new();
+        loop {
+            match tokio::time::timeout(PROMPT_TIMEOUT, rx.recv()).await {
+                Ok(Some(PromptEvent::Reply(reply))) => {
+                    if let Some(t) = reply.text {
+                        pieces.push(t);
+                    }
+                    pieces.extend(reply.chunks);
+                    if reply.done {
+                        self.forget_pending_prompt(token_id, &prompt_id);
+                        return PromptOutcome::Done {
+                            text: pieces.concat(),
+                            exit: reply.exit,
+                        };
+                    }
+                }
+                Ok(Some(PromptEvent::Err(body))) => {
+                    self.forget_pending_prompt(token_id, &prompt_id);
+                    return PromptOutcome::Err(body);
+                }
+                Ok(None) | Err(_) => {
+                    self.forget_pending_prompt(token_id, &prompt_id);
+                    return PromptOutcome::Disconnected;
+                }
+            }
+        }
+    }
+
+    fn forget_pending_prompt(&self, token_id: &str, prompt_id: &str) {
+        let entries = self.entries.lock().expect("registry mutex poisoned");
+        if let Some(entry) = entries.get(token_id) {
+            let mut pending = entry
+                .pending_prompts
+                .lock()
+                .expect("pending-prompt mutex poisoned");
+            pending.remove(prompt_id);
+        }
+    }
+
+    /// Called from a connection task when a `reply` arrives: forwards it
+    /// to the matching pending outbound `prompt` (if any). Uses `get`,
+    /// not `remove` — a `done: false` reply is not the last one, so
+    /// [`Registry::prompt`]'s own loop (not this call) decides when to
+    /// stop listening (see [`Registry::forget_pending_prompt`]).
+    pub fn resolve_reply(&self, token_id: &str, reply_to: &str, body: ReplyBody) {
+        let entries = self.entries.lock().expect("registry mutex poisoned");
+        if let Some(entry) = entries.get(token_id) {
+            let pending = entry
+                .pending_prompts
+                .lock()
+                .expect("pending-prompt mutex poisoned");
+            if let Some(tx) = pending.get(reply_to) {
+                let _ = tx.send(PromptEvent::Reply(body));
+            }
+        }
+    }
+
+    /// Called from a connection task when an `error` arrives: forwards it
+    /// to the matching pending outbound `prompt` (if any) — this is how a
+    /// remote client's own `unknown_session` (a stale `presence` row: the
+    /// roster thought it hosted this session, the client disagrees)
+    /// reaches `holler say`. A no-op if `reply_to` matches no outstanding
+    /// prompt, the same way [`Registry::resolve_query_err`] is a no-op
+    /// for an unmatched `query`.
+    pub fn resolve_prompt_err(&self, token_id: &str, reply_to: &str, body: ErrorBody) {
+        let entries = self.entries.lock().expect("registry mutex poisoned");
+        if let Some(entry) = entries.get(token_id) {
+            let pending = entry
+                .pending_prompts
+                .lock()
+                .expect("pending-prompt mutex poisoned");
+            if let Some(tx) = pending.get(reply_to) {
+                let _ = tx.send(PromptEvent::Err(body));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -602,5 +757,137 @@ mod tests {
         .await
         .expect("query itself must resolve within its own timeout budget");
         assert!(matches!(outcome, QueryOutcome::Disconnected));
+    }
+
+    #[tokio::test]
+    async fn prompt_against_unknown_token_is_disconnected() {
+        let registry = Registry::new();
+        let outcome = registry
+            .prompt(
+                "tok_nope",
+                "id-1".to_string(),
+                "alpha".to_string(),
+                "hi".to_string(),
+                None,
+            )
+            .await;
+        assert!(matches!(outcome, PromptOutcome::Disconnected));
+    }
+
+    #[tokio::test]
+    async fn prompt_round_trip_resolves_once_done_is_true() {
+        let registry = Registry::new();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+
+        let registry = std::sync::Arc::new(registry);
+        let registry2 = registry.clone();
+        let responder = tokio::spawn(async move {
+            let envelope = out_rx.recv().await.expect("prompt envelope sent");
+            let crate::proto::Body::Prompt(crate::proto::PromptBody { session, text, .. }) =
+                envelope.body
+            else {
+                panic!("expected a Prompt body");
+            };
+            assert_eq!(session, "alpha");
+            assert_eq!(text, "hello");
+            registry2.resolve_reply(
+                "tok_1",
+                &envelope.id,
+                ReplyBody {
+                    session: "alpha".to_string(),
+                    text: Some("hi ".to_string()),
+                    chunks: vec![],
+                    done: false,
+                    exit: None,
+                },
+            );
+            registry2.resolve_reply(
+                "tok_1",
+                &envelope.id,
+                ReplyBody {
+                    session: "alpha".to_string(),
+                    text: Some("there".to_string()),
+                    chunks: vec![],
+                    done: true,
+                    exit: Some(0),
+                },
+            );
+        });
+
+        let outcome = registry
+            .prompt(
+                "tok_1",
+                "p-1".to_string(),
+                "alpha".to_string(),
+                "hello".to_string(),
+                None,
+            )
+            .await;
+        responder.await.unwrap();
+        match outcome {
+            PromptOutcome::Done { text, exit } => {
+                assert_eq!(text, "hi there");
+                assert_eq!(exit, Some(0));
+            }
+            _ => panic!("expected PromptOutcome::Done"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_round_trip_resolves_with_the_target_error() {
+        let registry = Registry::new();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+
+        let registry = std::sync::Arc::new(registry);
+        let registry2 = registry.clone();
+        let responder = tokio::spawn(async move {
+            let envelope = out_rx.recv().await.expect("prompt envelope sent");
+            registry2.resolve_prompt_err(
+                "tok_1",
+                &envelope.id,
+                ErrorBody {
+                    code: "unknown_session".to_string(),
+                    cmd: None,
+                    message: Some("no such session".to_string()),
+                },
+            );
+        });
+
+        let outcome = registry
+            .prompt(
+                "tok_1",
+                "p-1".to_string(),
+                "alpha".to_string(),
+                "hello".to_string(),
+                None,
+            )
+            .await;
+        responder.await.unwrap();
+        match outcome {
+            PromptOutcome::Err(body) => assert_eq!(body.code, "unknown_session"),
+            _ => panic!("expected PromptOutcome::Err"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_after_disconnect_is_disconnected() {
+        let registry = Registry::new();
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+        drop(out_rx);
+        registry.remove("tok_1");
+
+        let outcome = registry
+            .prompt(
+                "tok_1",
+                "p-1".to_string(),
+                "alpha".to_string(),
+                "hi".to_string(),
+                None,
+            )
+            .await;
+        assert!(matches!(outcome, PromptOutcome::Disconnected));
     }
 }

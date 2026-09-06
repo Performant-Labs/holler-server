@@ -148,6 +148,13 @@ fn auth_envelope(token_id: &str, credential: &str) -> Value {
     })
 }
 
+fn presence_envelope(token_id: &str, sessions: Value) -> Value {
+    json!({
+        "v": 1, "type": "presence", "id": "id-presence", "ts": "2026-09-05T00:00:00Z",
+        "from": token_id, "body": { "sessions": sessions }
+    })
+}
+
 fn client_hello_envelope(token_id: &str, client_id: &str) -> Value {
     json!({
         "v": 1, "type": "hello", "id": "id-hello", "ts": "2026-09-05T00:00:00Z",
@@ -777,4 +784,131 @@ fn query_to_a_disconnected_client_is_an_error() {
     assert!(!out.status.success());
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(stderr.contains("no live connection"), "{stderr:?}");
+}
+
+// ---------------------------------------------------------------------
+// Route prompt/reply by session name (issue #33): `holler say <session>`
+// against a real ACP-stub-like WS client that advertises via `presence`
+// then answers a `prompt` with a `reply`.
+// ---------------------------------------------------------------------
+
+/// Answer every `ping` (so the connection stays alive under the
+/// server's own liveness checks) and every `prompt` addressed to
+/// `session` with a single `done: true` `reply` echoing `text` back
+/// with a `" (heard)"` suffix — standing in for a real ACP-backed
+/// client's session output, until the socket closes or is aborted.
+fn spawn_prompt_responder(
+    mut write: impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin + Send + 'static,
+    mut read: impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin + Send + 'static,
+    token_id: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(Ok(Message::Text(text))) = read.next().await {
+            let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let reply = match v["type"].as_str() {
+                Some("ping") => json!({
+                    "v": 1, "type": "pong", "id": v["id"], "ts": "2026-09-05T00:00:00Z", "from": token_id,
+                    "body": {}
+                }),
+                Some("prompt") => {
+                    let session = v["body"]["session"].as_str().unwrap_or_default();
+                    let heard = format!("{} (heard)", v["body"]["text"].as_str().unwrap_or_default());
+                    json!({
+                        "v": 1, "type": "reply", "id": v["id"], "ts": "2026-09-05T00:00:00Z", "from": token_id,
+                        "body": { "session": session, "text": heard, "done": true, "exit": 0 }
+                    })
+                }
+                _ => continue,
+            };
+            if write
+                .send(Message::Text(reply.to_string().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
+#[test]
+fn say_routes_a_prompt_by_session_name_and_persists_the_talk_log() {
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "kiwi");
+    let (client_id, credential) = redeem(&env, &token_id, &secret, "kiwi.local");
+    let server = ServerProcess::spawn(&env);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    // `#[allow]`: the async block's own tail expression is a
+    // `JoinHandle` (itself awaitable) — clippy's `async_yields_async`
+    // flags that shape, but here it is exactly the point: we want the
+    // handle back, not to await the spawned task in place.
+    #[allow(clippy::async_yields_async)]
+    let responder = rt.block_on(async {
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(server.url())
+            .await
+            .unwrap();
+        send_json(&mut ws, &auth_envelope(&token_id, &credential)).await;
+        let _server_hello = recv_json(&mut ws).await;
+        send_json(&mut ws, &client_hello_envelope(&token_id, &client_id)).await;
+
+        // Advertise `alpha` (ADR 0006/0007), the ACP-stub-standin's one
+        // hosted session, then start answering prompts.
+        send_json(
+            &mut ws,
+            &presence_envelope(
+                &token_id,
+                json!([{ "name": "alpha", "harness": "opencode" }]),
+            ),
+        )
+        .await;
+        // Give the server a moment to have processed the `presence`
+        // before `holler say` (below, a separate process) races it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (write, read) = ws.split();
+        spawn_prompt_responder(write, read, token_id.clone())
+    });
+
+    // `holler say alpha "hello"`, a separate CLI process, resolves
+    // `alpha` via the live roster and gets the routed `reply` back.
+    let say_out = env
+        .cmd()
+        .args(["say", "alpha", "hello"])
+        .output()
+        .unwrap();
+    assert!(say_out.status.success(), "{say_out:?}");
+    let say_stdout = String::from_utf8(say_out.stdout).unwrap();
+    assert_eq!(say_stdout.trim(), "hello (heard)");
+
+    // A name the roster has never heard of fails closed with
+    // `unknown_session`, not a hang or a silent no-op.
+    let unknown_out = env
+        .cmd()
+        .args(["say", "nope", "hi"])
+        .output()
+        .unwrap();
+    assert!(!unknown_out.status.success());
+    let unknown_stderr = String::from_utf8(unknown_out.stderr).unwrap();
+    assert!(unknown_stderr.contains("unknown_session"), "{unknown_stderr:?}");
+
+    // The exchange is durably persisted (issue #33's "enough talk log
+    // for `holler wait`") — read it back directly rather than trusting
+    // the write happened.
+    let talklog = holler_server::wire::talklog::TalkLog::new(env.dir.path().to_path_buf());
+    let entries = talklog.read("alpha");
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].session, "alpha");
+    assert_eq!(entries[0].prompt_text, "hello");
+    assert_eq!(entries[0].replies.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].replies[0].text.as_deref(), Some("hello (heard)"));
+    assert!(entries[0].replies[0].done);
+    assert_eq!(entries[0].replies[0].exit, Some(0));
+
+    rt.block_on(async {
+        responder.abort();
+        let _ = responder.await;
+    });
 }

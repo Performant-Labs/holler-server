@@ -135,6 +135,13 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// `holler say <session> <text>`: prompt a session by name (ADR
+    /// 0007), routed by the live `holler serve` process to whichever
+    /// connection currently hosts it (via the roster, issue #32), and
+    /// print back its `reply` text once `done: true` arrives. Fails with
+    /// `unknown_session` if the roster does not know `<session>`, or its
+    /// owning connection is gone.
+    Say { session: String, text: String },
 }
 
 /// The four `query` `cmd`s the protocol defines (spec §7). `holler
@@ -227,6 +234,7 @@ fn main() {
         Commands::Caps { id, json } => run_caps(id, json),
         Commands::Query { args, json } => run_query(args, json),
         Commands::Roster { json } => run_roster(json),
+        Commands::Say { session, text } => run_say(session, text),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -422,6 +430,30 @@ fn run_roster(json: bool) -> Result<(), Box<dyn std::error::Error>> {
         print_roster_table(&rows);
     }
     Ok(())
+}
+
+/// `holler say <session> <text>` (issue #33): reach a live `holler serve`
+/// process over the control channel and route a `prompt` to whichever
+/// connection the roster says hosts `<session>`. No local fallback —
+/// there is no roster to consult without a live server.
+fn run_say(session: String, text: String) -> Result<(), Box<dyn std::error::Error>> {
+    let store = TokenStore::open()?;
+    let state_dir = store.dir().to_path_buf();
+    match wire::control::run_say(&state_dir, session, text) {
+        Some(wire::control::SayReply::Ok { text, exit }) => {
+            println!("{text}");
+            if let Some(code) = exit {
+                if code != 0 {
+                    std::process::exit(code.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+                }
+            }
+            Ok(())
+        }
+        Some(wire::control::SayReply::Err { error }) => {
+            Err(format!("{}: {}", error.code, error.message.unwrap_or_default()).into())
+        }
+        None => Err("no live `holler serve` process is reachable on this host".into()),
+    }
 }
 
 /// Pretty-print a `status`/`caps` `query_ok` body the way `holler

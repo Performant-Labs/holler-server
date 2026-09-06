@@ -35,6 +35,9 @@ pub const CODE_JOIN_FAILED: &str = "join_failed";
 /// registry entry; sent to the superseded connection just before the
 /// server closes its socket (spec §11, issue #56).
 pub const CODE_SESSION_SUPERSEDED: &str = "session_superseded";
+/// `prompt`/`say` to a session name the roster does not know, or whose
+/// owning connection is gone (spec §11).
+pub const CODE_UNKNOWN_SESSION: &str = "unknown_session";
 
 // --------------------------------------------------------------------------
 // Envelope (spec §3)

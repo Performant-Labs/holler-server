@@ -10,10 +10,13 @@
 //! wired yet — see [`PROTOCOL_FEATURES`] for the full vocabulary those
 //! unimplemented ids come from.
 
+use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use crate::proto::{Body, Envelope, HelloBody, MessageType, PingBody, PongBody, QueryBody, Role};
+use crate::proto::{
+    Body, Envelope, HelloBody, MessageType, PingBody, PongBody, PromptBody, QueryBody, Role,
+};
 
 /// This binary's protocol version (spec §2): every process today has
 /// `min = 1`, `max = 1`.
@@ -120,6 +123,21 @@ pub fn new_query_envelope(id: &str, cmd: String, args: Vec<String>) -> Envelope 
         ts: now_ts(),
         from: "server".to_string(),
         body: Body::Query(QueryBody { cmd, args }),
+    }
+}
+
+/// A `prompt` envelope the registry sends to a live connection to route
+/// `holler say <session> <text>` (issue #33) by session name — the
+/// outbound counterpart of [`new_query_envelope`], addressed by whichever
+/// live connection the roster says currently hosts `session` (ADR 0007).
+pub fn new_prompt_envelope(id: &str, session: String, text: String, meta: Option<Value>) -> Envelope {
+    Envelope {
+        v: 1,
+        msg_type: MessageType::Prompt,
+        id: id.to_string(),
+        ts: now_ts(),
+        from: "server".to_string(),
+        body: Body::Prompt(PromptBody { session, text, meta }),
     }
 }
 

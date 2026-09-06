@@ -36,6 +36,7 @@ pub mod lockout;
 pub mod query;
 pub mod registry;
 pub mod roster;
+pub mod talklog;
 
 use std::io;
 use std::net::SocketAddr;
@@ -52,6 +53,7 @@ use connection::ConnectionContext;
 use lockout::LockoutTracker;
 use registry::Registry;
 use roster::{Roster, RosterConfig};
+use talklog::TalkLog;
 
 /// A `--listen`/`HOLLER_LISTEN` value did not parse as `[host:]port`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +155,7 @@ pub async fn serve(config: ServeConfig) -> io::Result<ServerHandle> {
     let roster = Arc::new(Roster::new(RosterConfig::from_env()));
     let lockout = Arc::new(LockoutTracker::new());
     let state_dir = store.dir().to_path_buf();
+    let talklog = Arc::new(TalkLog::new(state_dir.clone()));
 
     let mut listeners = Vec::with_capacity(config.listen_addrs.len());
     for addr in &config.listen_addrs {
@@ -170,6 +173,7 @@ pub async fn serve(config: ServeConfig) -> io::Result<ServerHandle> {
         registry: registry.clone(),
         roster: roster.clone(),
         lockout: lockout.clone(),
+        talklog: talklog.clone(),
         server_hostname: Arc::from(hostname.as_str()),
         listening: listening_urls.clone(),
         debug: config.debug,
@@ -189,6 +193,7 @@ pub async fn serve(config: ServeConfig) -> io::Result<ServerHandle> {
         state_dir,
         registry,
         roster.clone(),
+        talklog,
         ctx.server_hostname.clone(),
         listening_urls,
         shutdown_rx.clone(),
