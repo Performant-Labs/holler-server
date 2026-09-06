@@ -2,10 +2,10 @@
 //! this process's `hello`/`status` self-description, and the `ping`
 //! envelope the registry sends to drive an RTT round trip.
 //!
-//! Advertise only what issue #31 actually implements (`docs/protocol/v1.md`
+//! Advertise only what is actually implemented (`docs/protocol/v1.md`
 //! §6: "Advertise only what is real"): `query` (only `status` today —
-//! the full dispatcher is #37) and `ping`. Not `interrupt`/`presence`/
-//! `roster`, which no story has wired yet.
+//! the full dispatcher is #37), `ping`, and, as of issue #32,
+//! `presence`/`roster`. Not `interrupt`, which no story has wired yet.
 
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -18,10 +18,11 @@ use crate::proto::{Body, Envelope, HelloBody, MessageType, PingBody, PongBody, Q
 /// `min = 1`, `max = 1`.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Protocol features this server process actually implements (issue #31
-/// scope): `query status` and `ping`/`pong`. `token` describes the CLI's
-/// own token-management surface, which is real regardless of the wire.
-pub const SERVER_FEATURES: &[&str] = &["query", "ping", "token"];
+/// Protocol features this server process actually implements: `query
+/// status` and `ping`/`pong` (issue #31), `presence`/`roster` (issue
+/// #32). `token` describes the CLI's own token-management surface,
+/// which is real regardless of the wire.
+pub const SERVER_FEATURES: &[&str] = &["query", "ping", "token", "presence", "roster"];
 
 /// The v1 harness-id vocabulary (spec §9). `holler-server` never runs a
 /// harness itself — this is the set of ids it *knows about*, not ids it
