@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-pid="$(pgrep -f "target/release/holler serve" || true)"
+pid="$(pgrep -f "target/release/holler-server serve" || true)"
 if [ -z "$pid" ]; then
   echo "holler-server: not running"
   exit 0

@@ -1,5 +1,5 @@
 //! End-to-end integration test for issue #31 ("first talk"): the real
-//! `holler serve` listener, driven by a real `tokio-tungstenite`
+//! `holler-server serve` listener, driven by a real `tokio-tungstenite`
 //! WebSocket client through `auth -> hello -> query status -> ping`,
 //! plus the CLI's own `token ping` / `status` reaching the live process
 //! over its local control channel, and the fail-closed paths (bad
@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
 
 fn holler() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_holler"))
+    Command::new(env!("CARGO_BIN_EXE_holler-server"))
 }
 
 /// A fresh, isolated state dir + pepper per test — mirrors
@@ -45,7 +45,7 @@ impl Env {
     }
 }
 
-/// A running `holler serve` child on an OS-assigned loopback port,
+/// A running `holler-server serve` child on an OS-assigned loopback port,
 /// killed on drop so a failing assertion never leaks the process.
 struct ServerProcess {
     child: Child,
@@ -58,7 +58,7 @@ impl ServerProcess {
         cmd.args(["serve", "--listen", "127.0.0.1:0"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd.spawn().expect("spawn `holler serve`");
+        let mut child = cmd.spawn().expect("spawn `holler-server serve`");
         let stdout = child.stdout.take().expect("stdout was piped");
 
         // Read the "listening on: ws://127.0.0.1:PORT" line off a
@@ -73,7 +73,7 @@ impl ServerProcess {
         });
         let line = rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("`holler serve` printed its listening line within 5s");
+            .expect("`holler-server serve` printed its listening line within 5s");
         let port = line
             .rsplit(':')
             .next()
@@ -247,7 +247,7 @@ fn first_talk_auth_hello_status_ping_and_cli_probe() {
         assert_eq!(pong["id"], "id-ping");
 
         // From here on, the server may independently push a `ping` at
-        // this connection (that is exactly how `holler token ping`'s
+        // this connection (that is exactly how `holler-server token ping`'s
         // RTT round trip works — see `wire::registry::Registry::ping`).
         // A real client answers with a matching `pong`; this test client
         // needs the same auto-responder, running concurrently with the
@@ -275,7 +275,7 @@ fn first_talk_auth_hello_status_ping_and_cli_probe() {
             }
         });
 
-        // `holler token ping <id>`, run as a SEPARATE process, reaches
+        // `holler-server token ping <id>`, run as a SEPARATE process, reaches
         // the live server over the control channel and reports the
         // real hostname + RTT — this is the acceptance criterion the
         // old `AlwaysDisconnected` probe could never satisfy.
@@ -293,7 +293,7 @@ fn first_talk_auth_hello_status_ping_and_cli_probe() {
         assert!(ping_stdout.contains("kiwi"), "{ping_stdout:?}");
         assert!(ping_stdout.contains("rtt="), "{ping_stdout:?}");
 
-        // `holler status`, also a separate process, reports healthy
+        // `holler-server status`, also a separate process, reports healthy
         // with `role: server` and the live client counted.
         let status_out = env.cmd().args(["status", "--json"]).output().unwrap();
         assert!(status_out.status.success(), "{status_out:?}");
@@ -519,7 +519,7 @@ fn status_with_no_server_running_reports_not_running() {
 }
 
 // ---------------------------------------------------------------------
-// Capability query (issue #37): `holler status/support/caps/query <id>`
+// Capability query (issue #37): `holler-server status/support/caps/query <id>`
 // relayed to a live client, with a scripted responder standing in for
 // that client's own dispatcher.
 // ---------------------------------------------------------------------
@@ -574,7 +574,7 @@ fn scripted_query_reply(token_id: &str, request: &Value) -> Value {
     })
 }
 
-/// Answer every `ping` (so `holler token ping` keeps working) and
+/// Answer every `ping` (so `holler-server token ping` keeps working) and
 /// `query` (via [`scripted_query_reply`]) the server sends this
 /// connection, until the socket closes or is aborted.
 fn spawn_scripted_responder(
@@ -624,7 +624,7 @@ fn remote_query_relay_covers_status_support_caps_protocol() {
         let (write, read) = ws.split();
         let responder = spawn_scripted_responder(write, read, token_id.clone());
 
-        // `holler status <id>` relays `query status` and reports the
+        // `holler-server status <id>` relays `query status` and reports the
         // remote client's own document, not the server's.
         let out = env
             .cmd()
@@ -636,7 +636,7 @@ fn remote_query_relay_covers_status_support_caps_protocol() {
         assert_eq!(doc["role"], "client");
         assert_eq!(doc["hostname"], "kiwi");
 
-        // `holler support <id> <feature>`: both `ok: true` and
+        // `holler-server support <id> <feature>`: both `ok: true` and
         // `ok: false` round trip.
         let out = env
             .cmd()
@@ -657,7 +657,7 @@ fn remote_query_relay_covers_status_support_caps_protocol() {
         let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(doc["ok"], false);
 
-        // `holler caps <id>`.
+        // `holler-server caps <id>`.
         let out = env
             .cmd()
             .args(["caps", &token_id, "--json"])
@@ -667,7 +667,7 @@ fn remote_query_relay_covers_status_support_caps_protocol() {
         let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(doc["role"], "client");
 
-        // `holler query <id> protocol` and `holler query <id> protocol <n>`.
+        // `holler-server query <id> protocol` and `holler-server query <id> protocol <n>`.
         let out = env
             .cmd()
             .args(["query", &token_id, "protocol", "--json"])
@@ -787,7 +787,7 @@ fn query_to_a_disconnected_client_is_an_error() {
 }
 
 // ---------------------------------------------------------------------
-// Route prompt/reply by session name (issue #33): `holler say <session>`
+// Route prompt/reply by session name (issue #33): `holler-server say <session>`
 // against a real ACP-stub-like WS client that advertises via `presence`
 // then answers a `prompt` with a `reply`.
 // ---------------------------------------------------------------------
@@ -865,14 +865,14 @@ fn say_routes_a_prompt_by_session_name_and_persists_the_talk_log() {
         )
         .await;
         // Give the server a moment to have processed the `presence`
-        // before `holler say` (below, a separate process) races it.
+        // before `holler-server say` (below, a separate process) races it.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let (write, read) = ws.split();
         spawn_prompt_responder(write, read, token_id.clone())
     });
 
-    // `holler say alpha "hello"`, a separate CLI process, resolves
+    // `holler-server say alpha "hello"`, a separate CLI process, resolves
     // `alpha` via the live roster and gets the routed `reply` back.
     let say_out = env
         .cmd()
@@ -895,7 +895,7 @@ fn say_routes_a_prompt_by_session_name_and_persists_the_talk_log() {
     assert!(unknown_stderr.contains("unknown_session"), "{unknown_stderr:?}");
 
     // The exchange is durably persisted (issue #33's "enough talk log
-    // for `holler wait`") — read it back directly rather than trusting
+    // for `holler-server wait`") — read it back directly rather than trusting
     // the write happened.
     let talklog = holler_server::wire::talklog::TalkLog::new(env.dir.path().to_path_buf());
     let entries = talklog.read("alpha");
@@ -914,7 +914,7 @@ fn say_routes_a_prompt_by_session_name_and_persists_the_talk_log() {
 }
 
 // ---------------------------------------------------------------------
-// Interrupt control path (issue #34, ADR 0005): `holler interrupt
+// Interrupt control path (issue #34, ADR 0005): `holler-server interrupt
 // <session>` against a real WS client that advertises two sibling
 // sessions on one connection, then answers (or withholds) `ack`.
 // ---------------------------------------------------------------------
@@ -1022,7 +1022,7 @@ fn interrupt_acks_and_scopes_to_the_named_session_only() {
         spawn_interrupt_responder(write, read, token_id.clone(), vec!["alpha"], seen.clone())
     });
 
-    // `holler interrupt alpha`, a separate CLI process, is acked.
+    // `holler-server interrupt alpha`, a separate CLI process, is acked.
     let out = env.cmd().args(["interrupt", "alpha"]).output().unwrap();
     assert!(out.status.success(), "{out:?}");
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -1174,8 +1174,8 @@ fn interrupt_reports_disconnected_when_the_connection_is_already_gone() {
 
 /// Answer `ping` normally, `interrupt` with an immediate `ack`, and
 /// silently withhold any `reply` to `prompt` — standing in for a real
-/// model turn still in flight when a separate `holler interrupt` cancels
-/// it out from under the `holler say` that is waiting on it.
+/// model turn still in flight when a separate `holler-server interrupt` cancels
+/// it out from under the `holler-server say` that is waiting on it.
 fn spawn_prompt_withholding_interrupt_responder(
     mut write: impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error>
         + Unpin
@@ -1257,7 +1257,7 @@ fn say_reports_interrupted_not_no_live_server_when_cancelled_mid_flight() {
         spawn_prompt_withholding_interrupt_responder(write, read, token_id.clone())
     });
 
-    // `holler say alpha "<long prompt>"`, a separate CLI process, starts
+    // `holler-server say alpha "<long prompt>"`, a separate CLI process, starts
     // waiting on a reply this responder will never send.
     let say_child = env
         .cmd()
@@ -1265,7 +1265,7 @@ fn say_reports_interrupted_not_no_live_server_when_cancelled_mid_flight() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn `holler say`");
+        .expect("spawn `holler-server say`");
 
     // Give the server a moment to register the prompt as pending before
     // a *different* CLI invocation interrupts the very same session.
@@ -1281,12 +1281,12 @@ fn say_reports_interrupted_not_no_live_server_when_cancelled_mid_flight() {
     // regression, just more slowly).
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let out = say_child.wait_with_output().expect("wait on `holler say`");
+        let out = say_child.wait_with_output().expect("wait on `holler-server say`");
         let _ = tx.send(out);
     });
     let say_out = rx
         .recv_timeout(Duration::from_secs(7))
-        .expect("`holler say` must return once its session's interrupt is acked, not hang");
+        .expect("`holler-server say` must return once its session's interrupt is acked, not hang");
 
     assert!(!say_out.status.success(), "{say_out:?}");
     let say_stderr = String::from_utf8(say_out.stderr).unwrap();
@@ -1306,10 +1306,10 @@ fn say_reports_interrupted_not_no_live_server_when_cancelled_mid_flight() {
 }
 
 // ---------------------------------------------------------------------
-// Revoke force-closes the live connection (issue #78): `holler client
+// Revoke force-closes the live connection (issue #78): `holler-server client
 // detach` / `token delete` correctly flip the on-disk record to
 // `revoked`, but before this fix left the live WebSocket connection (and
-// `holler status`/`roster`'s view of it) untouched. These exercise the
+// `holler-server status`/`roster`'s view of it) untouched. These exercise the
 // new control-channel `Revoke` request end to end against a real
 // connection.
 // ---------------------------------------------------------------------
@@ -1330,8 +1330,8 @@ fn client_detach_force_closes_the_live_connection() {
         let _server_hello = recv_json(&mut ws).await;
         send_json(&mut ws, &client_hello_envelope(&token_id, &client_id)).await;
 
-        // `holler client detach <id>`, a separate CLI process, revokes
-        // the token on disk AND reaches this live `holler serve` process
+        // `holler-server client detach <id>`, a separate CLI process, revokes
+        // the token on disk AND reaches this live `holler-server serve` process
         // over the control channel to force-close the connection — not
         // just stop the client from reconnecting later.
         let detach_out = env
@@ -1358,7 +1358,7 @@ fn client_detach_force_closes_the_live_connection() {
         );
     });
 
-    // `holler status` no longer counts this client as connected.
+    // `holler-server status` no longer counts this client as connected.
     let status_out = env.cmd().args(["status", "--json"]).output().unwrap();
     assert!(status_out.status.success(), "{status_out:?}");
     let status_json: Value = serde_json::from_slice(&status_out.stdout).unwrap();
@@ -1371,7 +1371,7 @@ fn client_detach_with_no_live_server_is_not_an_error() {
     let (token_id, secret) = mint(&env, "kiwi");
     let (_client_id, _credential) = redeem(&env, &token_id, &secret, "kiwi.local");
 
-    // No `holler serve` process running at all — the control channel is
+    // No `holler-server serve` process running at all — the control channel is
     // unreachable, but the on-disk revoke alone is sufficient (issue
     // #78's scope note: this must not become a hard error).
     let out = env

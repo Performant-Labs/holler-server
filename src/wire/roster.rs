@@ -90,7 +90,7 @@ pub struct RosterConfig {
     /// A `Gone` row older than this is dropped from memory entirely by
     /// [`Roster::prune`] — bounds memory for a long-running server with
     /// churny sessions while still giving an operator a real window to
-    /// see a session went `gone` via `holler roster` before it vanishes.
+    /// see a session went `gone` via `holler-server roster` before it vanishes.
     /// Default: twice `gone_after`.
     pub prune_after: Duration,
     /// How often the background prune sweep runs. Default 30s; this is
@@ -177,7 +177,7 @@ impl RosterEntry {
     }
 }
 
-/// A read-only snapshot row for `holler roster` / the control channel.
+/// A read-only snapshot row for `holler-server roster` / the control channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RosterRow {
     pub name: String,
@@ -283,7 +283,7 @@ impl Roster {
     /// `connected -> reconnecting -> gone` TTL in [`RosterEntry::state_at`],
     /// since the server does not actually know what happened there.
     ///
-    /// Rows are kept, not removed, so `holler roster` reports the same
+    /// Rows are kept, not removed, so `holler-server roster` reports the same
     /// `gone` state a TTL-decayed row eventually reaches — just without
     /// the wait — matching [`Roster::snapshot`]'s existing convention of
     /// always including a row regardless of state. A no-op for a
@@ -299,7 +299,7 @@ impl Roster {
 
     /// Resolve a session name to the `token_id` of the live connection
     /// currently hosting it (ADR 0007: "address sessions, not hosts") —
-    /// for `holler say`/`prompt` routing (issue #33). `None` if no row
+    /// for `holler-server say`/`prompt` routing (issue #33). `None` if no row
     /// exists at all, or the row has aged past [`RosterState::Gone`]: a
     /// stale route is refused the same as no route (the caller surfaces
     /// `unknown_session`, not a prompt into the void).

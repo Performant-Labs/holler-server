@@ -242,7 +242,7 @@ pub struct TokenView {
     pub token_id: String,
     pub state: String,
     pub machine: String,
-    /// Shown once bound — `holler client list` needs something that
+    /// Shown once bound — `holler-server client list` needs something that
     /// identifies *the client*, not just the token that provisioned it.
     /// `"-"` until bound.
     pub client_id: String,
@@ -396,7 +396,7 @@ impl TokenStore {
     /// blocks — does not poll or time out — until the lock is free, which
     /// is fine here since every caller's critical section is small,
     /// synchronous file I/O with no risk of a long hold. Guards against
-    /// two processes (a `holler serve` and a concurrent CLI invocation,
+    /// two processes (a `holler-server serve` and a concurrent CLI invocation,
     /// or two CLI invocations) racing a `mint`/`delete`/`redeem`/
     /// `verify_credential` against the same `HOLLER_STATE_DIR` and
     /// losing one side's update to a last-write-wins clobber.
@@ -657,7 +657,7 @@ impl TokenStore {
         })
     }
 
-    /// CLI contract for `holler token ping <id>`: unused/stale/deleted
+    /// CLI contract for `holler-server token ping <id>`: unused/stale/deleted
     /// tokens error; a bound token with no live connection fails; a
     /// bound token with a live connection reports hostname + RTT.
     pub fn ping(

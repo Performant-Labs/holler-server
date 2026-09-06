@@ -20,9 +20,9 @@
 //!
 //! ## Scope cut: the local control channel
 //!
-//! `holler token ping <id>` / `holler status` / `holler roster` are
+//! `holler-server token ping <id>` / `holler-server status` / `holler-server roster` are
 //! separate, one-shot CLI processes — they do not share memory with a
-//! long-running `holler serve` process, so they cannot read its
+//! long-running `holler-server serve` process, so they cannot read its
 //! in-memory [`registry::Registry`] or [`roster::Roster`] directly.
 //! [`control`] adds a small Unix-domain-socket side channel (not part of
 //! Holler v1) for exactly this: a live server, and only a live server on
@@ -159,7 +159,7 @@ pub async fn serve(config: ServeConfig) -> io::Result<ServerHandle> {
 
     // Issue #89: probe-and-bind the control socket before doing anything
     // else observable (binding a TCP port, writing the advertise file) so
-    // a second `holler serve` against the same `HOLLER_STATE_DIR` fails
+    // a second `holler-server serve` against the same `HOLLER_STATE_DIR` fails
     // fast and cleanly if a live instance already owns it, rather than
     // silently stealing the control socket out from under it.
     let control_listener = control::bind_control_socket(&state_dir)?;
@@ -223,7 +223,7 @@ pub async fn serve(config: ServeConfig) -> io::Result<ServerHandle> {
 
 /// Periodically drop `Gone` roster rows old enough to prune (memory
 /// hygiene only — see `roster`'s module doc; never affects what
-/// `holler roster` reports for a row still within its prune window).
+/// `holler-server roster` reports for a row still within its prune window).
 async fn roster_prune_loop(roster: Arc<Roster>, mut shutdown_rx: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(roster.sweep_interval());
     loop {

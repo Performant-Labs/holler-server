@@ -50,8 +50,8 @@ Two terminals on the **same machine**. Loopback `ws` is enough (ADR 0004 / 0010)
 ```bash
 export HOLLER_DEBUG=quiet          # none | quiet | noisy; never logs secrets
 # export HOLLER_PEPPER=…           # HMAC pepper; file mode 0600 also fine (ADR 0010)
-holler --listen 127.0.0.1:41807    # default if omitted
-holler token mint --label dev
+holler-server serve --listen 127.0.0.1:41807    # default if omitted
+holler-server token mint --label dev
 ```
 
 Copy the join secret once. Do not paste it into debug logs.

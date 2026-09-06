@@ -1,10 +1,10 @@
 //! Local admin control channel (issue #31 scope note): a Unix-domain
 //! socket, private to the state directory, letting a separate one-shot
-//! `holler` CLI invocation (`holler token ping`, `holler status`) ask a
-//! *live* `holler serve` process about its in-memory
+//! `holler` CLI invocation (`holler-server token ping`, `holler-server status`) ask a
+//! *live* `holler-server serve` process about its in-memory
 //! [`super::registry::Registry`] — which the CLI cannot otherwise reach,
-//! since the registry is per-process state and `holler token ping` /
-//! `holler status` run as separate OS processes from the server.
+//! since the registry is per-process state and `holler-server token ping` /
+//! `holler-server status` run as separate OS processes from the server.
 //!
 //! This is **not** part of Holler v1 (`docs/protocol/v1.md`): it never
 //! carries a credential, is unreachable off the local machine (a Unix
@@ -39,7 +39,7 @@ const CONTROL_SOCKET_NAME: &str = "control.sock";
 
 /// How long the CLI side waits for a control-channel round trip before
 /// reporting "no live server" — generous for a loopback UDS hop, short
-/// enough `holler token ping` / `holler status` never hang. Used for the
+/// enough `holler-server token ping` / `holler-server status` never hang. Used for the
 /// *connect* step of every request, and for the whole round trip of the
 /// fast ops (`status`/`roster`/`ping`/`query`/`revoke`). Not cfg-gated:
 /// [`run_say`]/[`run_interrupt`] reference [`REPLY_TIMEOUT`] (this
@@ -63,7 +63,7 @@ pub fn control_socket_path(state_dir: &Path) -> PathBuf {
     state_dir.join(CONTROL_SOCKET_NAME)
 }
 
-/// Issue #89: a second `holler serve` process found a live instance
+/// Issue #89: a second `holler-server serve` process found a live instance
 /// already bound to this state dir's control socket and refused to
 /// start, rather than silently stealing it (see [`bind_control_socket`]).
 #[derive(Debug)]
@@ -75,7 +75,7 @@ impl std::fmt::Display for AlreadyRunning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "another holler serve process is already running against this \
+            "another holler-server serve process is already running against this \
              state dir (a live process answered at {:?}); stop it first, or \
              point HOLLER_STATE_DIR at a different directory",
             self.path
@@ -92,7 +92,7 @@ enum Request {
         token_id: String,
     },
     Roster,
-    /// `holler status/support/caps/query [<id>] ...` (issue #37):
+    /// `holler-server status/support/caps/query [<id>] ...` (issue #37):
     /// `target: None` asks this live process itself; `Some(id)` asks
     /// the server to relay a `query` to the connection `id` names
     /// (token id, client id, or hostname — see
@@ -106,18 +106,18 @@ enum Request {
         #[serde(default)]
         args: Vec<String>,
     },
-    /// `holler say <session> <text>` (issue #33): prompt a session by
+    /// `holler-server say <session> <text>` (issue #33): prompt a session by
     /// name, resolved via the roster (ADR 0007) to whichever live
     /// connection currently hosts it.
     Say { session: String, text: String },
-    /// `holler interrupt <session>` (issue #34, ADR 0005): cancel a
+    /// `holler-server interrupt <session>` (issue #34, ADR 0005): cancel a
     /// session's in-flight turn — a **control** frame, resolved via the
     /// roster the same way `Say` is, but never queued behind a `prompt`.
     Interrupt { session: String },
-    /// `holler token delete` / `client detach` (issue #78): after the
+    /// `holler-server token delete` / `client detach` (issue #78): after the
     /// on-disk revoke (`TokenStore::delete`) succeeds, ask a live `holler
     /// serve` process to force-close `token_id`'s live connection too, so
-    /// it stops looking connected on `holler status`/`roster`. Best-effort
+    /// it stops looking connected on `holler-server status`/`roster`. Best-effort
     /// from the CLI's point of view: the on-disk revoke is the durable,
     /// required step and already happened by the time this is sent; no
     /// live server reachable (`run_client_query` returns `None`) is not an
@@ -151,7 +151,7 @@ pub enum QueryReply {
 /// `done: true` arrives, an `error` — the target's own (e.g. a stale
 /// `presence` row) or this server's `unknown_session` when the roster
 /// names no live connection for the session at all — or `Interrupted`
-/// (issue #82): a **different** CLI invocation's `holler interrupt` for
+/// (issue #82): a **different** CLI invocation's `holler-server interrupt` for
 /// this exact session landed (and was acked) while this `say` was still
 /// waiting on its reply. Kept apart from `Err`'s `unknown_session` (used
 /// for a real dropped connection) on purpose — the server and the
@@ -210,7 +210,7 @@ pub struct StatusDoc {
     pub clients: usize,
 }
 
-/// One `holler roster` row, as answered over the control channel. The
+/// One `holler-server roster` row, as answered over the control channel. The
 /// roster only exists in the live server's memory (unlike `token`,
 /// which is file-backed) — [`query_roster`] on an unreachable server
 /// returns an empty list, not an error, the same way an unbound token
@@ -646,7 +646,7 @@ pub fn query_status(state_dir: &Path) -> Option<StatusDoc> {
 /// Ask a live server for its roster. Unlike [`query_status`], no live
 /// server reachable is not distinguished from "a live server with an
 /// empty roster" — both legitimately answer "nothing to holler at",
-/// and `holler roster` has no other document shape to fall back to
+/// and `holler-server roster` has no other document shape to fall back to
 /// (there is no file-backed roster the way `token` has one).
 pub fn query_roster(state_dir: &Path) -> Vec<RosterRowDoc> {
     let Some(line) = run_client_query(state_dir, &Request::Roster) else {
@@ -655,7 +655,7 @@ pub fn query_roster(state_dir: &Path) -> Vec<RosterRowDoc> {
     serde_json::from_str(&line).unwrap_or_default()
 }
 
-/// `holler status/support/caps/query [<id>] <cmd> [args...]` (issue
+/// `holler-server status/support/caps/query [<id>] <cmd> [args...]` (issue
 /// #37): ask a live server (if any) to answer `query_cmd`/`args`,
 /// either about itself (`target: None`) or by relaying to the
 /// connection `target` names. `None` means no live server is reachable
@@ -685,7 +685,7 @@ pub fn run_query(
 /// still working on this, it just hasn't answered yet" (`TimedOut`) —
 /// `main.rs`'s `run_say`/`run_interrupt` report those as different,
 /// accurate messages instead of collapsing both into the same "no live
-/// `holler serve` process is reachable" text.
+/// `holler-server serve` process is reachable" text.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlOutcome<T> {
     Reached(T),
@@ -693,14 +693,14 @@ pub enum ControlOutcome<T> {
     TimedOut,
 }
 
-/// `holler say <session> <text>` (issue #33): ask a live server (if any)
+/// `holler-server say <session> <text>` (issue #33): ask a live server (if any)
 /// to route a `prompt` to whichever connection currently hosts `session`
 /// and wait for its `reply` to finish. Uses [`REPLY_TIMEOUT`], not
 /// [`CLIENT_TIMEOUT`], for the read step — the server's own wait for
 /// `say` is a real round trip to the target session
 /// (`registry.prompt(...)`), which can legitimately outlast a short
 /// local-loopback budget (issue #206). `NotReachable` means no live
-/// server is reachable at all — `holler say` has no local fallback
+/// server is reachable at all — `holler-server say` has no local fallback
 /// (there is nothing to route to without a live roster). `TimedOut`
 /// means the connection to a live server was established fine, but no
 /// reply arrived within `REPLY_TIMEOUT` — the target session may still
@@ -720,7 +720,7 @@ pub fn run_say(state_dir: &Path, session: String, text: String) -> ControlOutcom
     }
 }
 
-/// `holler interrupt <session>` (issue #34, ADR 0005): ask a live server
+/// `holler-server interrupt <session>` (issue #34, ADR 0005): ask a live server
 /// (if any) to send a control-frame `interrupt` to whichever connection
 /// currently hosts `session` and wait for its outcome. Uses
 /// [`REPLY_TIMEOUT`] for the same reason [`run_say`] does (issue #206):
@@ -728,7 +728,7 @@ pub fn run_say(state_dir: &Path, session: String, text: String) -> ControlOutcom
 /// than a `say` turn, sharing the generous read timeout here means a
 /// slow control-socket hop never gets misreported as "no live server."
 /// `NotReachable` means no live server is reachable at all — `holler
-/// interrupt` has no local fallback, the same as `holler say`.
+/// interrupt` has no local fallback, the same as `holler-server say`.
 /// `TimedOut` means a live server never answered within `REPLY_TIMEOUT`.
 pub fn run_interrupt(state_dir: &Path, session: String) -> ControlOutcome<InterruptReply> {
     let req = Request::Interrupt { session };
@@ -742,7 +742,7 @@ pub fn run_interrupt(state_dir: &Path, session: String) -> ControlOutcome<Interr
     }
 }
 
-/// `holler token delete` / `client detach` (issue #78): ask a live server
+/// `holler-server token delete` / `client detach` (issue #78): ask a live server
 /// (if any) to force-close `token_id`'s live connection, right after the
 /// caller has already performed the durable on-disk revoke. `None` means
 /// no live server is reachable at all — there is nothing live to close,
@@ -756,7 +756,7 @@ pub fn run_revoke(state_dir: &Path, token_id: String) -> Option<RevokeReply> {
 
 /// [`ConnectionProbe`] backed by the control channel: the "real"
 /// liveness check that replaces [`crate::token::AlwaysDisconnected`] as
-/// `holler token ping`'s default (issue #31).
+/// `holler-server token ping`'s default (issue #31).
 pub struct LiveProbe {
     state_dir: PathBuf,
 }
