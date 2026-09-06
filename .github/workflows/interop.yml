@@ -159,31 +159,38 @@ jobs:
           path: /tmp/handoff.json
           retention-days: 1
 
-      # GitHub Actions has no native "wait until a sibling job is done"
-      # signal for a job with nothing left to do but stay alive. A fixed,
-      # documented sleep is the accepted answer (issue #94's design
-      # comment): budgeted generously for both client jobs' checkout +
-      # build + artifact poll + join + run to reach a live presence
-      # frame, not real coordination.
-      - name: Wait for client jobs to join and start their sessions
-        run: sleep 360
-
+      # No blind sleep here: poll until the session's row actually shows
+      # state=connected, not merely until its name appears anywhere in
+      # the roster JSON. A name-only check is a real bug this workflow
+      # hit in practice: roster rows survive (as "reconnecting", then
+      # "gone") for a while after a client disconnects, so a name-only
+      # grep can pass against an already-dead session — which is exactly
+      # what happened when this job's own fixed-length wait ran long
+      # enough that the macOS client's job (and its runner) had already
+      # finished and been torn down before this check ran. 3 minutes is
+      # generous for both client jobs' checkout + build + artifact poll +
+      # join to reach a live presence frame.
       - name: Verify macOS session joined (poll the roster)
+        id: macos_roster
         run: |
-          for i in $(seq 1 30); do
-            ./target/release/holler roster --json | grep -q '"macos-session"' && break
+          state=""
+          for i in $(seq 1 90); do
+            state=$(./target/release/holler roster --json | grep -A3 '"name": "macos-session"' | grep -oE '"state": "[a-z]+"' | cut -d'"' -f4)
+            [ "$state" = "connected" ] && break
             sleep 2
           done
           ./target/release/holler roster
-          ./target/release/holler roster --json | grep -q '"macos-session"' \
-            || { echo "::error::macos-session never appeared on the roster"; exit 1; }
+          [ "$state" = "connected" ] \
+            || { echo "::error::macos-session never reached state=connected (last seen: ${state:-absent})"; exit 1; }
 
       # `say`/`roster`/`interrupt` reach a live `holler serve` over its
       # local Unix-domain control socket (src/wire/control.rs) — private
       # to this machine's HOLLER_STATE_DIR, not reachable over the
       # network the tunnel exposes. So the actual protocol-level
       # verification runs here, on the same machine as the live server,
-      # not on the client legs.
+      # not on the client legs. Runs immediately after the roster check
+      # above confirms state=connected, not after a separate wait, so
+      # there's no gap for the client to have gone stale in between.
       - name: Exercise say/interrupt against the macOS session
         run: |
           ./target/release/holler say macos-session "ping from linux-server"
@@ -192,16 +199,19 @@ jobs:
       # Known, already-accepted limitation (holler-client#60): holler-client
       # does not currently compile on Windows at all, so windows-client
       # (below) is expected to fail before it ever joins. Best-effort only
-      # — never fails this job.
+      # — never fails this job. Short budget: no point waiting long for a
+      # leg that's expected to have failed at its build step.
       - name: Verify Windows session (best-effort — see holler-client#60)
         continue-on-error: true
         run: |
-          for i in $(seq 1 15); do
-            ./target/release/holler roster --json | grep -q '"windows-session"' && break
+          state=""
+          for i in $(seq 1 30); do
+            state=$(./target/release/holler roster --json | grep -A3 '"name": "windows-session"' | grep -oE '"state": "[a-z]+"' | cut -d'"' -f4)
+            [ "$state" = "connected" ] && break
             sleep 2
           done
           ./target/release/holler roster
-          ./target/release/holler roster --json | grep -q '"windows-session"'
+          [ "$state" = "connected" ]
 
       - name: Exercise say/interrupt against the Windows session (best-effort)
         continue-on-error: true
