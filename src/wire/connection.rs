@@ -308,6 +308,16 @@ pub async fn handle_connection(
     // 3. Session loop: service inbound client frames and outbound frames
     // the registry wants pushed at this connection (server-initiated
     // `ping`, for `holler token ping`).
+    //
+    // `certain_close` distinguishes the one exit path where the server
+    // *knows* this connection is over — a real `Message::Close` frame or
+    // a clean EOF (`None`) — from every other exit (a decode/protocol
+    // failure this server itself closes over, or a websocket-level read
+    // error such as a broken pipe mid-frame) where what actually happened
+    // to the peer is genuinely ambiguous. Only the certain case skips the
+    // roster's TTL decay (issue #80); see `Roster::mark_gone`'s doc
+    // comment for why the ambiguous cases must not.
+    let mut certain_close = false;
     loop {
         tokio::select! {
             incoming = read.next() => {
@@ -329,7 +339,10 @@ pub async fn handle_connection(
                         let _ = write.send(Message::Pong(payload)).await;
                     }
                     Some(Ok(Message::Pong(_))) => {}
-                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Close(_))) | None => {
+                        certain_close = true;
+                        break;
+                    }
                     Some(Ok(Message::Binary(_)) | Ok(Message::Frame(_))) => {
                         // Spec §13: "Binary frames... not in v1." Fail
                         // closed rather than silently ignore.
@@ -366,6 +379,9 @@ pub async fn handle_connection(
     }
 
     ctx.registry.remove(&verified.token_id);
+    if certain_close {
+        ctx.roster.mark_gone(&verified.token_id);
+    }
     trace(
         &ctx,
         &format!(

@@ -144,17 +144,28 @@ fn env_duration_ms(key: &str) -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
-/// One session's roster row. `last_seen` is the only mutable fact;
-/// everything else about "is it connected" is derived from it.
+/// One session's roster row. `last_seen` is the mutable fact everything
+/// about "is it connected" is normally derived from; `gone_now` is the
+/// one exception (issue #80) — set when the server has a *certain*
+/// signal the owning connection is over (an explicit WS close/clean
+/// EOF, or a server-initiated revoke), as opposed to the ambiguous
+/// "haven't heard from you in a while" `state_at` otherwise decays
+/// through. It is still read fresh on every [`RosterEntry::state_at`]
+/// call, same discipline as `last_seen` — just a known fact instead of
+/// a time-derived guess.
 struct RosterEntry {
     harness: String,
     token_id: String,
     client_id: String,
     last_seen: Instant,
+    gone_now: bool,
 }
 
 impl RosterEntry {
     fn state_at(&self, now: Instant, config: &RosterConfig) -> RosterState {
+        if self.gone_now {
+            return RosterState::Gone;
+        }
         let elapsed = now.saturating_duration_since(self.last_seen);
         if elapsed >= config.gone_after {
             RosterState::Gone
@@ -256,9 +267,34 @@ impl Roster {
                 token_id: token_id.to_string(),
                 client_id: client_id.to_string(),
                 last_seen: now,
+                gone_now: false,
             },
         );
         Ok(())
+    }
+
+    /// Immediately mark every session row owned by `token_id` as gone
+    /// (issue #80) — for a connection loss the server knows with
+    /// certainty: an explicit `Message::Close`/clean EOF observed in
+    /// `connection.rs`'s session loop, or a server-initiated revoke
+    /// (`control.rs`'s `Request::Revoke`, issue #78). Reserved for that
+    /// certain case: the genuinely-ambiguous case (missed heartbeats, a
+    /// read error, a timeout) must keep decaying through the normal
+    /// `connected -> reconnecting -> gone` TTL in [`RosterEntry::state_at`],
+    /// since the server does not actually know what happened there.
+    ///
+    /// Rows are kept, not removed, so `holler roster` reports the same
+    /// `gone` state a TTL-decayed row eventually reaches — just without
+    /// the wait — matching [`Roster::snapshot`]'s existing convention of
+    /// always including a row regardless of state. A no-op for a
+    /// `token_id` that owns no rows.
+    pub fn mark_gone(&self, token_id: &str) {
+        let mut entries = self.entries.lock().expect("roster mutex poisoned");
+        for entry in entries.values_mut() {
+            if entry.token_id == token_id {
+                entry.gone_now = true;
+            }
+        }
     }
 
     /// Resolve a session name to the `token_id` of the live connection
@@ -436,6 +472,84 @@ mod tests {
         let rows = roster.snapshot();
         assert_eq!(rows[0].client_id, "cli_2");
         assert_eq!(rows[0].state, RosterState::Connected);
+    }
+
+    #[test]
+    fn mark_gone_is_immediate_not_ttl_derived() {
+        let roster = Roster::new(tiny_config());
+        roster
+            .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
+            .unwrap();
+        assert_eq!(roster.snapshot()[0].state, RosterState::Connected);
+
+        roster.mark_gone("tok_1");
+        assert_eq!(roster.snapshot()[0].state, RosterState::Gone);
+        assert_eq!(roster.resolve_session("alpha"), None);
+    }
+
+    #[test]
+    fn mark_gone_only_affects_rows_owned_by_that_token_id() {
+        let roster = Roster::new(tiny_config());
+        roster
+            .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
+            .unwrap();
+        roster
+            .advertise("beta".into(), "opencode".into(), "tok_2", "cli_2")
+            .unwrap();
+
+        roster.mark_gone("tok_1");
+
+        let rows = roster.snapshot();
+        let alpha = rows.iter().find(|r| r.name == "alpha").unwrap();
+        let beta = rows.iter().find(|r| r.name == "beta").unwrap();
+        assert_eq!(alpha.state, RosterState::Gone);
+        assert_eq!(beta.state, RosterState::Connected);
+    }
+
+    #[test]
+    fn re_advertise_after_mark_gone_goes_back_to_connected() {
+        let roster = Roster::new(tiny_config());
+        roster
+            .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
+            .unwrap();
+        roster.mark_gone("tok_1");
+        assert_eq!(roster.snapshot()[0].state, RosterState::Gone);
+
+        // A fresh reconnect + re-advertise under the same token_id
+        // clears the certain-gone mark, same as it clears TTL staleness.
+        roster
+            .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
+            .unwrap();
+        assert_eq!(roster.snapshot()[0].state, RosterState::Connected);
+    }
+
+    #[test]
+    fn mark_gone_lets_a_different_client_reclaim_the_name_immediately() {
+        let roster = Roster::new(tiny_config());
+        roster
+            .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
+            .unwrap();
+        roster.mark_gone("tok_1");
+
+        // Without waiting out any TTL, a different client can now take
+        // the name — mirrors `a_name_can_be_reclaimed_once_the_prior_owner_is_gone`,
+        // but via the certain-close path instead of elapsed time.
+        roster
+            .advertise("alpha".into(), "opencode".into(), "tok_2", "cli_2")
+            .unwrap();
+        let rows = roster.snapshot();
+        assert_eq!(rows[0].client_id, "cli_2");
+        assert_eq!(rows[0].state, RosterState::Connected);
+    }
+
+    #[test]
+    fn mark_gone_for_an_unknown_token_id_is_a_no_op() {
+        let roster = Roster::new(tiny_config());
+        roster
+            .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
+            .unwrap();
+        roster.mark_gone("tok_nope");
+        assert_eq!(roster.snapshot()[0].state, RosterState::Connected);
     }
 
     #[test]

@@ -31,19 +31,14 @@ fn holler() -> Command {
 /// A fresh, isolated state dir + pepper + short roster TTLs per test.
 struct Env {
     dir: tempfile::TempDir,
+    reconnect_ms: u64,
+    gone_ms: u64,
 }
 
 impl Env {
     fn new() -> Self {
         Env {
             dir: tempfile::tempdir().unwrap(),
-        }
-    }
-
-    fn cmd(&self) -> Command {
-        let mut cmd = holler();
-        cmd.env("HOLLER_STATE_DIR", self.dir.path())
-            .env("HOLLER_SERVER_PEPPER", "roster-test-pepper")
             // Short TTLs so this test doesn't wait out the real 45s /
             // 180s production window: 500ms to `reconnecting`, 3s
             // total (from last presence) to `gone`. Generous enough
@@ -53,8 +48,29 @@ impl Env {
             // transition it's trying to observe — the in-process unit
             // tests in `src/wire/roster.rs` hit exactly this kind of
             // flake on a loaded CI runner with tighter margins.
-            .env("HOLLER_ROSTER_RECONNECT_MS", "500")
-            .env("HOLLER_ROSTER_GONE_MS", "3000")
+            reconnect_ms: 500,
+            gone_ms: 3000,
+        }
+    }
+
+    /// Wide TTLs (issue #80): for tests proving a row reaches `gone`
+    /// via the certain-close path, not the TTL decay. A row that
+    /// reached `gone` fast under these windows could not have gotten
+    /// there any other way.
+    fn with_wide_ttls() -> Self {
+        Env {
+            dir: tempfile::tempdir().unwrap(),
+            reconnect_ms: 30_000,
+            gone_ms: 60_000,
+        }
+    }
+
+    fn cmd(&self) -> Command {
+        let mut cmd = holler();
+        cmd.env("HOLLER_STATE_DIR", self.dir.path())
+            .env("HOLLER_SERVER_PEPPER", "roster-test-pepper")
+            .env("HOLLER_ROSTER_RECONNECT_MS", self.reconnect_ms.to_string())
+            .env("HOLLER_ROSTER_GONE_MS", self.gone_ms.to_string())
             .env("HOLLER_ROSTER_SWEEP_MS", "100");
         cmd
     }
@@ -146,6 +162,18 @@ fn redeem(env: &Env, token_id: &str, secret: &str, machine: &str) -> (String, St
     (client_id, credential)
 }
 
+/// `holler token delete <token_id>` (issue #78): revokes on disk, then
+/// (if a live server is reachable, which it is here) force-closes the
+/// live connection over the control channel.
+fn revoke(env: &Env, token_id: &str) {
+    let out = env
+        .cmd()
+        .args(["token", "delete", token_id])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+}
+
 fn auth_envelope(token_id: &str, credential: &str) -> Value {
     json!({
         "v": 1, "type": "auth", "id": "id-auth", "ts": "2026-09-05T00:00:00Z",
@@ -203,6 +231,27 @@ fn wait_for_roster_row(env: &Env, name: &str, pred: impl Fn(Option<&Value>) -> b
         }
         if std::time::Instant::now() >= deadline {
             panic!("timed out waiting for roster row {name:?}; last snapshot: {rows}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Like [`wait_for_roster_row`], but with a short (2s) budget — for
+/// asserting a row reaches `gone` *fast*, not just eventually. Used
+/// alongside [`Env::with_wide_ttls`] (issue #80): under those wide
+/// windows, a row that only decayed via the TTL could not possibly
+/// reach `gone` within this budget, so a pass here is only possible via
+/// the certain-close/revoke path, not the TTL.
+fn wait_for_roster_state_soon(env: &Env, name: &str, state: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let rows = roster_json(env);
+        let row = find_row(&rows, name).cloned();
+        if row.as_ref().is_some_and(|r| r["state"] == state) {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("row {name:?} did not reach state {state:?} within 2s; last snapshot: {rows}");
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -380,5 +429,101 @@ fn holler_roster_tracks_two_sibling_sessions_independently() {
             r.is_some_and(|r| r["state"] == "gone")
         });
         assert_eq!(row["state"], "gone");
+    });
+}
+
+/// Issue #80: an explicit, graceful WebSocket close is a certain signal
+/// the connection is over — the roster must reflect `gone` right away,
+/// not decay through the same `connected -> reconnecting -> gone` TTL a
+/// silent network drop would use. `Env::with_wide_ttls` makes those TTLs
+/// wide enough that reaching `gone` within this test's 2s budget is only
+/// possible via the certain-close path, not the TTL.
+#[test]
+fn holler_roster_shows_gone_immediately_after_explicit_close() {
+    let env = Env::with_wide_ttls();
+    let (token_id, secret) = mint(&env, "kiwi");
+    let (_client_id, credential) = redeem(&env, &token_id, &secret, "kiwi.local");
+    let server = ServerProcess::spawn(&env);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(server.url())
+            .await
+            .unwrap();
+        send_json(&mut ws, &auth_envelope(&token_id, &credential)).await;
+        let _server_hello = recv_json(&mut ws).await;
+
+        send_json(
+            &mut ws,
+            &presence_envelope(
+                &token_id,
+                json!([{"name": "closer", "harness": "opencode"}]),
+            ),
+        )
+        .await;
+        let row = wait_for_roster_row(&env, "closer", |r| r.is_some());
+        assert_eq!(row["state"], "connected");
+
+        // A real, graceful WebSocket close handshake — not a network
+        // drop or a killed process.
+        ws.close(None)
+            .await
+            .expect("client sends a real Close frame");
+        drop(ws);
+
+        wait_for_roster_state_soon(&env, "closer", "gone");
+    });
+}
+
+/// Issue #80/#78: a server-initiated revoke (`holler token delete` /
+/// `client detach`) force-closes the live connection with the same
+/// certainty as an explicit client close — the roster must reflect
+/// `gone` immediately here too, not via the TTL.
+#[test]
+fn holler_roster_shows_gone_immediately_after_revoke() {
+    let env = Env::with_wide_ttls();
+    let (token_id, secret) = mint(&env, "kiwi");
+    let (_client_id, credential) = redeem(&env, &token_id, &secret, "kiwi.local");
+    let server = ServerProcess::spawn(&env);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(server.url())
+            .await
+            .unwrap();
+        send_json(&mut ws, &auth_envelope(&token_id, &credential)).await;
+        let _server_hello = recv_json(&mut ws).await;
+
+        send_json(
+            &mut ws,
+            &presence_envelope(
+                &token_id,
+                json!([{"name": "revoked", "harness": "opencode"}]),
+            ),
+        )
+        .await;
+        let row = wait_for_roster_row(&env, "revoked", |r| r.is_some());
+        assert_eq!(row["state"], "connected");
+
+        // Revoke while the connection is still open, from a separate
+        // `holler token delete` process — mirrors the real CLI flow.
+        revoke(&env, &token_id);
+
+        wait_for_roster_state_soon(&env, "revoked", "gone");
+
+        // The connection was actually force-closed server-side, not
+        // just marked gone with the socket still open. `Registry::remove`
+        // (issue #78) drops the outbound channel rather than sending a
+        // clean `Close` handshake, so the client may see a graceful
+        // close, a protocol-level reset, or EOF — any of those confirms
+        // the socket is gone; only a live, still-open connection would
+        // fail this.
+        let closed = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("the revoked connection closes within 5s");
+        assert!(
+            !matches!(closed, Some(Ok(_))),
+            "expected the server to close the revoked connection, got {closed:?}"
+        );
     });
 }
