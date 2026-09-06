@@ -3,7 +3,9 @@
 //! — so it exercises argument parsing, process exit codes, and stdout
 //! formatting the way an operator actually sees them.
 
-use std::process::Command;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 fn holler() -> Command {
     Command::new(env!("CARGO_BIN_EXE_holler"))
@@ -313,4 +315,92 @@ fn redeem_already_bound_token_fails() {
     assert!(!second.status.success());
     let stderr = String::from_utf8(second.stderr).unwrap();
     assert!(stderr.to_lowercase().contains("bound"));
+}
+
+/// Starts `holler serve` with the given `--advertise` (or none) bound to
+/// an OS-assigned loopback port, waits for it to print its "listening
+/// on" line (proof it has already persisted its advertise state — issue
+/// #66 persists before that print), then kills it. The test does not
+/// need the server to actually stay reachable, only for the advertise
+/// state to have been written to `HOLLER_STATE_DIR`.
+fn run_serve_briefly(env: &Env, advertise: Option<&str>) {
+    let mut cmd = env.cmd();
+    cmd.args(["serve", "--listen", "127.0.0.1:0"]);
+    if let Some(addr) = advertise {
+        cmd.args(["--advertise", addr]);
+    }
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut line = String::new();
+        let read = reader.read_line(&mut line).unwrap();
+        if read == 0 || line.contains("listening on") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "holler serve never printed its listening line"
+        );
+    }
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
+fn mint_prints_join_command_when_serve_advertised_a_reachable_address() {
+    let env = Env::new();
+    run_serve_briefly(&env, Some("example.test:41807"));
+
+    let mint_out = env
+        .cmd()
+        .args(["token", "mint", "--label", "advertised-box"])
+        .output()
+        .unwrap();
+    assert!(mint_out.status.success(), "{mint_out:?}");
+    let mint_stdout = String::from_utf8(mint_out.stdout).unwrap();
+    let token_id = mint_stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("token_id:").map(|s| s.trim().to_string()))
+        .unwrap();
+    let secret = mint_stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("secret:").map(|s| s.trim().to_string()))
+        .unwrap();
+
+    let expected =
+        format!("holler join --server ws://example.test:41807 --token {token_id}:{secret}");
+    assert!(
+        mint_stdout.contains(&expected),
+        "expected join command {expected:?} in:\n{mint_stdout}"
+    );
+}
+
+#[test]
+fn mint_warns_when_no_serve_has_ever_run() {
+    let env = Env::new();
+    let mint_out = env.cmd().args(["token", "mint"]).output().unwrap();
+    assert!(mint_out.status.success(), "{mint_out:?}");
+    let mint_stdout = String::from_utf8(mint_out.stdout).unwrap();
+    assert!(mint_stdout.to_lowercase().contains("warning"));
+    assert!(!mint_stdout.contains("holler join"));
+}
+
+#[test]
+fn mint_warns_when_serve_only_ever_ran_loopback_only() {
+    let env = Env::new();
+    run_serve_briefly(&env, None);
+
+    let mint_out = env.cmd().args(["token", "mint"]).output().unwrap();
+    assert!(mint_out.status.success(), "{mint_out:?}");
+    let mint_stdout = String::from_utf8(mint_out.stdout).unwrap();
+    assert!(mint_stdout.to_lowercase().contains("warning"));
+    assert!(!mint_stdout.contains("holler join"));
 }
