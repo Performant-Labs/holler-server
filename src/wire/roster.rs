@@ -273,6 +273,34 @@ impl Roster {
         Ok(())
     }
 
+    /// Refreshes `last_seen` on every session this client currently
+    /// advertises, without a fresh `presence` frame.
+    ///
+    /// `presence` is a one-shot, sent only at (re)connect (issue #52's
+    /// "ask again" contract — it is never streamed mid-connection), so
+    /// before this existed `last_seen` was set once at connect and never
+    /// touched again for the rest of a session's life. `reconnect_after`'s
+    /// own doc comment says "3 x the recommended 15s heartbeat" — the
+    /// heartbeat was always meant to be what keeps a row `Connected`, but
+    /// nothing wired `ping` receipt to the roster, so any connection
+    /// older than `reconnect_after` (45s default) drifted to
+    /// `Reconnecting`, then `Gone` at `gone_after` (180s), then got
+    /// pruned — regardless of whether the client was heartbeating
+    /// perfectly. Call this on every inbound `ping` (`connection.rs`).
+    ///
+    /// A client with no sessions currently advertised (nothing to
+    /// refresh) is not an error — it just does nothing, the same way a
+    /// pre-first-`presence` heartbeat has nothing to touch yet.
+    pub fn touch_client(&self, token_id: &str) {
+        let now = Instant::now();
+        let mut entries = self.entries.lock().expect("roster mutex poisoned");
+        for entry in entries.values_mut() {
+            if entry.token_id == token_id {
+                entry.last_seen = now;
+            }
+        }
+    }
+
     /// Immediately mark every session row owned by `token_id` as gone
     /// (issue #80) — for a connection loss the server knows with
     /// certainty: an explicit `Message::Close`/clean EOF observed in
@@ -447,6 +475,91 @@ mod tests {
         roster
             .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
             .unwrap();
+        assert_eq!(roster.snapshot()[0].state, RosterState::Connected);
+    }
+
+    #[test]
+    fn heartbeat_touch_prevents_drift_to_reconnecting() {
+        // The bug this exists to fix: presence fires once at connect and
+        // never again, so without touch_client a perfectly healthy
+        // connection would still drift Connected -> Reconnecting on a
+        // clock that had nothing to do with whether it was actually
+        // alive. Simulates three heartbeats, each inside the window the
+        // previous one bought, well past where the row would have gone
+        // Reconnecting on presence alone.
+        let roster = Roster::new(tiny_config());
+        roster
+            .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
+            .unwrap();
+
+        for _ in 0..3 {
+            std::thread::sleep(Duration::from_millis(200));
+            roster.touch_client("tok_1");
+            assert_eq!(
+                roster.snapshot()[0].state,
+                RosterState::Connected,
+                "a touch inside the window must keep the row Connected"
+            );
+        }
+        // Total elapsed (~600ms) already exceeds reconnect_after (300ms)
+        // from the original advertise — only the repeated touches kept
+        // it Connected.
+    }
+
+    #[test]
+    fn touch_client_refreshes_every_session_that_client_owns() {
+        let roster = Roster::new(tiny_config());
+        roster
+            .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
+            .unwrap();
+        roster
+            .advertise("beta".into(), "opencode".into(), "tok_1", "cli_1")
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(700));
+        roster.touch_client("tok_1");
+
+        let rows = roster.snapshot();
+        let alpha = rows.iter().find(|r| r.name == "alpha").unwrap();
+        let beta = rows.iter().find(|r| r.name == "beta").unwrap();
+        assert_eq!(alpha.state, RosterState::Connected, "touch must reach every session, not just one");
+        assert_eq!(beta.state, RosterState::Connected, "touch must reach every session, not just one");
+    }
+
+    #[test]
+    fn touch_client_does_not_affect_a_different_clients_session() {
+        let roster = Roster::new(tiny_config());
+        roster
+            .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
+            .unwrap();
+        roster
+            .advertise("beta".into(), "opencode".into(), "tok_2", "cli_2")
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(700));
+        roster.touch_client("tok_1");
+
+        let rows = roster.snapshot();
+        let alpha = rows.iter().find(|r| r.name == "alpha").unwrap();
+        let beta = rows.iter().find(|r| r.name == "beta").unwrap();
+        assert_eq!(alpha.state, RosterState::Connected, "tok_1's touch must refresh its own session");
+        assert_eq!(
+            beta.state,
+            RosterState::Reconnecting,
+            "tok_1's touch must never refresh a different client's session"
+        );
+    }
+
+    #[test]
+    fn touch_client_on_an_unknown_token_is_a_no_op_not_a_panic() {
+        let roster = Roster::new(tiny_config());
+        roster
+            .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
+            .unwrap();
+        // A client with nothing advertised yet (or ever) has nothing to
+        // refresh — this must be silent, not an error, since a ping can
+        // legitimately arrive before a client's first presence.
+        roster.touch_client("tok_never_seen");
         assert_eq!(roster.snapshot()[0].state, RosterState::Connected);
     }
 

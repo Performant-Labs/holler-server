@@ -528,6 +528,11 @@ async fn handle_frame(
         Body::Ping(ping) => {
             let hostname = ping.hostname.clone().unwrap_or_default();
             trace(ctx, &format!("client ping from {hostname}"));
+            // `presence` only ever fires once, at connect — this is what
+            // actually keeps a healthy connection's roster row from
+            // drifting to Reconnecting/Gone on its own heartbeat. See
+            // Roster::touch_client's doc comment for why this was missing.
+            ctx.roster.touch_client(token_id);
             let _ = write
                 .send(Message::Text(
                     encode(&new_pong_envelope(&envelope.id, &ctx.server_hostname)).into(),
