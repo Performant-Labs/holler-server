@@ -14,6 +14,13 @@ name: interop
 # deciding it here.
 on:
   workflow_dispatch: {}
+  # TEMPORARY, verification-only: `workflow_dispatch` cannot be invoked via
+  # API/CLI for a workflow that only exists on a non-default branch (a hard
+  # GitHub constraint), so this branch-scoped `push` trigger lets this PR's
+  # own branch actually run the workflow in CI for real iteration before
+  # merge. Removed before this PR is finalized.
+  push:
+    branches: [feature/94-interop-harness]
 
 env:
   # A fixed, non-secret pepper (ADR 0009's HMAC pepper for token hashing).
