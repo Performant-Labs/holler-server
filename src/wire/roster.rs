@@ -300,11 +300,18 @@ impl Roster {
 mod tests {
     use super::*;
 
+    /// Wide margins between thresholds (and between a sleep and the
+    /// threshold it's meant to cross) on purpose: a loaded, shared CI
+    /// runner can stretch a `thread::sleep` well past its nominal
+    /// duration under scheduler contention (observed in CI: a 50ms
+    /// sleep landing past a 90ms threshold). These numbers are sized so
+    /// that even several-hundred-ms of scheduling slop still lands on
+    /// the intended side of each threshold.
     fn tiny_config() -> RosterConfig {
         RosterConfig {
-            reconnect_after: Duration::from_millis(30),
-            gone_after: Duration::from_millis(90),
-            prune_after: Duration::from_millis(200),
+            reconnect_after: Duration::from_millis(300),
+            gone_after: Duration::from_millis(2000),
+            prune_after: Duration::from_millis(5000),
             sweep_interval: Duration::from_millis(10),
         }
     }
@@ -330,11 +337,11 @@ mod tests {
             .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
             .unwrap();
 
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(700));
         let rows = roster.snapshot();
         assert_eq!(rows[0].state, RosterState::Reconnecting);
 
-        std::thread::sleep(Duration::from_millis(60));
+        std::thread::sleep(Duration::from_millis(2000));
         let rows = roster.snapshot();
         assert_eq!(rows[0].state, RosterState::Gone);
     }
@@ -346,7 +353,7 @@ mod tests {
             .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
             .unwrap();
 
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(700));
         assert_eq!(roster.snapshot()[0].state, RosterState::Reconnecting);
 
         roster
@@ -365,7 +372,7 @@ mod tests {
             .advertise("beta".into(), "opencode".into(), "tok_1", "cli_1")
             .unwrap();
 
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(700));
         // Refresh only `alpha`; `beta` keeps aging on its own.
         roster
             .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
@@ -402,7 +409,7 @@ mod tests {
             .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
             .unwrap();
 
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(2700));
         assert_eq!(roster.snapshot()[0].state, RosterState::Gone);
 
         roster
@@ -415,16 +422,25 @@ mod tests {
 
     #[test]
     fn prune_removes_only_rows_gone_past_prune_after() {
-        let roster = Roster::new(tiny_config());
+        // A short `gone_after` and a far-off `prune_after`, so there's
+        // a wide, jitter-tolerant window between "already gone" and
+        // "old enough to prune" (see `tiny_config`'s doc comment on
+        // why these margins matter under CI scheduling contention).
+        let roster = Roster::new(RosterConfig {
+            reconnect_after: Duration::from_millis(50),
+            gone_after: Duration::from_millis(200),
+            prune_after: Duration::from_millis(3000),
+            sweep_interval: Duration::from_millis(10),
+        });
         roster
             .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
             .unwrap();
 
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(600));
         roster.prune();
         assert_eq!(roster.len(), 1, "gone but within prune_after stays");
 
-        std::thread::sleep(Duration::from_millis(150));
+        std::thread::sleep(Duration::from_millis(3200));
         roster.prune();
         assert_eq!(roster.len(), 0, "past prune_after is removed");
     }

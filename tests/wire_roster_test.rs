@@ -45,14 +45,17 @@ impl Env {
         cmd.env("HOLLER_STATE_DIR", self.dir.path())
             .env("HOLLER_SERVER_PEPPER", "roster-test-pepper")
             // Short TTLs so this test doesn't wait out the real 45s /
-            // 180s production window: 300ms to `reconnecting`, 900ms
+            // 180s production window: 500ms to `reconnecting`, 3s
             // total (from last presence) to `gone`. Generous enough
-            // above the CLI subprocess-spawn overhead (`holler roster`
-            // runs as its own process per check) that polling this
-            // roster doesn't race the transition it's trying to observe.
-            .env("HOLLER_ROSTER_RECONNECT_MS", "300")
-            .env("HOLLER_ROSTER_GONE_MS", "900")
-            .env("HOLLER_ROSTER_SWEEP_MS", "50");
+            // above CLI subprocess-spawn overhead and CI scheduler
+            // jitter (`holler roster` runs as its own process per
+            // check) that polling this roster doesn't race the
+            // transition it's trying to observe — the in-process unit
+            // tests in `src/wire/roster.rs` hit exactly this kind of
+            // flake on a loaded CI runner with tighter margins.
+            .env("HOLLER_ROSTER_RECONNECT_MS", "500")
+            .env("HOLLER_ROSTER_GONE_MS", "3000")
+            .env("HOLLER_ROSTER_SWEEP_MS", "100");
         cmd
     }
 }
@@ -191,7 +194,7 @@ fn find_row<'a>(rows: &'a Value, name: &str) -> Option<&'a Value> {
 /// Polls `holler roster --json` until `pred` matches the named row (or
 /// the row is absent and `pred` accepts `None`), or the budget expires.
 fn wait_for_roster_row(env: &Env, name: &str, pred: impl Fn(Option<&Value>) -> bool) -> Value {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let rows = roster_json(env);
         let row = find_row(&rows, name).cloned();
