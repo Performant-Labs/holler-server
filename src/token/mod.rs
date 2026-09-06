@@ -56,6 +56,10 @@ pub enum TokenError {
     /// `redeem` presented a secret that does not match the stored hash.
     /// Fails closed: no state mutation happens on this path.
     WrongSecret(String),
+    /// `verify_credential` (issue #31: WebSocket `auth`) presented a
+    /// credential that does not match the stored hash. Fails closed: no
+    /// state mutation happens on this path.
+    WrongCredential(String),
     /// `redeem` on a token that was already redeemed once (secrets are
     /// single-use; same `token_id`, but a second `join` needs a new mint).
     AlreadyBound(String),
@@ -90,6 +94,7 @@ impl fmt::Display for TokenError {
             }
             TokenError::Disconnected(id) => write!(f, "token {id} is bound but not connected"),
             TokenError::WrongSecret(id) => write!(f, "wrong secret for token {id}"),
+            TokenError::WrongCredential(id) => write!(f, "wrong credential for token {id}"),
             TokenError::AlreadyBound(id) => {
                 write!(f, "token {id} was already redeemed and is bound to a client")
             }
@@ -277,6 +282,15 @@ pub struct RedeemResult {
     pub credential: String,
 }
 
+/// Result of a successful [`TokenStore::verify_credential`]: identifies
+/// which bound client just authenticated (issue #31 `auth`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedClient {
+    pub token_id: String,
+    pub client_id: String,
+    pub machine: String,
+}
+
 /// The outcome of a successful `ping` against a bound token.
 #[derive(Debug)]
 pub enum PingOutcome {
@@ -319,12 +333,21 @@ impl TokenStore {
     /// Open the store at `HOLLER_STATE_DIR` (default
     /// `./holler-server-state`), creating the directory if needed.
     pub fn open() -> Result<Self, TokenError> {
-        let dir = std::env::var(STATE_DIR_ENV).unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
-        let dir = PathBuf::from(dir);
+        let dir = state_dir();
         fs::create_dir_all(&dir)?;
         Ok(TokenStore {
             path: dir.join(STATE_FILE),
         })
+    }
+
+    /// The directory this store (and the issue #31 control-socket path,
+    /// which lives alongside it) resolve to: `HOLLER_STATE_DIR`, default
+    /// `./holler-server-state`. Exposed so `wire::control` can locate the
+    /// same directory without duplicating the env var name.
+    pub fn dir(&self) -> &std::path::Path {
+        self.path
+            .parent()
+            .expect("store path is always `<dir>/tokens.json`")
     }
 
     #[cfg(test)]
@@ -514,6 +537,77 @@ impl TokenStore {
         })
     }
 
+    /// Verify a presented client credential (issue #31 `auth`) against
+    /// the stored hash for `token_id`, without re-minting or re-redeeming
+    /// anything (redeem is the one-time #30 operation; this is the
+    /// read-mostly check a live WebSocket connection performs on every
+    /// `auth`, including a reconnect). On success, records `last_seen`
+    /// (the only mutation) and returns the client identity to bind the
+    /// connection to.
+    ///
+    /// Fails closed the same way `redeem` does: unknown token is
+    /// `NotFound`; not yet bound is `Unbound`; invalidated/revoked
+    /// records stay rejected; a mismatched credential is
+    /// `WrongCredential`. No mutation happens on any error path.
+    pub fn verify_credential(
+        &self,
+        token_id: &str,
+        credential: &str,
+    ) -> Result<VerifiedClient, TokenError> {
+        let pepper = std::env::var(PEPPER_ENV).map_err(|_| TokenError::PepperMissing)?;
+        if pepper.is_empty() {
+            return Err(TokenError::PepperMissing);
+        }
+        self.verify_credential_with_pepper(pepper.as_bytes(), token_id, credential)
+    }
+
+    /// The pepper-taking core of [`TokenStore::verify_credential`] (see
+    /// [`TokenStore::mint_with_pepper`] for why this split exists).
+    fn verify_credential_with_pepper(
+        &self,
+        pepper: &[u8],
+        token_id: &str,
+        credential: &str,
+    ) -> Result<VerifiedClient, TokenError> {
+        let mut records = self.load()?;
+        let record = records
+            .iter_mut()
+            .find(|r| r.token_id == token_id)
+            .ok_or_else(|| TokenError::NotFound(token_id.to_string()))?;
+
+        match record.state {
+            StoredState::Bound => {}
+            StoredState::Unused => return Err(TokenError::Unbound(token_id.to_string())),
+            StoredState::Invalidated => {
+                return Err(TokenError::Invalidated(token_id.to_string()))
+            }
+            StoredState::Revoked => return Err(TokenError::Revoked(token_id.to_string())),
+        }
+
+        // A `Bound` record always carries a `credential_hash` (set at
+        // redeem, only ever cleared by a revoke — which already returned
+        // above). Treat a missing hash the same as a wrong credential
+        // rather than panicking: fail closed on any inconsistency.
+        let matches = record
+            .credential_hash
+            .as_deref()
+            .is_some_and(|hash| verify_secret(pepper, credential, hash));
+        if !matches {
+            return Err(TokenError::WrongCredential(token_id.to_string()));
+        }
+
+        let now = OffsetDateTime::now_utc();
+        record.last_seen = Some(now.format(&Rfc3339)?);
+        let verified = VerifiedClient {
+            token_id: token_id.to_string(),
+            client_id: record.client_id.clone().unwrap_or_default(),
+            machine: record.machine.clone().unwrap_or_default(),
+        };
+
+        self.save(&records)?;
+        Ok(verified)
+    }
+
     /// CLI contract for `holler token ping <id>`: unused/stale/deleted
     /// tokens error; a bound token with no live connection fails; a
     /// bound token with a live connection reports hostname + RTT.
@@ -542,6 +636,15 @@ impl TokenStore {
             }
         }
     }
+}
+
+/// The state directory `TokenStore::open` resolves to: `HOLLER_STATE_DIR`
+/// env, default `./holler-server-state`. A free function (not a method)
+/// so callers that need the directory before/without opening a store
+/// (issue #31's control-socket path) can resolve it identically.
+fn state_dir() -> PathBuf {
+    let dir = std::env::var(STATE_DIR_ENV).unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
+    PathBuf::from(dir)
 }
 
 // --------------------------------------------------------------------------
@@ -1028,6 +1131,104 @@ mod tests {
         let records = store.load().unwrap();
         assert_eq!(records[0].state, StoredState::Revoked);
         assert_eq!(records[0].credential_hash, None);
+    }
+
+    #[test]
+    fn verify_credential_accepts_the_real_credential_and_updates_last_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let minted = store
+            .mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL)
+            .unwrap();
+        let redeemed = store
+            .redeem_with_pepper(
+                TEST_PEPPER,
+                &minted.token_id,
+                &minted.secret,
+                "kiwi.local".to_string(),
+            )
+            .unwrap();
+
+        assert_eq!(store.load().unwrap()[0].last_seen, None);
+
+        let verified = store
+            .verify_credential_with_pepper(TEST_PEPPER, &minted.token_id, &redeemed.credential)
+            .unwrap();
+        assert_eq!(verified.token_id, minted.token_id);
+        assert_eq!(verified.client_id, redeemed.client_id);
+        assert_eq!(verified.machine, "kiwi.local");
+
+        assert!(store.load().unwrap()[0].last_seen.is_some());
+    }
+
+    #[test]
+    fn verify_credential_rejects_wrong_credential_without_mutating_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let minted = store
+            .mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL)
+            .unwrap();
+        store
+            .redeem_with_pepper(
+                TEST_PEPPER,
+                &minted.token_id,
+                &minted.secret,
+                "kiwi.local".to_string(),
+            )
+            .unwrap();
+
+        let err = store
+            .verify_credential_with_pepper(TEST_PEPPER, &minted.token_id, "hlr_live_not-it")
+            .unwrap_err();
+        assert!(matches!(err, TokenError::WrongCredential(_)));
+        assert_eq!(store.load().unwrap()[0].last_seen, None);
+    }
+
+    #[test]
+    fn verify_credential_on_unbound_token_is_unbound() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let minted = store
+            .mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL)
+            .unwrap();
+
+        let err = store
+            .verify_credential_with_pepper(TEST_PEPPER, &minted.token_id, "hlr_live_whatever")
+            .unwrap_err();
+        assert!(matches!(err, TokenError::Unbound(_)));
+    }
+
+    #[test]
+    fn verify_credential_unknown_token_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let err = store
+            .verify_credential_with_pepper(TEST_PEPPER, "tok_nope", "hlr_live_whatever")
+            .unwrap_err();
+        assert!(matches!(err, TokenError::NotFound(_)));
+    }
+
+    #[test]
+    fn verify_credential_on_revoked_token_is_revoked() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let minted = store
+            .mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL)
+            .unwrap();
+        let redeemed = store
+            .redeem_with_pepper(
+                TEST_PEPPER,
+                &minted.token_id,
+                &minted.secret,
+                "kiwi.local".to_string(),
+            )
+            .unwrap();
+        store.delete(&minted.token_id).unwrap();
+
+        let err = store
+            .verify_credential_with_pepper(TEST_PEPPER, &minted.token_id, &redeemed.credential)
+            .unwrap_err();
+        assert!(matches!(err, TokenError::Revoked(_)));
     }
 
     #[test]

@@ -17,6 +17,12 @@ use serde_json::Value;
 pub const CODE_UNSUPPORTED_VERSION: &str = "unsupported_version";
 /// Unknown envelope `type` (spec §3, §11).
 pub const CODE_UNKNOWN_TYPE: &str = "unknown_type";
+/// `auth` missing, malformed, or the credential does not verify (spec §11).
+pub const CODE_UNAUTHENTICATED: &str = "unauthenticated";
+/// Unknown `query` `cmd` (spec §11).
+pub const CODE_UNKNOWN_CMD: &str = "unknown_cmd";
+/// Server `query`/`ping` to a bound token with no live socket (spec §11).
+pub const CODE_NOT_CONNECTED: &str = "not_connected";
 
 // --------------------------------------------------------------------------
 // Envelope (spec §3)
@@ -625,4 +631,21 @@ pub fn error_for_unknown_type(unknown_type: &str, reply_id: &str, from: &str) ->
 /// Build a generic `error` envelope with just a `code` (spec §11).
 pub fn error_for(code: &str, reply_id: &str, from: &str) -> Envelope {
     new_error_envelope(code, None, None, reply_id, from)
+}
+
+/// Build an `error` envelope with a human-readable `message` (spec §11).
+pub fn error_with_message(code: &str, message: &str, reply_id: &str, from: &str) -> Envelope {
+    new_error_envelope(code, None, Some(message.to_string()), reply_id, from)
+}
+
+/// Build the `error` envelope for an unknown `query` `cmd` (spec §7, §11):
+/// `code: "unknown_cmd"`, echoing the offending `cmd`.
+pub fn error_for_unknown_cmd(cmd: &str, reply_id: &str, from: &str) -> Envelope {
+    new_error_envelope(
+        CODE_UNKNOWN_CMD,
+        Some(cmd),
+        Some(format!("unknown query cmd: {cmd}")),
+        reply_id,
+        from,
+    )
 }
