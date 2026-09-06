@@ -13,10 +13,11 @@
 //! exists only so an operator can exercise the same library call from
 //! a shell without a real client.
 
+use std::net::SocketAddr;
+
 use clap::{Parser, Subcommand};
-use holler_server::token::{
-    parse_ttl, AlwaysDisconnected, PingOutcome, RedeemResult, TokenError, TokenStore, DEFAULT_TTL,
-};
+use holler_server::token::{parse_ttl, PingOutcome, RedeemResult, TokenError, TokenStore, DEFAULT_TTL};
+use holler_server::wire;
 
 /// `holler token list` / `holler client list` share this table shape;
 /// `client list` just pre-filters to bound records.
@@ -81,6 +82,26 @@ enum Commands {
     /// Manage bound clients — aliases of the bound-token list/detach
     /// paths under `token`, scoped to records that are actually bound.
     Client(ClientArgs),
+    /// Run the WebSocket listener (issue #31: "first talk"). Blocks
+    /// until Ctrl-C.
+    Serve(ServeArgs),
+    /// This process's own status document (`role: server`). Reaches a
+    /// live `holler serve` process over the local control channel if
+    /// one is running on this host; otherwise reports a local-only,
+    /// not-connected document.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(clap::Args)]
+struct ServeArgs {
+    /// `[host:]port`, e.g. `127.0.0.1:41807` or `[::1]:41807`.
+    /// Repeatable, to serve more than one address family (ADR 0004).
+    /// Defaults to `HOLLER_LISTEN`, then `127.0.0.1:41807`.
+    #[arg(long)]
+    listen: Vec<String>,
 }
 
 #[derive(clap::Args)]
@@ -142,14 +163,93 @@ enum ClientCommands {
 
 fn main() {
     let cli = Cli::parse();
-    let result = match cli.command {
-        Commands::Token(args) => run_token(args.command),
-        Commands::Client(args) => run_client(args.command),
+    let result: Result<(), Box<dyn std::error::Error>> = match cli.command {
+        Commands::Token(args) => run_token(args.command).map_err(Into::into),
+        Commands::Client(args) => run_client(args.command).map_err(Into::into),
+        Commands::Serve(args) => run_serve(args),
+        Commands::Status { json } => run_status(json),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
+}
+
+/// Resolve the addresses `holler serve` binds: `--listen` (repeatable)
+/// wins outright over `HOLLER_LISTEN` (comma-separated, for the same
+/// two-families case as a repeated flag); neither present defaults to
+/// `127.0.0.1:41807` (ADR 0004).
+fn resolve_listen_addrs(flag_values: &[String]) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error>> {
+    let specs: Vec<String> = if !flag_values.is_empty() {
+        flag_values.to_vec()
+    } else if let Ok(env_val) = std::env::var("HOLLER_LISTEN") {
+        env_val
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        vec!["127.0.0.1:41807".to_string()]
+    };
+    specs
+        .iter()
+        .map(|s| wire::parse_listen_spec(s).map_err(|e| e.into()))
+        .collect()
+}
+
+fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let listen_addrs = resolve_listen_addrs(&args.listen)?;
+    let debug = holler_server::debug::DebugLevel::resolve(None, std::env::var("HOLLER_DEBUG").ok().as_deref())?;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let config = wire::ServeConfig { listen_addrs, debug };
+        let handle = wire::serve(config).await?;
+        let addrs: Vec<String> = handle.addrs.iter().map(|a| format!("ws://{a}")).collect();
+        println!("holler-server listening on: {}", addrs.join(", "));
+
+        tokio::signal::ctrl_c().await?;
+        println!("holler-server: shutting down");
+        handle.shutdown().await;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })
+}
+
+fn run_status(json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let store = TokenStore::open()?;
+    let state_dir = store.dir().to_path_buf();
+    let live = wire::control::query_status(&state_dir);
+    let hostname = wire::local_hostname()?;
+
+    let (listening, clients) = match &live {
+        Some(doc) => (doc.listening.clone(), doc.clients),
+        None => (Vec::new(), 0),
+    };
+    let body = wire::hello::status_query_ok_body(&hostname, &listening, clients);
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&body)?);
+    } else {
+        println!("role:      server");
+        println!("hostname:  {hostname}");
+        println!(
+            "protocol:  {} (min {} max {})",
+            wire::hello::PROTOCOL_VERSION,
+            wire::hello::PROTOCOL_VERSION,
+            wire::hello::PROTOCOL_VERSION
+        );
+        println!(
+            "listening: {}",
+            if listening.is_empty() {
+                "not running".to_string()
+            } else {
+                listening.join(", ")
+            }
+        );
+        println!("clients:   {clients}");
+        println!("status:    {}", if live.is_some() { "healthy" } else { "not running" });
+    }
+    Ok(())
 }
 
 fn run_token(command: TokenCommands) -> Result<(), TokenError> {
@@ -181,13 +281,16 @@ fn run_token(command: TokenCommands) -> Result<(), TokenError> {
             println!("token {id} is now {new_state}");
             Ok(())
         }
-        TokenCommands::Ping { id } => match store.ping(&id, &AlwaysDisconnected) {
-            Ok(PingOutcome::Connected { hostname, rtt_ms }) => {
-                println!("{hostname} rtt={rtt_ms}ms");
-                Ok(())
+        TokenCommands::Ping { id } => {
+            let probe = wire::control::LiveProbe::new(store.dir().to_path_buf());
+            match store.ping(&id, &probe) {
+                Ok(PingOutcome::Connected { hostname, rtt_ms }) => {
+                    println!("{hostname} rtt={rtt_ms}ms");
+                    Ok(())
+                }
+                Err(e) => Err(e),
             }
-            Err(e) => Err(e),
-        },
+        }
         TokenCommands::Redeem {
             id,
             secret,

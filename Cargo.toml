@@ -66,6 +66,10 @@ sha2 = "0.10"
 # features are enabled (no `local-offset`, which is unsound in
 # multi-threaded processes and unneeded since everything here is UTC).
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "macros", "time", "io-util", "rt", "signal"] }
+tokio-tungstenite = "0.30.0"
+futures-util = { version = "0.3.34", features = ["sink"] }
+hostname = "0.4.2"
 
 # Test-only dependencies. `libc` is used by the first_talk harness to kill
 # a child's whole process group on Unix (`setpgid` at spawn, `killpg` +
