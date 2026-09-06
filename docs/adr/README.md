@@ -19,6 +19,7 @@ Architecture decision records for holler-server.
 | 0011 | #12 | New harnesses are config, not Holler releases |
 | 0012 | #13 | Body protocol is ACP v1 (RFDs, not IETF RFCs) |
 | 0013 | #14 | Rust, because we want the official ACP SDK |
-| 0014–0025 | #15–#26 | reserved |
+| 0014 | #15 | Versioning: SemVer per crate, starting at 0.1.0, independent per repo |
+| 0015–0025 | #16–#26 | reserved |
 
 Issue #1 is the project brief, not an ADR.
