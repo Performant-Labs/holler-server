@@ -86,8 +86,13 @@ impl Registry {
     }
 
     /// Register a newly authenticated connection. Replaces any prior
-    /// entry for the same `token_id` (a reconnect from the same client
-    /// supersedes its old, presumably now-dead, socket).
+    /// entry for the same `token_id` (a reconnect from the same client,
+    /// or a replayed credential, supersedes its old, possibly still-live
+    /// socket) — and actually closes that old socket: the superseded
+    /// connection is sent a `session_superseded` `error` first, then its
+    /// `out_tx` is dropped, closing the channel its `handle_connection`
+    /// task is selecting on; that task's next `out_rx.recv()` sees the
+    /// close and breaks its loop, dropping the WebSocket (issue #56).
     pub fn insert(
         &self,
         token_id: &str,
@@ -95,17 +100,29 @@ impl Registry {
         hostname: String,
         out_tx: mpsc::UnboundedSender<Envelope>,
     ) {
-        let mut entries = self.entries.lock().expect("registry mutex poisoned");
-        entries.insert(
-            token_id.to_string(),
-            Entry {
-                hostname,
-                client_id,
-                out_tx,
-                pending: Mutex::new(HashMap::new()),
-                pending_queries: Mutex::new(HashMap::new()),
-            },
-        );
+        let previous = {
+            let mut entries = self.entries.lock().expect("registry mutex poisoned");
+            entries.insert(
+                token_id.to_string(),
+                Entry {
+                    hostname,
+                    client_id,
+                    out_tx,
+                    pending: Mutex::new(HashMap::new()),
+                    pending_queries: Mutex::new(HashMap::new()),
+                },
+            )
+        };
+        if let Some(previous) = previous {
+            let notice = crate::proto::error_with_message(
+                crate::proto::CODE_SESSION_SUPERSEDED,
+                "a new connection authenticated for this token; closing",
+                "",
+                "server",
+            );
+            let _ = previous.out_tx.send(notice);
+            // `previous` drops here, taking its `out_tx` with it.
+        }
     }
 
     /// Update the recorded hostname for a connection once its `hello`
@@ -420,6 +437,38 @@ mod tests {
 
         let status = registry.ping("tok_1", "ping-1".to_string(), "srv").await;
         assert!(matches!(status, ConnectionStatus::Disconnected));
+    }
+
+    #[tokio::test]
+    async fn insert_for_an_already_live_token_id_closes_the_old_connection() {
+        let registry = Registry::new();
+        let (out_tx_1, mut out_rx_1) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx_1);
+
+        // A second `auth` for the same `token_id` (reconnect, or a
+        // replayed credential) supersedes the first connection.
+        let (out_tx_2, _out_rx_2) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_2".to_string(), "mango".to_string(), out_tx_2);
+
+        // The old connection's outbound channel gets one message — the
+        // supersede notice — then closes.
+        let notice = out_rx_1
+            .recv()
+            .await
+            .expect("superseded connection is sent a notice");
+        let crate::proto::Body::Error(ErrorBody { code, .. }) = notice.body else {
+            panic!("expected an error envelope");
+        };
+        assert_eq!(code, crate::proto::CODE_SESSION_SUPERSEDED);
+
+        assert!(
+            out_rx_1.recv().await.is_none(),
+            "old connection's channel must close so its select loop breaks"
+        );
+
+        // The new connection is the one now tracked.
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.snapshot()[0].1, "mango");
     }
 
     #[test]
