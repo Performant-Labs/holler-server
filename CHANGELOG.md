@@ -12,4 +12,3 @@ backfilled with pre-decision history.
 Nothing yet — this file is created ahead of the first tagged release; see
 [issue #90](https://github.com/Performant-Labs/holler-server/issues/90) for the release
 process this project hasn't cut a release with yet.
-</content>
