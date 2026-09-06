@@ -1,0 +1,90 @@
+name: Test case proposal
+description: Propose a new test case for the master test-case catalog
+title: "[Test case]: "
+labels:
+  - test-case
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Proposes a new entry for the test-case catalog in
+        [the master testing issue](https://github.com/Performant-Labs/holler-server/issues/98).
+        A maintainer will assign this to the next available reserved slot (issues #99-#198)
+        rather than leaving it as a standalone issue, so the catalog's numbering stays
+        contiguous. See [CONTRIBUTING.md](../../CONTRIBUTING.md) for the AI-disclosure policy.
+
+  - type: dropdown
+    id: applies-to
+    attributes:
+      label: Applies to
+      options:
+        - server
+        - client
+        - both
+    validations:
+      required: true
+
+  - type: dropdown
+    id: automation-status
+    attributes:
+      label: Automation status
+      description: >
+        Pick both `test-auto` and `test-manual` labels on the resulting issue if this test
+        case is genuinely both (e.g. automated on some platforms, manual on others).
+      options:
+        - Already automated (give the test file/function below)
+        - Should be automated, but isn't yet
+        - Manual only (e.g. requires real API cost, or a human judgment call)
+    validations:
+      required: true
+
+  - type: input
+    id: automation-ref
+    attributes:
+      label: Automation reference
+      description: >
+        If already automated, the real test file/function that exercises this
+        (e.g. `holler-server: tests/wire_roster_test.rs::some_test_name`). Leave blank
+        if not automated yet.
+      placeholder: "holler-server: tests/wire_roster_test.rs::..."
+    validations:
+      required: false
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What this test case verifies
+      description: A short description of the behavior/contract being tested.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps
+      description: Concrete steps to exercise this test case (manual) or what the automated test does.
+      placeholder: |
+        1. holler serve --listen 127.0.0.1:41807
+        2. holler token mint --label test
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: verification
+    attributes:
+      label: Verification
+      options:
+        - label: >
+            I have personally verified this test case is real and reproducible (not an
+            AI's unverified guess at a scenario) — required to submit.
+          required: true
+        - label: This proposal was drafted with AI assistance.
+          required: false
