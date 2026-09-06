@@ -21,6 +21,10 @@ pub const CODE_UNKNOWN_TYPE: &str = "unknown_type";
 pub const CODE_UNAUTHENTICATED: &str = "unauthenticated";
 /// Unknown `query` `cmd` (spec §11).
 pub const CODE_UNKNOWN_CMD: &str = "unknown_cmd";
+/// `support`/`protocol` argument is not in the v1 vocabulary — an
+/// unknown feature/harness id, a missing argument, or a malformed
+/// `protocol` version (spec §7, §11).
+pub const CODE_UNKNOWN_FEATURE: &str = "unknown_feature";
 /// Server `query`/`ping` to a bound token with no live socket (spec §11).
 pub const CODE_NOT_CONNECTED: &str = "not_connected";
 

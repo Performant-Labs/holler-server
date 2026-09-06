@@ -86,11 +86,42 @@ enum Commands {
     /// Run the WebSocket listener (issue #31: "first talk"). Blocks
     /// until Ctrl-C.
     Serve(ServeArgs),
-    /// This process's own status document (`role: server`). Reaches a
-    /// live `holler serve` process over the local control channel if
-    /// one is running on this host; otherwise reports a local-only,
-    /// not-connected document.
+    /// This process's own status document (`role: server`), or (with an
+    /// `id`) a live client's status, relayed over the wire (issue #37).
+    /// Reaches a live `holler serve` process over the local control
+    /// channel if one is running on this host; otherwise reports a
+    /// local-only, not-connected document.
     Status {
+        /// Token id, client id, or hostname of a connected client —
+        /// relays `query status` to it instead of answering locally.
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// `holler support [<id>] <feature>`: do you (or a connected
+    /// client) support this protocol feature or harness, right now.
+    Support {
+        /// `<feature>` (local) or `<id> <feature>` (relayed to that
+        /// client). A single argument that is not a known feature or
+        /// harness id is an error ("missing feature"), per spec §8.
+        #[arg(num_args = 1..=2)]
+        args: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// `holler caps [<id>]`: full capability document (status + a map
+    /// of every known feature/harness → `{ok, kind, reason?}`).
+    Caps {
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// `holler query [<id>] <cmd> [args...]`: the general query form —
+    /// `status` / `caps` / `support [feature]` / `protocol [version]`,
+    /// local or (with a leading `<id>`) relayed to a connected client.
+    Query {
+        #[arg(num_args = 1..)]
+        args: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -104,6 +135,11 @@ enum Commands {
         json: bool,
     },
 }
+
+/// The four `query` `cmd`s the protocol defines (spec §7). `holler
+/// query`'s general form uses this to tell a leading `<id>` apart from
+/// the `cmd` itself: an id is never one of these words.
+const KNOWN_QUERY_CMDS: &[&str] = &["status", "caps", "support", "protocol"];
 
 #[derive(clap::Args)]
 struct ServeArgs {
@@ -177,7 +213,10 @@ fn main() {
         Commands::Token(args) => run_token(args.command).map_err(Into::into),
         Commands::Client(args) => run_client(args.command).map_err(Into::into),
         Commands::Serve(args) => run_serve(args),
-        Commands::Status { json } => run_status(json),
+        Commands::Status { id, json } => run_status(id, json),
+        Commands::Support { args, json } => run_support(args, json),
+        Commands::Caps { id, json } => run_caps(id, json),
+        Commands::Query { args, json } => run_query(args, json),
         Commands::Roster { json } => run_roster(json),
     };
     if let Err(e) = result {
@@ -226,39 +265,92 @@ fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     })
 }
 
-fn run_status(json: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn run_status(id: Option<String>, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    run_query_command("status", id, Vec::new(), json)
+}
+
+fn run_support(mut args: Vec<String>, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // clap's `num_args = 1..=2` guarantees 1 or 2 elements.
+    let (target, feature) = if args.len() == 2 {
+        (Some(args.remove(0)), args.remove(0))
+    } else {
+        (None, args.remove(0))
+    };
+    run_query_command("support", target, vec![feature], json)
+}
+
+fn run_caps(id: Option<String>, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    run_query_command("caps", id, Vec::new(), json)
+}
+
+fn run_query(args: Vec<String>, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // `holler query <cmd> [args...]` vs `holler query <id> <cmd> [args...]`:
+    // a leading word that is not one of the four known `cmd`s, with a
+    // second word to be the `cmd`, is a target id (spec §8's
+    // disambiguation for `support`, generalized). A single unrecognized
+    // word is always treated as a local `cmd` — it fails closed via
+    // `query::dispatch`'s own `unknown_cmd`, not a CLI-level "missing
+    // cmd" error, matching ADR 0009 (never invent, but still dispatch).
+    let (target, cmd, rest) = if args.len() >= 2 && !KNOWN_QUERY_CMDS.contains(&args[0].as_str()) {
+        (Some(args[0].clone()), args[1].clone(), args[2..].to_vec())
+    } else {
+        (None, args[0].clone(), args[1..].to_vec())
+    };
+    run_query_command(&cmd, target, rest, json)
+}
+
+/// Shared path for `status`/`support`/`caps`/`query`: reach a live
+/// `holler serve` process over the control channel (issue #37); for an
+/// untargeted query with no live server, fall back to this binary's own
+/// compile-time view (zero clients, no confirmed harnesses — the same
+/// "not running" answer `holler status` has always given). A targeted
+/// query has no local fallback — resolving `<id>` requires a live
+/// registry, so no live server means the target is simply unreachable.
+fn run_query_command(
+    cmd: &str,
+    target: Option<String>,
+    args: Vec<String>,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let store = TokenStore::open()?;
     let state_dir = store.dir().to_path_buf();
-    let live = wire::control::query_status(&state_dir);
-    let hostname = wire::local_hostname()?;
 
-    let (listening, clients) = match &live {
-        Some(doc) => (doc.listening.clone(), doc.clients),
-        None => (Vec::new(), 0),
+    let reply = wire::control::run_query(&state_dir, target.clone(), cmd, args.clone());
+    let body = match reply {
+        Some(wire::control::QueryReply::Ok { query_ok }) => query_ok,
+        Some(wire::control::QueryReply::Err { error }) => {
+            return Err(format!("{}: {}", error.code, error.message.unwrap_or_default()).into());
+        }
+        Some(wire::control::QueryReply::NotConnected) if target.is_some() => {
+            return Err(format!(
+                "no live connection matches {:?}",
+                target.expect("target.is_some() was just checked")
+            )
+            .into());
+        }
+        _ if target.is_some() => {
+            return Err("no live `holler serve` process is reachable on this host".into());
+        }
+        _ => {
+            // Untargeted, no live server: this binary's own local view.
+            let hostname = wire::local_hostname()?;
+            match wire::query::dispatch(cmd, &args, &hostname, &[], 0, &[]) {
+                Ok(body) => body,
+                Err(err) => {
+                    return Err(
+                        format!("{}: {}", err.code, err.message.unwrap_or_default()).into(),
+                    );
+                }
+            }
+        }
     };
-    let body = wire::hello::status_query_ok_body(&hostname, &listening, clients);
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        println!("{}", serde_json::to_string_pretty(&body.rest)?);
+    } else if body.cmd == "status" || body.cmd == "caps" {
+        print_status_like(&body);
     } else {
-        println!("role:      server");
-        println!("hostname:  {hostname}");
-        println!(
-            "protocol:  {} (min {} max {})",
-            wire::hello::PROTOCOL_VERSION,
-            wire::hello::PROTOCOL_VERSION,
-            wire::hello::PROTOCOL_VERSION
-        );
-        println!(
-            "listening: {}",
-            if listening.is_empty() {
-                "not running".to_string()
-            } else {
-                listening.join(", ")
-            }
-        );
-        println!("clients:   {clients}");
-        println!("status:    {}", if live.is_some() { "healthy" } else { "not running" });
+        print_generic(&body);
     }
     Ok(())
 }
@@ -314,6 +406,72 @@ fn run_roster(json: bool) -> Result<(), Box<dyn std::error::Error>> {
         print_roster_table(&rows);
     }
     Ok(())
+}
+
+/// Pretty-print a `status`/`caps` `query_ok` body the way `holler
+/// status` has always looked; `caps` additionally lists its
+/// `capabilities` map.
+fn print_status_like(body: &holler_server::proto::QueryOkBody) {
+    use serde_json::Value;
+    let rest = &body.rest;
+    let get_str = |k: &str| rest.get(k).and_then(Value::as_str).unwrap_or("?");
+    let listening = rest.get("listening").and_then(Value::as_array);
+    let listening_str = match listening {
+        Some(l) if !l.is_empty() => l
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => "not running".to_string(),
+    };
+
+    println!("role:      {}", get_str("role"));
+    println!("hostname:  {}", get_str("hostname"));
+    println!(
+        "protocol:  {} (min {} max {})",
+        rest.get("protocol").and_then(Value::as_u64).unwrap_or(0),
+        rest.get("protocol_min").and_then(Value::as_u64).unwrap_or(0),
+        rest.get("protocol_max").and_then(Value::as_u64).unwrap_or(0)
+    );
+    println!("listening: {listening_str}");
+    println!(
+        "clients:   {}",
+        rest.get("clients").and_then(Value::as_u64).unwrap_or(0)
+    );
+    println!(
+        "status:    {}",
+        if listening.is_some_and(|l| !l.is_empty()) {
+            "healthy"
+        } else {
+            "not running"
+        }
+    );
+
+    if let Some(capabilities) = rest.get("capabilities").and_then(Value::as_object) {
+        println!("capabilities:");
+        let mut ids: Vec<&String> = capabilities.keys().collect();
+        ids.sort();
+        for id in ids {
+            let ok = capabilities[id]
+                .get("ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            println!("  {id}: {}", if ok { "ok" } else { "no" });
+        }
+    }
+}
+
+/// Pretty-print any other `query_ok` body (`support`, `protocol`) as
+/// `field: value` lines, sorted for stable output.
+fn print_generic(body: &holler_server::proto::QueryOkBody) {
+    println!("cmd: {}", body.cmd);
+    if let Some(map) = body.rest.as_object() {
+        let mut keys: Vec<&String> = map.keys().collect();
+        keys.sort();
+        for key in keys {
+            println!("{key}: {}", map[key]);
+        }
+    }
 }
 
 fn run_token(command: TokenCommands) -> Result<(), TokenError> {
