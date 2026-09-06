@@ -2,7 +2,7 @@
 //!
 //! Canonical spec: `docs/protocol/v1.md`. One JSON object per WebSocket
 //! text frame: [`Envelope`] wraps a `Body` that is an extensible enum
-//! over the 12 v1 message types.
+//! over the 14 v1 message types.
 
 use serde::de::Error as _;
 use serde::Deserializer;
@@ -27,6 +27,10 @@ pub const CODE_UNKNOWN_CMD: &str = "unknown_cmd";
 pub const CODE_UNKNOWN_FEATURE: &str = "unknown_feature";
 /// Server `query`/`ping` to a bound token with no live socket (spec §11).
 pub const CODE_NOT_CONNECTED: &str = "not_connected";
+/// `join` secret not found, already bound, invalidated, revoked, or
+/// expired — the specific reason goes in `error.message` (spec §4.1,
+/// §11, ADR 0015).
+pub const CODE_JOIN_FAILED: &str = "join_failed";
 
 // --------------------------------------------------------------------------
 // Envelope (spec §3)
@@ -44,9 +48,16 @@ pub enum Role {
     Server,
 }
 
-/// The 12 v1 message types (spec §5).
+/// The v1 message types (spec §5), including `join`/`join_ok` (ADR 0015).
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MessageType {
+    /// client → server: redeem a one-time join secret for a `client_id`
+    /// + credential (first frame only, never alongside `auth`).
+    #[serde(rename = "join")]
+    Join,
+    /// server → client: `join` succeeded: `client_id` + credential.
+    #[serde(rename = "join_ok")]
+    JoinOk,
     /// client → server: present credential.
     #[serde(rename = "auth")]
     Auth,
@@ -116,6 +127,8 @@ pub struct Envelope {
 /// itself is never (de)serialized as a serde enum.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Body {
+    Join(JoinBody),
+    JoinOk(JoinOkBody),
     Auth(AuthBody),
     Hello(HelloBody),
     Query(QueryBody),
@@ -133,6 +146,23 @@ pub enum Body {
 // --------------------------------------------------------------------------
 // Bodies (spec §4–§11)
 // --------------------------------------------------------------------------
+
+/// `join` body (spec §4.1, ADR 0015): a one-time join secret plus the
+/// joining machine's hostname. `from` on the envelope carries the join
+/// token's public `token_id` (not the secret).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct JoinBody {
+    pub secret: String,
+    pub hostname: String,
+}
+
+/// `join_ok` body (spec §4.1, ADR 0015): the newly issued client
+/// identity + long-lived credential, shown once.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct JoinOkBody {
+    pub client_id: String,
+    pub credential: String,
+}
 
 /// Spec leaves the auth body shape open (issue #28); modeled as a thin
 /// wrapper around an opaque credential object so we can parse/echo it
@@ -282,7 +312,7 @@ pub enum DecodeError {
     /// Envelope `v` is present but not `1` (spec §2: a v1 server
     /// requires `v == 1`; no silent downgrade).
     UnsupportedVersion(u32),
-    /// Envelope `type` is not one of the 12 v1 types (spec §3).
+    /// Envelope `type` is not one of the 14 v1 types (spec §3).
     UnknownType,
     /// Frame is not valid JSON, or JSON that does not fit the
     /// envelope schema. `serde_json::Error` is not `Clone`, so we
@@ -321,7 +351,7 @@ pub fn encode(envelope: &Envelope) -> serde_json::Result<String> {
 /// tagging cannot reach.
 ///
 /// * A frame that is not JSON is [`DecodeError::Malformed`].
-/// * A frame whose `type` is not one of the 12 v1 types is
+/// * A frame whose `type` is not one of the 14 v1 types is
 ///   [`DecodeError::UnknownType`] (spec §3: "Do not ignore it as
 ///   success.").
 /// * A frame whose JSON is valid and `type` is known, but whose `v` is
@@ -459,9 +489,11 @@ fn parse_envelope(raw: &str) -> Result<ParsedEnvelope, DecodeError> {
 
 impl MessageType {
     /// Map a wire `type` string to a [`MessageType`]; `None` if the
-    /// string is not one of the 12 v1 types.
+    /// string is not one of the 14 v1 types.
     fn from_wire(s: &str) -> Option<Self> {
         match s {
+            "join" => Some(Self::Join),
+            "join_ok" => Some(Self::JoinOk),
             "auth" => Some(Self::Auth),
             "hello" => Some(Self::Hello),
             "query" => Some(Self::Query),
@@ -482,6 +514,8 @@ impl MessageType {
     /// [`MessageType::from_wire`]).
     fn as_wire_str(self) -> &'static str {
         match self {
+            Self::Join => "join",
+            Self::JoinOk => "join_ok",
             Self::Auth => "auth",
             Self::Hello => "hello",
             Self::Query => "query",
@@ -512,6 +546,8 @@ impl MessageType {
 impl Serialize for Body {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
+            Body::Join(b) => b.serialize(serializer),
+            Body::JoinOk(b) => b.serialize(serializer),
             Body::Auth(b) => b.serialize(serializer),
             Body::Hello(b) => b.serialize(serializer),
             Body::Query(b) => b.serialize(serializer),
@@ -537,6 +573,12 @@ impl Body {
     fn deserialize_value(body: Value, msg_type: MessageType) -> Result<Self, DecodeError> {
         let malformed = |msg: String| DecodeError::Malformed(msg);
         match msg_type {
+            MessageType::Join => Ok(Body::Join(
+                serde_json::from_value(body).map_err(|e| malformed(e.to_string()))?,
+            )),
+            MessageType::JoinOk => Ok(Body::JoinOk(
+                serde_json::from_value(body).map_err(|e| malformed(e.to_string()))?,
+            )),
             MessageType::Auth => Ok(Body::Auth(
                 serde_json::from_value(body).map_err(|e| malformed(e.to_string()))?,
             )),

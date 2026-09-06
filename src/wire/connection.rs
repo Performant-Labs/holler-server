@@ -13,8 +13,8 @@ use serde::Deserialize;
 
 use crate::debug::{redact, DebugLevel};
 use crate::proto::{
-    self, AuthBody, Body, DecodeError, Envelope, MessageType, PresenceBody, QueryBody,
-    CODE_UNAUTHENTICATED, CODE_UNKNOWN_TYPE,
+    self, AuthBody, Body, DecodeError, Envelope, JoinBody, JoinOkBody, MessageType, PresenceBody,
+    QueryBody, CODE_JOIN_FAILED, CODE_UNAUTHENTICATED, CODE_UNKNOWN_TYPE,
 };
 use crate::token::TokenStore;
 
@@ -60,9 +60,12 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<ConnectionContext>) {
     };
     let (mut write, mut read) = ws_stream.split();
 
-    // 1. First frame must be `auth` (spec §4). Anything else — wrong
-    // type, undecodable, or a version/type the codec already rejects —
-    // fails closed: reply `error` and close, per ADR 0009.
+    // 1. First frame must be `auth` or `join` (spec §4, §4.1; ADR 0015).
+    // Anything else — wrong type, undecodable, or a version/type the
+    // codec already rejects — fails closed: reply `error` and close, per
+    // ADR 0009. `join` is a one-shot bootstrap: it never falls through
+    // to the `auth` path below, on success or failure alike (see
+    // `handle_join`), so a connection sends `join` or `auth`, never both.
     let raw = match next_text_frame(&mut read).await {
         Some(t) => t,
         None => return,
@@ -77,19 +80,26 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<ConnectionContext>) {
             return;
         }
     };
-    let Body::Auth(AuthBody { credential }) = &envelope.body else {
-        let _ = write
-            .send(Message::Text(
-                encode(&proto::error_with_message(
-                    CODE_UNAUTHENTICATED,
-                    "first frame must be `auth`",
-                    &envelope.id,
-                    "server",
+    let credential = match &envelope.body {
+        Body::Join(JoinBody { secret, hostname }) => {
+            handle_join(&ctx, &envelope, secret, hostname, &mut write).await;
+            return;
+        }
+        Body::Auth(AuthBody { credential }) => credential,
+        _ => {
+            let _ = write
+                .send(Message::Text(
+                    encode(&proto::error_with_message(
+                        CODE_UNAUTHENTICATED,
+                        "first frame must be `auth` or `join`",
+                        &envelope.id,
+                        "server",
+                    ))
+                    .into(),
                 ))
-                .into(),
-            ))
-            .await;
-        return;
+                .await;
+            return;
+        }
     };
     let Some(credential) = credential.as_str() else {
         let _ = write
@@ -226,6 +236,66 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<ConnectionContext>) {
     );
 }
 
+/// Handle a `join` first frame (spec §4.1, ADR 0015): redeem the
+/// one-time secret via [`TokenStore::redeem`], reply `join_ok` or an
+/// `error`/`join_failed` (reason in `message`), then return — the
+/// caller (`handle_connection`) closes the connection right after this
+/// returns, on either outcome. `join` never proceeds into `hello`/the
+/// session loop on the same socket: it is a one-shot bootstrap, not a
+/// session (the client reconnects via `auth` to actually start one).
+async fn handle_join(
+    ctx: &Arc<ConnectionContext>,
+    envelope: &Envelope,
+    secret: &str,
+    hostname: &str,
+    write: &mut (impl Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+) {
+    let token_id = envelope.from.clone();
+    match ctx.store.redeem(&token_id, secret, hostname.to_string()) {
+        Ok(result) => {
+            trace(
+                ctx,
+                &format!("join succeeded for {}", redact("token_id", &token_id)),
+            );
+            let reply = Envelope {
+                v: 1,
+                msg_type: MessageType::JoinOk,
+                id: envelope.id.clone(),
+                ts: envelope.ts.clone(),
+                from: "server".to_string(),
+                body: Body::JoinOk(JoinOkBody {
+                    client_id: result.client_id,
+                    credential: result.credential,
+                }),
+            };
+            let _ = write.send(Message::Text(encode(&reply).into())).await;
+        }
+        Err(e) => {
+            trace(
+                ctx,
+                &format!("join rejected for {}: {e}", redact("token_id", &token_id)),
+            );
+            let _ = write
+                .send(Message::Text(
+                    encode(&proto::error_with_message(
+                        CODE_JOIN_FAILED,
+                        &e.to_string(),
+                        &envelope.id,
+                        "server",
+                    ))
+                    .into(),
+                ))
+                .await;
+        }
+    }
+    // ADR 0015: the server closes the connection right after replying,
+    // success or failure alike. A real WebSocket close handshake (not
+    // just dropping the TCP stream) so a well-behaved client sees a
+    // clean `Close`, not a reset.
+    let _ = write.send(Message::Close(None)).await;
+    let _ = write.close().await;
+}
+
 /// Handle one decoded-or-not frame received after auth. Returns `false`
 /// when the connection should close (malformed frame / unsupported
 /// version — ADR 0009 fail-closed).
@@ -319,6 +389,17 @@ async fn handle_frame(
             // scope (reconnect is a *new* connection); ignore rather
             // than tearing down an otherwise-good session over it.
             trace(ctx, "ignoring mid-session `auth` frame");
+        }
+        Body::Join(_) | Body::JoinOk(_) => {
+            // `join` is legal only as the first frame (ADR 0015); a
+            // connection that reaches `handle_frame` has already
+            // authenticated, so a `join`/`join_ok` here is out of
+            // sequence. Ignore rather than tearing down an otherwise-good
+            // session over it, mirroring the mid-session `auth` case.
+            trace(
+                ctx,
+                &format!("ignoring mid-session {:?} frame", envelope.msg_type),
+            );
         }
         Body::Presence(PresenceBody { sessions }) => {
             // No ack (research memo, message-integrity §3: `presence`
