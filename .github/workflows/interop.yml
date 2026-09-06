@@ -48,8 +48,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Unlike ci.yml's GitHub-hosted runners (which ship rustup
+      # preinstalled), the shared self-hosted-linux pool's runner image
+      # (see playbook/infrastructure/ci-platform.md) has no Rust toolchain
+      # baked in — install it if missing, rather than assuming it's there.
       - name: Install Rust
-        run: rustup toolchain install stable
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+          fi
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
+          "${CARGO_HOME:-$HOME/.cargo}/bin/rustup" toolchain install stable
 
       - name: Build holler-server
         run: cargo build --release
