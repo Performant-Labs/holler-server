@@ -9,7 +9,7 @@ Specs: [Holler v1](v1.md) · [protocol index](README.md) · interrupt [ADR 0005]
 ## Interrupt
 
 ```
-you:  holler interrupt alpha
+you:  holler-server interrupt alpha
           │  Holler v1  (WebSocket, default :41807)
           ▼
      holler-server  --interrupt frame-->  holler-client
@@ -19,7 +19,7 @@ you:  holler interrupt alpha
                                           session/cancel
 ```
 
-`holler interrupt alpha` is **not** a prompt and not SIGINT. It is a Holler control frame:
+`holler-server interrupt alpha` is **not** a prompt and not SIGINT. It is a Holler control frame:
 
 ```json
 { "v": 1, "type": "interrupt", "body": { "session": "alpha" } }
@@ -28,7 +28,7 @@ you:  holler interrupt alpha
 holler-client already has an ACP subprocess for that session (v1 default: `opencode acp`). It maps the frame to ACP **`session/cancel`**.
 
 - The **turn** dies.
-- The **ACP session stays** and must accept a later `holler say`.
+- The **ACP session stays** and must accept a later `holler-server say`.
 - Nested tool/permission work should cancel with the turn (ACP cascading cancel).
 - Interrupting `alpha` must not touch `beta`.
 
@@ -39,7 +39,7 @@ If that agent does not honor `session/cancel`, v1 falls back to OpenCode HTTP `P
 Same hinge:
 
 ```
-you:  holler say alpha "…"
+you:  holler-server say alpha "…"
           │  Holler v1  prompt
           ▼
      holler-server  -------------------->  holler-client
@@ -51,7 +51,7 @@ you:  holler say alpha "…"
      holler-server  <----- reply ---------  holler-client
 ```
 
-`holler say` is a Holler `prompt` frame. The client turns it into ACP `session/prompt`. Agent output comes back as ACP `session/update` and is published on the circuit as Holler `reply`.
+`holler-server say` is a Holler `prompt` frame. The client turns it into ACP `session/prompt`. Agent output comes back as ACP `session/update` and is published on the circuit as Holler `reply`.
 
 Extra prompts while a turn runs are **queued**. Interrupt cancels the current turn; queued prompts stay (ADR 0005).
 
