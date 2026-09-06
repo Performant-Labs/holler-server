@@ -151,7 +151,7 @@ pub async fn serve(config: ServeConfig) -> io::Result<ServerHandle> {
 
     let hostname = local_hostname()?;
     let store = Arc::new(TokenStore::open().map_err(io::Error::other)?);
-    let registry = Arc::new(Registry::new());
+    let registry = Arc::new(Registry::new().with_debug(config.debug));
     let roster = Arc::new(Roster::new(RosterConfig::from_env()));
     let lockout = Arc::new(LockoutTracker::new());
     let state_dir = store.dir().to_path_buf();
