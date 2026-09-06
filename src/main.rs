@@ -369,7 +369,7 @@ fn run_query_command(
         _ => {
             // Untargeted, no live server: this binary's own local view.
             let hostname = wire::local_hostname()?;
-            match wire::query::dispatch(cmd, &args, &hostname, &[], 0, &[]) {
+            match wire::query::dispatch(cmd, &args, &hostname, &[], 0, 0, &[]) {
                 Ok(body) => body,
                 Err(err) => {
                     return Err(

@@ -279,6 +279,20 @@ impl Roster {
         })
     }
 
+    /// Count of rows not yet [`RosterState::Gone`] (issue #81's `query
+    /// status`/`caps` `sessions` field) — distinct from
+    /// [`super::registry::Registry::len`], which counts open sockets,
+    /// not advertised sessions; a socket can be open with zero sessions,
+    /// or a session can still be `Reconnecting` after its socket drops.
+    pub fn live_count(&self) -> usize {
+        let now = Instant::now();
+        let entries = self.entries.lock().expect("roster mutex poisoned");
+        entries
+            .values()
+            .filter(|e| e.state_at(now, &self.config) != RosterState::Gone)
+            .count()
+    }
+
     /// Snapshot of every row, with state derived as of now (for `holler
     /// roster` / the control channel).
     pub fn snapshot(&self) -> Vec<RosterRow> {
@@ -362,6 +376,26 @@ mod tests {
         std::thread::sleep(Duration::from_millis(2000));
         let rows = roster.snapshot();
         assert_eq!(rows[0].state, RosterState::Gone);
+    }
+
+    #[test]
+    fn live_count_excludes_gone_but_includes_reconnecting() {
+        let roster = Roster::new(tiny_config());
+        roster
+            .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
+            .unwrap();
+        roster
+            .advertise("beta".into(), "opencode".into(), "tok_2", "cli_2")
+            .unwrap();
+        assert_eq!(roster.live_count(), 2);
+
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(roster.snapshot()[0].state, RosterState::Reconnecting);
+        // Reconnecting still counts as live — only `Gone` is excluded.
+        assert_eq!(roster.live_count(), 2);
+
+        std::thread::sleep(Duration::from_millis(2000));
+        assert_eq!(roster.live_count(), 0);
     }
 
     #[test]

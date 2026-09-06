@@ -486,6 +486,7 @@ async fn handle_frame(
                 &ctx.server_hostname,
                 ctx.listening.as_slice(),
                 ctx.registry.len(),
+                ctx.roster.live_count(),
                 &confirmed,
             ) {
                 Ok(body) => Envelope {

@@ -328,6 +328,7 @@ async fn handle_control_conn(
                             &server_hostname,
                             &listening,
                             registry.len(),
+                            roster.live_count(),
                             &confirmed,
                         ) {
                             Ok(body) => QueryReply::Ok { query_ok: body },

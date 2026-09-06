@@ -54,6 +54,7 @@ fn status_rest(
     hostname: &str,
     listening: &[String],
     clients: usize,
+    sessions: usize,
     confirmed: &[HarnessConfirmation],
 ) -> Value {
     json!({
@@ -67,21 +68,25 @@ fn status_rest(
         "harnesses_known": HARNESSES_KNOWN,
         "harnesses_confirmed": confirmed,
         "clients": clients,
-        "sessions": 0,
+        "sessions": sessions,
     })
 }
 
 /// `query status` (spec §7 "status document"): who is this process, is
-/// it up, which harnesses are **confirmed** right now.
+/// it up, which harnesses are **confirmed** right now. `sessions` is a
+/// live count (issue #81) — rows the roster does not yet consider
+/// [`super::roster::RosterState::Gone`], the same "known vs. confirmed"
+/// discipline as `harnesses_confirmed` — never a static config number.
 pub fn status_body(
     hostname: &str,
     listening: &[String],
     clients: usize,
+    sessions: usize,
     confirmed: &[HarnessConfirmation],
 ) -> QueryOkBody {
     QueryOkBody {
         cmd: "status".to_string(),
-        rest: status_rest(hostname, listening, clients, confirmed),
+        rest: status_rest(hostname, listening, clients, sessions, confirmed),
     }
 }
 
@@ -91,9 +96,10 @@ pub fn caps_body(
     hostname: &str,
     listening: &[String],
     clients: usize,
+    sessions: usize,
     confirmed: &[HarnessConfirmation],
 ) -> QueryOkBody {
-    let mut rest = status_rest(hostname, listening, clients, confirmed);
+    let mut rest = status_rest(hostname, listening, clients, sessions, confirmed);
 
     let mut capabilities = serde_json::Map::new();
     for feature in PROTOCOL_FEATURES {
@@ -235,11 +241,12 @@ pub fn dispatch(
     hostname: &str,
     listening: &[String],
     clients: usize,
+    sessions: usize,
     confirmed: &[HarnessConfirmation],
 ) -> Result<QueryOkBody, ErrorBody> {
     match cmd {
-        "status" => Ok(status_body(hostname, listening, clients, confirmed)),
-        "caps" => Ok(caps_body(hostname, listening, clients, confirmed)),
+        "status" => Ok(status_body(hostname, listening, clients, sessions, confirmed)),
+        "caps" => Ok(caps_body(hostname, listening, clients, sessions, confirmed)),
         "support" => support_body(args, confirmed),
         "protocol" => protocol_body(args),
         other => Err(error_body(
@@ -263,7 +270,13 @@ mod tests {
 
     #[test]
     fn status_reports_role_and_confirmed_harnesses() {
-        let body = status_body("uranus", &["ws://x".to_string()], 2, &confirmed("opencode", &["kiwi"]));
+        let body = status_body(
+            "uranus",
+            &["ws://x".to_string()],
+            2,
+            0,
+            &confirmed("opencode", &["kiwi"]),
+        );
         assert_eq!(body.cmd, "status");
         assert_eq!(body.rest["role"], "server");
         assert_eq!(body.rest["clients"], 2);
@@ -272,8 +285,14 @@ mod tests {
     }
 
     #[test]
+    fn status_reports_a_real_session_count_not_the_hardcoded_zero() {
+        let body = status_body("uranus", &[], 2, 3, &[]);
+        assert_eq!(body.rest["sessions"], 3);
+    }
+
+    #[test]
     fn caps_maps_every_known_feature_and_harness() {
-        let body = caps_body("uranus", &[], 0, &[]);
+        let body = caps_body("uranus", &[], 0, 0, &[]);
         let caps = body.rest["capabilities"].as_object().unwrap();
         assert_eq!(caps.len(), PROTOCOL_FEATURES.len() + HARNESSES_KNOWN.len());
         assert_eq!(caps["query"]["ok"], true);
@@ -285,10 +304,16 @@ mod tests {
 
     #[test]
     fn caps_reflects_a_confirmed_harness() {
-        let body = caps_body("uranus", &[], 1, &confirmed("opencode", &["kiwi"]));
+        let body = caps_body("uranus", &[], 1, 1, &confirmed("opencode", &["kiwi"]));
         let caps = body.rest["capabilities"].as_object().unwrap();
         assert_eq!(caps["opencode"]["ok"], true);
         assert_eq!(caps["opencode"]["clients"][0], "kiwi");
+    }
+
+    #[test]
+    fn caps_reports_a_real_session_count_not_the_hardcoded_zero() {
+        let body = caps_body("uranus", &[], 0, 5, &[]);
+        assert_eq!(body.rest["sessions"], 5);
     }
 
     #[test]
@@ -379,15 +404,21 @@ mod tests {
 
     #[test]
     fn dispatch_routes_known_cmds() {
-        assert!(dispatch("status", &[], "uranus", &[], 0, &[]).is_ok());
-        assert!(dispatch("caps", &[], "uranus", &[], 0, &[]).is_ok());
-        assert!(dispatch("protocol", &[], "uranus", &[], 0, &[]).is_ok());
-        assert!(dispatch("support", &["query".to_string()], "uranus", &[], 0, &[]).is_ok());
+        assert!(dispatch("status", &[], "uranus", &[], 0, 0, &[]).is_ok());
+        assert!(dispatch("caps", &[], "uranus", &[], 0, 0, &[]).is_ok());
+        assert!(dispatch("protocol", &[], "uranus", &[], 0, 0, &[]).is_ok());
+        assert!(dispatch("support", &["query".to_string()], "uranus", &[], 0, 0, &[]).is_ok());
+    }
+
+    #[test]
+    fn dispatch_threads_the_session_count_through_to_status() {
+        let body = dispatch("status", &[], "uranus", &[], 0, 4, &[]).unwrap();
+        assert_eq!(body.rest["sessions"], 4);
     }
 
     #[test]
     fn dispatch_fails_closed_on_unknown_cmd() {
-        let err = dispatch("summarize", &[], "uranus", &[], 0, &[]).unwrap_err();
+        let err = dispatch("summarize", &[], "uranus", &[], 0, 0, &[]).unwrap_err();
         assert_eq!(err.code, CODE_UNKNOWN_CMD);
         assert_eq!(err.cmd.as_deref(), Some("summarize"));
     }
