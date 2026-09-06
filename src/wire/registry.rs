@@ -88,21 +88,34 @@ enum PendingQueryReply {
 /// The outcome of [`Registry::prompt`]: the concatenated text of every
 /// `reply` frame received up to and including the one with `done: true`
 /// (spec §10: `text` and/or `chunks`, joined in arrival order), the
-/// target's own `error` in place of a reply, or `Disconnected` — covering
+/// target's own `error` in place of a reply, `Disconnected` — covering
 /// "no such connection", "the outbound channel is closed", and "no
 /// `reply` arrived within [`PROMPT_TIMEOUT`]" uniformly, same as
-/// [`QueryOutcome::Disconnected`].
+/// [`QueryOutcome::Disconnected`] — or `Cancelled` (issue #82): a
+/// **different** CLI invocation's `holler interrupt` for this exact
+/// session landed (and was acked) while this prompt was still waiting.
+/// Kept apart from `Disconnected` on purpose — the connection (and the
+/// server) are both still very much alive; only this one turn was cut
+/// short deliberately, which is a different fact than "unreachable" and
+/// deserves its own CLI-facing message rather than the misleading
+/// generic one (see `main.rs`'s `run_say`).
 pub enum PromptOutcome {
     Done { text: String, exit: Option<i64> },
     Err(ErrorBody),
     Disconnected,
+    Cancelled,
 }
 
 /// One event this process's pending `prompt` is waiting on: a `reply`
-/// frame (partial or final) or the target's own `error` in place of one.
+/// frame (partial or final), the target's own `error` in place of one, or
+/// `Cancelled` (issue #82) — pushed by [`Registry::interrupt`] once its
+/// `ack` arrives for the very same session, so a concurrently waiting
+/// [`Registry::prompt`] wakes immediately instead of idling out to
+/// [`PROMPT_TIMEOUT`] or a real (but here irrelevant) disconnect.
 enum PromptEvent {
     Reply(ReplyBody),
     Err(ErrorBody),
+    Cancelled,
 }
 
 /// The outcome of [`Registry::interrupt`] (issue #34, ADR 0005). Unlike
@@ -140,10 +153,14 @@ struct Entry {
     pending_queries: Mutex<HashMap<String, oneshot::Sender<PendingQueryReply>>>,
     /// Outstanding outbound `prompt`s this connection has not yet
     /// finished answering, keyed by the envelope `id` every `reply`
-    /// (partial or final) must echo back. An `mpsc`, not a `oneshot`
-    /// (unlike `pending`/`pending_queries`): a `prompt` may see several
-    /// `done: false` replies before the one that finishes it.
-    pending_prompts: Mutex<HashMap<String, mpsc::UnboundedSender<PromptEvent>>>,
+    /// (partial or final) must echo back, alongside the session name it
+    /// was sent for. An `mpsc`, not a `oneshot` (unlike
+    /// `pending`/`pending_queries`): a `prompt` may see several
+    /// `done: false` replies before the one that finishes it. The session
+    /// name (issue #82) lets [`Registry::interrupt`] find and wake the
+    /// pending prompt(s) for the session it just got an `ack` for, without
+    /// knowing their prompt ids.
+    pending_prompts: Mutex<HashMap<String, (String, mpsc::UnboundedSender<PromptEvent>)>>,
     /// Outstanding outbound `interrupt`s this connection has not yet
     /// `ack`ed, keyed by the interrupt envelope's `id` (which the `ack`
     /// body's `of` must echo back). Deliberately its own map, never
@@ -504,7 +521,7 @@ impl Registry {
                 .pending_prompts
                 .lock()
                 .expect("pending-prompt mutex poisoned");
-            pending.insert(prompt_id.clone(), tx);
+            pending.insert(prompt_id.clone(), (session.clone(), tx));
         }
 
         let envelope = crate::wire::hello::new_prompt_envelope(&prompt_id, session, text, meta);
@@ -532,6 +549,10 @@ impl Registry {
                 Ok(Some(PromptEvent::Err(body))) => {
                     self.forget_pending_prompt(token_id, &prompt_id);
                     return PromptOutcome::Err(body);
+                }
+                Ok(Some(PromptEvent::Cancelled)) => {
+                    self.forget_pending_prompt(token_id, &prompt_id);
+                    return PromptOutcome::Cancelled;
                 }
                 Ok(None) | Err(_) => {
                     self.forget_pending_prompt(token_id, &prompt_id);
@@ -564,7 +585,7 @@ impl Registry {
                 .pending_prompts
                 .lock()
                 .expect("pending-prompt mutex poisoned");
-            if let Some(tx) = pending.get(reply_to) {
+            if let Some((_, tx)) = pending.get(reply_to) {
                 let _ = tx.send(PromptEvent::Reply(body));
             }
         }
@@ -584,7 +605,7 @@ impl Registry {
                 .pending_prompts
                 .lock()
                 .expect("pending-prompt mutex poisoned");
-            if let Some(tx) = pending.get(reply_to) {
+            if let Some((_, tx)) = pending.get(reply_to) {
                 let _ = tx.send(PromptEvent::Err(body));
             }
         }
@@ -629,14 +650,22 @@ impl Registry {
             pending.insert(interrupt_id.clone(), tx);
         }
 
-        let envelope = crate::wire::hello::new_interrupt_envelope(&interrupt_id, session);
+        let envelope = crate::wire::hello::new_interrupt_envelope(&interrupt_id, session.clone());
         if out_tx.send(envelope).is_err() {
             self.forget_pending_interrupt(token_id, &interrupt_id);
             return InterruptOutcome::Disconnected;
         }
 
         match tokio::time::timeout(INTERRUPT_ACK_TIMEOUT, rx).await {
-            Ok(Ok(())) => InterruptOutcome::Acked,
+            Ok(Ok(())) => {
+                // The client just confirmed this session's turn is
+                // cancelled (issue #82): wake any `holler say` still
+                // waiting on this same session's `prompt` right now,
+                // rather than leaving it to idle out to `PROMPT_TIMEOUT`
+                // or a real disconnect that never actually happens.
+                self.cancel_pending_prompts_for_session(token_id, &session);
+                InterruptOutcome::Acked
+            }
             // The `oneshot::Sender` was dropped without sending — that
             // only happens when `Registry::remove` drops this
             // connection's whole `Entry` (and every pending map in it)
@@ -671,6 +700,28 @@ impl Registry {
                 .lock()
                 .expect("pending-interrupt mutex poisoned");
             pending.remove(interrupt_id);
+        }
+    }
+
+    /// Wake every pending [`Registry::prompt`] on `token_id`'s connection
+    /// whose session matches `session` with [`PromptEvent::Cancelled`]
+    /// (issue #82), called right after an `interrupt` for that session is
+    /// `ack`ed. Does not remove the entries itself — `Registry::prompt`'s
+    /// own loop does that via [`Registry::forget_pending_prompt`] once it
+    /// observes the event, the same way it does for every other outcome.
+    fn cancel_pending_prompts_for_session(&self, token_id: &str, session: &str) {
+        let entries = self.entries.lock().expect("registry mutex poisoned");
+        let Some(entry) = entries.get(token_id) else {
+            return;
+        };
+        let pending = entry
+            .pending_prompts
+            .lock()
+            .expect("pending-prompt mutex poisoned");
+        for (prompt_session, tx) in pending.values() {
+            if prompt_session == session {
+                let _ = tx.send(PromptEvent::Cancelled);
+            }
         }
     }
 

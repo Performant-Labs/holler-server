@@ -460,6 +460,9 @@ fn run_say(session: String, text: String) -> Result<(), Box<dyn std::error::Erro
             }
             Ok(())
         }
+        Some(wire::control::SayReply::Interrupted) => {
+            Err("prompt was interrupted before it completed".into())
+        }
         Some(wire::control::SayReply::Err { error }) => {
             Err(format!("{}: {}", error.code, error.message.unwrap_or_default()).into())
         }

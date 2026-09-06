@@ -1155,6 +1155,148 @@ fn interrupt_reports_disconnected_when_the_connection_is_already_gone() {
 }
 
 // ---------------------------------------------------------------------
+// A `say` racing an `interrupt` for the very same session, from a
+// *different* CLI invocation (issue #82): the `say` process must report
+// its own turn was interrupted, not the misleading "no live `holler
+// serve` process is reachable" it used to print when the in-flight
+// `prompt` it was waiting on got cut out from under it elsewhere. The
+// server (and the connection) are alive throughout.
+// ---------------------------------------------------------------------
+
+/// Answer `ping` normally, `interrupt` with an immediate `ack`, and
+/// silently withhold any `reply` to `prompt` — standing in for a real
+/// model turn still in flight when a separate `holler interrupt` cancels
+/// it out from under the `holler say` that is waiting on it.
+fn spawn_prompt_withholding_interrupt_responder(
+    mut write: impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + Unpin
+        + Send
+        + 'static,
+    mut read: impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin
+        + Send
+        + 'static,
+    token_id: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(Ok(Message::Text(text))) = read.next().await {
+            let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            match v["type"].as_str() {
+                Some("ping") => {
+                    let pong = json!({
+                        "v": 1, "type": "pong", "id": v["id"], "ts": "2026-09-05T00:00:00Z",
+                        "from": token_id, "body": {}
+                    });
+                    if write
+                        .send(Message::Text(pong.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Some("interrupt") => {
+                    let ack = json!({
+                        "v": 1, "type": "ack", "id": v["id"], "ts": "2026-09-05T00:00:00Z",
+                        "from": token_id, "body": { "of": v["id"] }
+                    });
+                    if write
+                        .send(Message::Text(ack.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                // `prompt` is deliberately left unanswered — the point of
+                // this responder.
+                _ => continue,
+            }
+        }
+    })
+}
+
+#[test]
+fn say_reports_interrupted_not_no_live_server_when_cancelled_mid_flight() {
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "kiwi");
+    let (client_id, credential) = redeem(&env, &token_id, &secret, "kiwi.local");
+    let server = ServerProcess::spawn(&env);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    #[allow(clippy::async_yields_async)]
+    let responder = rt.block_on(async {
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(server.url())
+            .await
+            .unwrap();
+        send_json(&mut ws, &auth_envelope(&token_id, &credential)).await;
+        let _server_hello = recv_json(&mut ws).await;
+        send_json(&mut ws, &client_hello_envelope(&token_id, &client_id)).await;
+        send_json(
+            &mut ws,
+            &presence_envelope(
+                &token_id,
+                json!([{ "name": "alpha", "harness": "opencode" }]),
+            ),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (write, read) = ws.split();
+        spawn_prompt_withholding_interrupt_responder(write, read, token_id.clone())
+    });
+
+    // `holler say alpha "<long prompt>"`, a separate CLI process, starts
+    // waiting on a reply this responder will never send.
+    let say_child = env
+        .cmd()
+        .args(["say", "alpha", "this prompt takes a while"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn `holler say`");
+
+    // Give the server a moment to register the prompt as pending before
+    // a *different* CLI invocation interrupts the very same session.
+    std::thread::sleep(Duration::from_millis(300));
+    let interrupt_out = env.cmd().args(["interrupt", "alpha"]).output().unwrap();
+    assert!(interrupt_out.status.success(), "{interrupt_out:?}");
+
+    // The interrupt is acked well inside `CLIENT_TIMEOUT` (5s): `say`
+    // must come back promptly with the new, accurate message rather than
+    // idling out to its own 5s control-socket read timeout and reporting
+    // the misleading "no live server" (the pre-fix behavior this test
+    // guards against — the generous bound below still catches that
+    // regression, just more slowly).
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let out = say_child.wait_with_output().expect("wait on `holler say`");
+        let _ = tx.send(out);
+    });
+    let say_out = rx
+        .recv_timeout(Duration::from_secs(7))
+        .expect("`holler say` must return once its session's interrupt is acked, not hang");
+
+    assert!(!say_out.status.success(), "{say_out:?}");
+    let say_stderr = String::from_utf8(say_out.stderr).unwrap();
+    assert!(
+        say_stderr.contains("interrupted before it completed"),
+        "{say_stderr:?}"
+    );
+    assert!(
+        !say_stderr.contains("no live"),
+        "must not report the misleading \"no live server\" message: {say_stderr:?}"
+    );
+
+    rt.block_on(async {
+        responder.abort();
+        let _ = responder.await;
+    });
+}
+
+// ---------------------------------------------------------------------
 // Revoke force-closes the live connection (issue #78): `holler client
 // detach` / `token delete` correctly flip the on-disk record to
 // `revoked`, but before this fix left the live WebSocket connection (and
