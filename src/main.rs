@@ -450,8 +450,8 @@ fn run_roster(json: bool) -> Result<(), Box<dyn std::error::Error>> {
 fn run_say(session: String, text: String) -> Result<(), Box<dyn std::error::Error>> {
     let store = TokenStore::open()?;
     let state_dir = store.dir().to_path_buf();
-    match wire::control::run_say(&state_dir, session, text) {
-        Some(wire::control::SayReply::Ok { text, exit }) => {
+    match wire::control::run_say(&state_dir, session.clone(), text) {
+        wire::control::ControlOutcome::Reached(wire::control::SayReply::Ok { text, exit }) => {
             println!("{text}");
             if let Some(code) = exit {
                 if code != 0 {
@@ -460,13 +460,23 @@ fn run_say(session: String, text: String) -> Result<(), Box<dyn std::error::Erro
             }
             Ok(())
         }
-        Some(wire::control::SayReply::Interrupted) => {
+        wire::control::ControlOutcome::Reached(wire::control::SayReply::Interrupted) => {
             Err("prompt was interrupted before it completed".into())
         }
-        Some(wire::control::SayReply::Err { error }) => {
+        wire::control::ControlOutcome::Reached(wire::control::SayReply::Err { error }) => {
             Err(format!("{}: {}", error.code, error.message.unwrap_or_default()).into())
         }
-        None => Err("no live `holler serve` process is reachable on this host".into()),
+        // Issue #206: the control socket connected fine and the server is
+        // alive — it just hasn't finished this turn yet. Distinct from
+        // `NotReachable` below, which is the real "no server running" case.
+        wire::control::ControlOutcome::TimedOut => Err(format!(
+            "say to {session:?} timed out waiting for a reply — the session \
+             may still be working; try `holler say` again or check `holler roster`"
+        )
+        .into()),
+        wire::control::ControlOutcome::NotReachable => {
+            Err("no live `holler serve` process is reachable on this host".into())
+        }
     }
 }
 
@@ -482,22 +492,36 @@ fn run_interrupt(session: String) -> Result<(), Box<dyn std::error::Error>> {
     let store = TokenStore::open()?;
     let state_dir = store.dir().to_path_buf();
     match wire::control::run_interrupt(&state_dir, session.clone()) {
-        Some(wire::control::InterruptReply::Ok) => {
+        wire::control::ControlOutcome::Reached(wire::control::InterruptReply::Ok) => {
             println!("interrupted {session}");
             Ok(())
         }
-        Some(wire::control::InterruptReply::TimedOut) => Err(format!(
-            "interrupt sent to {session:?}, but no ack arrived in time — \
-             the connection is alive but the cancel may not have landed"
-        )
-        .into()),
-        Some(wire::control::InterruptReply::Disconnected) => {
+        wire::control::ControlOutcome::Reached(wire::control::InterruptReply::TimedOut) => {
+            Err(format!(
+                "interrupt sent to {session:?}, but no ack arrived in time — \
+                 the connection is alive but the cancel may not have landed"
+            )
+            .into())
+        }
+        wire::control::ControlOutcome::Reached(wire::control::InterruptReply::Disconnected) => {
             Err(format!("session {session:?}'s connection is gone").into())
         }
-        Some(wire::control::InterruptReply::Err { error }) => {
+        wire::control::ControlOutcome::Reached(wire::control::InterruptReply::Err { error }) => {
             Err(format!("{}: {}", error.code, error.message.unwrap_or_default()).into())
         }
-        None => Err("no live `holler serve` process is reachable on this host".into()),
+        // Issue #206: the control-socket round trip itself timed out
+        // (distinct from the server-reported `InterruptReply::TimedOut`
+        // above, which means the socket answered but the target's own
+        // ack never arrived within `INTERRUPT_ACK_TIMEOUT`).
+        wire::control::ControlOutcome::TimedOut => Err(format!(
+            "interrupt to {session:?} timed out waiting for a reply from the \
+             server — the session may still be working; try `holler status` \
+             to check whether the server is still up"
+        )
+        .into()),
+        wire::control::ControlOutcome::NotReachable => {
+            Err("no live `holler serve` process is reachable on this host".into())
+        }
     }
 }
 
