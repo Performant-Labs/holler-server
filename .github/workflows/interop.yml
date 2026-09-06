@@ -256,7 +256,7 @@ jobs:
             exit 1
           fi
 
-          gh run download "${{ github.run_id }}" -n interop-handoff -D /tmp/handoff
+          gh run download "${{ github.run_id }}" --repo "${{ github.repository }}" -n interop-handoff -D /tmp/handoff
           cat /tmp/handoff/handoff.json
 
           tunnel_url=$(jq -r .tunnel_url /tmp/handoff/handoff.json)
@@ -338,7 +338,7 @@ jobs:
             exit 1
           }
 
-          gh run download "${{ github.run_id }}" -n interop-handoff -D handoff
+          gh run download "${{ github.run_id }}" --repo "${{ github.repository }}" -n interop-handoff -D handoff
           Get-Content handoff/handoff.json
 
           $json = Get-Content handoff/handoff.json -Raw | ConvertFrom-Json
