@@ -1,5 +1,9 @@
 # Testing Holler (CLI, not a browser)
 
+This page is about the *design* of the wire harness below. For practical "how do I run a
+test / a single ticket / the release-gating catalog" instructions, see
+[running-tests.md](running-tests.md) instead.
+
 Playwright is the wrong tool here. It drives **web pages**. Holler is two processes and a CLI. There is no DOM.
 
 ## What we use instead
