@@ -80,6 +80,15 @@ enum Request {
     /// session's in-flight turn — a **control** frame, resolved via the
     /// roster the same way `Say` is, but never queued behind a `prompt`.
     Interrupt { session: String },
+    /// `holler token delete` / `client detach` (issue #78): after the
+    /// on-disk revoke (`TokenStore::delete`) succeeds, ask a live `holler
+    /// serve` process to force-close `token_id`'s live connection too, so
+    /// it stops looking connected on `holler status`/`roster`. Best-effort
+    /// from the CLI's point of view: the on-disk revoke is the durable,
+    /// required step and already happened by the time this is sent; no
+    /// live server reachable (`run_client_query` returns `None`) is not an
+    /// error, same as `Say`/`Interrupt`.
+    Revoke { token_id: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -135,6 +144,16 @@ pub enum InterruptReply {
     TimedOut,
     Disconnected,
     Err { error: ErrorBody },
+}
+
+/// Answer to a [`Request::Revoke`] (issue #78): whether this live server
+/// actually had a connection for `token_id` to force-close. `closed:
+/// false` just means there was nothing live for this process to close —
+/// not an error, and not a sign the on-disk revoke (already performed by
+/// the time this request is sent) failed.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RevokeReply {
+    pub closed: bool,
 }
 
 /// The live server's self-report, as answered over the control channel.
@@ -406,6 +425,11 @@ async fn handle_control_conn(
                 };
                 serde_json::to_string(&reply).expect("InterruptReply always serializes")
             }
+            Request::Revoke { token_id } => {
+                let closed = registry.remove(&token_id);
+                let reply = RevokeReply { closed };
+                serde_json::to_string(&reply).expect("RevokeReply always serializes")
+            }
         };
         write_half.write_all(response.as_bytes()).await?;
         write_half.write_all(b"\n").await?;
@@ -518,6 +542,18 @@ pub fn run_say(state_dir: &Path, session: String, text: String) -> Option<SayRep
 /// fallback, the same as `holler say`.
 pub fn run_interrupt(state_dir: &Path, session: String) -> Option<InterruptReply> {
     let req = Request::Interrupt { session };
+    let line = run_client_query(state_dir, &req)?;
+    serde_json::from_str(&line).ok()
+}
+
+/// `holler token delete` / `client detach` (issue #78): ask a live server
+/// (if any) to force-close `token_id`'s live connection, right after the
+/// caller has already performed the durable on-disk revoke. `None` means
+/// no live server is reachable at all — there is nothing live to close,
+/// and the on-disk revoke is sufficient on its own; callers must not
+/// treat `None` here as a failure of the revoke itself.
+pub fn run_revoke(state_dir: &Path, token_id: String) -> Option<RevokeReply> {
+    let req = Request::Revoke { token_id };
     let line = run_client_query(state_dir, &req)?;
     serde_json::from_str(&line).ok()
 }
@@ -961,5 +997,56 @@ mod tests {
         assert!(matches!(reply, InterruptReply::Disconnected));
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn revoke_force_closes_the_live_connection_and_reports_closed_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Registry::new());
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+        let (server, _shutdown_tx) = spawn_control_server(dir.path(), registry.clone()).await;
+
+        let reply = tokio::task::spawn_blocking({
+            let dir = dir.path().to_path_buf();
+            move || run_revoke(&dir, "tok_1".to_string())
+        })
+        .await
+        .unwrap()
+        .expect("a live server answers a revoke request");
+        assert!(reply.closed);
+
+        // The registry entry is actually gone, and dropping it dropped
+        // `out_tx` — a real connection task's `out_rx.recv()` would see
+        // that close and break its session loop (see `Registry::remove`'s
+        // doc comment).
+        assert_eq!(registry.len(), 0);
+        assert!(out_rx.recv().await.is_none());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn revoke_of_an_unknown_token_reports_closed_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Registry::new());
+        let (server, _shutdown_tx) = spawn_control_server(dir.path(), registry).await;
+
+        let reply = tokio::task::spawn_blocking({
+            let dir = dir.path().to_path_buf();
+            move || run_revoke(&dir, "tok_nope".to_string())
+        })
+        .await
+        .unwrap()
+        .expect("the control socket answers even for an unknown token");
+        assert!(!reply.closed);
+
+        server.abort();
+    }
+
+    #[test]
+    fn run_revoke_with_no_server_running_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(run_revoke(dir.path(), "tok_1".to_string()).is_none());
     }
 }

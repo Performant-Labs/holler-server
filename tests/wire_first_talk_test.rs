@@ -1153,3 +1153,126 @@ fn interrupt_reports_disconnected_when_the_connection_is_already_gone() {
     let stderr = String::from_utf8(out.stderr).unwrap().to_lowercase();
     assert!(stderr.contains("gone"), "{stderr:?}");
 }
+
+// ---------------------------------------------------------------------
+// Revoke force-closes the live connection (issue #78): `holler client
+// detach` / `token delete` correctly flip the on-disk record to
+// `revoked`, but before this fix left the live WebSocket connection (and
+// `holler status`/`roster`'s view of it) untouched. These exercise the
+// new control-channel `Revoke` request end to end against a real
+// connection.
+// ---------------------------------------------------------------------
+
+#[test]
+fn client_detach_force_closes_the_live_connection() {
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "kiwi");
+    let (client_id, credential) = redeem(&env, &token_id, &secret, "kiwi.local");
+    let server = ServerProcess::spawn(&env);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(server.url())
+            .await
+            .unwrap();
+        send_json(&mut ws, &auth_envelope(&token_id, &credential)).await;
+        let _server_hello = recv_json(&mut ws).await;
+        send_json(&mut ws, &client_hello_envelope(&token_id, &client_id)).await;
+
+        // `holler client detach <id>`, a separate CLI process, revokes
+        // the token on disk AND reaches this live `holler serve` process
+        // over the control channel to force-close the connection — not
+        // just stop the client from reconnecting later.
+        let detach_out = env
+            .cmd()
+            .args(["client", "detach", &token_id])
+            .output()
+            .unwrap();
+        assert!(detach_out.status.success(), "{detach_out:?}");
+        let detach_stdout = String::from_utf8(detach_out.stdout).unwrap();
+        assert!(detach_stdout.contains("revoked"), "{detach_stdout:?}");
+
+        // The live connection actually closes, from the client's own
+        // point of view — not just that the CLI printed success and the
+        // on-disk record flipped to `revoked`. The server drops the
+        // socket outright (no close handshake), so this may surface as
+        // an `Ok(None)` (clean EOF) or a websocket-level error depending
+        // on OS timing — either is "closed".
+        let closed = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("the connection closes within 5s");
+        assert!(
+            matches!(closed, None | Some(Err(_)) | Some(Ok(Message::Close(_)))),
+            "expected the connection to close, got {closed:?}"
+        );
+    });
+
+    // `holler status` no longer counts this client as connected.
+    let status_out = env.cmd().args(["status", "--json"]).output().unwrap();
+    assert!(status_out.status.success(), "{status_out:?}");
+    let status_json: Value = serde_json::from_slice(&status_out.stdout).unwrap();
+    assert_eq!(status_json["clients"], 0);
+}
+
+#[test]
+fn client_detach_with_no_live_server_is_not_an_error() {
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "kiwi");
+    let (_client_id, _credential) = redeem(&env, &token_id, &secret, "kiwi.local");
+
+    // No `holler serve` process running at all — the control channel is
+    // unreachable, but the on-disk revoke alone is sufficient (issue
+    // #78's scope note: this must not become a hard error).
+    let out = env
+        .cmd()
+        .args(["client", "detach", &token_id])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("revoked"), "{stdout:?}");
+}
+
+#[test]
+fn client_detach_also_rejects_a_reconnect_attempt_with_the_old_credential() {
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "kiwi");
+    let (client_id, credential) = redeem(&env, &token_id, &secret, "kiwi.local");
+    let server = ServerProcess::spawn(&env);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(server.url())
+            .await
+            .unwrap();
+        send_json(&mut ws, &auth_envelope(&token_id, &credential)).await;
+        let _server_hello = recv_json(&mut ws).await;
+        send_json(&mut ws, &client_hello_envelope(&token_id, &client_id)).await;
+
+        let detach_out = env
+            .cmd()
+            .args(["client", "detach", &token_id])
+            .output()
+            .unwrap();
+        assert!(detach_out.status.success(), "{detach_out:?}");
+
+        // Drain the close on the first connection so it doesn't linger.
+        let _ = tokio::time::timeout(Duration::from_secs(5), ws.next()).await;
+    });
+
+    // A brand-new connection presenting the now-revoked credential is
+    // rejected, same as any other bad `auth` — confirming
+    // `TokenStore::verify_credential` already fails closed on `Revoked`
+    // (it does, per `token::tests::verify_credential_on_revoked_token_is_revoked`);
+    // this issue's actual gap was the live force-close exercised above,
+    // not this rejection.
+    rt.block_on(async {
+        let (mut ws2, _resp2) = tokio_tungstenite::connect_async(server.url())
+            .await
+            .unwrap();
+        send_json(&mut ws2, &auth_envelope(&token_id, &credential)).await;
+        let err = recv_json(&mut ws2).await;
+        assert_eq!(err["type"], "error");
+        assert_eq!(err["body"]["code"], "unauthenticated");
+    });
+}
