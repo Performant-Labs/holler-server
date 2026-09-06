@@ -46,7 +46,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 
-use crate::debug::DebugLevel;
+use crate::debug::DebugConfig;
 use crate::token::TokenStore;
 
 use connection::{ConnectionContext, ConnectionLimits};
@@ -111,7 +111,7 @@ impl std::error::Error for NonLoopbackWithoutTls {}
 /// Configuration for [`serve`].
 pub struct ServeConfig {
     pub listen_addrs: Vec<SocketAddr>,
-    pub debug: DebugLevel,
+    pub debug: DebugConfig,
 }
 
 /// A running server: the addresses it actually bound (useful when a

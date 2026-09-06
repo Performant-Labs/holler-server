@@ -75,6 +75,20 @@ fn print_table(views: &[holler_server::token::TokenView]) {
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// Debug verbosity: `none` (default), `quiet` (high-level frame
+    /// summaries), or `noisy` (full frame JSON, secrets redacted).
+    /// Overrides `HOLLER_DEBUG` when both are set. See
+    /// [`holler_server::debug`] for the exact contract.
+    #[arg(long, global = true)]
+    debug: Option<String>,
+
+    /// Debug output shape: `text` (default) — fixed-width console lines
+    /// with an emission timestamp first — or `json` — JSON Lines, one
+    /// object per line, for `jq`/Vector/Loki. Overrides
+    /// `HOLLER_LOG_FORMAT` when both are set.
+    #[arg(long, global = true)]
+    log_format: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -235,10 +249,21 @@ enum ClientCommands {
 
 fn main() {
     let cli = Cli::parse();
+    // Both axes are resolved once, up front, so an invalid value fails the
+    // process before it does anything observable — and so `serve` gets the
+    // same flag-wins-over-env contract for `--log-format` as for `--debug`
+    // (issue #230).
+    let debug = match resolve_debug_config(cli.debug.as_deref(), cli.log_format.as_deref()) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
     let result: Result<(), Box<dyn std::error::Error>> = match cli.command {
         Commands::Token(args) => run_token(args.command).map_err(Into::into),
         Commands::Client(args) => run_client(args.command).map_err(Into::into),
-        Commands::Serve(args) => run_serve(args),
+        Commands::Serve(args) => run_serve(args, debug),
         Commands::Status { id, json } => run_status(id, json),
         Commands::Support { args, json } => run_support(args, json),
         Commands::Caps { id, json } => run_caps(id, json),
@@ -275,9 +300,27 @@ fn resolve_listen_addrs(flag_values: &[String]) -> Result<Vec<SocketAddr>, Box<d
         .collect()
 }
 
-fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+/// Resolves both debug axes from their flags and environment variables.
+/// Each is flag-wins-over-env and fail-closed: an invalid value at
+/// whichever precedence level wins is an error, never a silent default.
+fn resolve_debug_config(
+    debug_flag: Option<&str>,
+    format_flag: Option<&str>,
+) -> Result<holler_server::debug::DebugConfig, Box<dyn std::error::Error>> {
+    use holler_server::debug::{DebugConfig, DebugLevel, LogFormat};
+    let level = DebugLevel::resolve(debug_flag, std::env::var("HOLLER_DEBUG").ok().as_deref())?;
+    let format = LogFormat::resolve(
+        format_flag,
+        std::env::var("HOLLER_LOG_FORMAT").ok().as_deref(),
+    )?;
+    Ok(DebugConfig::new(level, format))
+}
+
+fn run_serve(
+    args: ServeArgs,
+    debug: holler_server::debug::DebugConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     let listen_addrs = resolve_listen_addrs(&args.listen)?;
-    let debug = holler_server::debug::DebugLevel::resolve(None, std::env::var("HOLLER_DEBUG").ok().as_deref())?;
 
     // Persist what this run resolved to advertise (issue #66) before
     // accepting any connections, so a `mint` invocation racing right
@@ -285,6 +328,13 @@ fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let resolved_advertise = advertise::resolve_advertise(args.advertise.as_deref(), &listen_addrs);
     let store = TokenStore::open()?;
     advertise::persist(store.dir(), resolved_advertise.as_deref())?;
+
+    if debug.is_on() {
+        eprintln!(
+            "holler-server: debug={} format={} — writing frames to stderr, secrets redacted",
+            debug.level, debug.format
+        );
+    }
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {

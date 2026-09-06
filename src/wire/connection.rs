@@ -19,7 +19,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use serde::Deserialize;
 
-use crate::debug::{redact, DebugLevel};
+use crate::debug::{self, redact, DebugConfig};
 use crate::proto::{
     self, AuthBody, Body, DecodeError, Envelope, JoinBody, JoinOkBody, MessageType, PresenceBody,
     QueryBody, CODE_JOIN_FAILED, CODE_UNAUTHENTICATED, CODE_UNKNOWN_TYPE,
@@ -103,7 +103,7 @@ pub struct ConnectionContext {
     pub talklog: Arc<TalkLog>,
     pub server_hostname: Arc<str>,
     pub listening: Arc<Vec<String>>,
-    pub debug: DebugLevel,
+    pub debug: DebugConfig,
     pub limits: ConnectionLimits,
     /// Slots for connections still working through their first frame
     /// (issue #57's `max_unauth_connections`) — `accept_loop` acquires one
@@ -152,10 +152,11 @@ pub async fn handle_connection(
 ) {
     let peer_ip = peer.ip();
     if ctx.lockout.is_locked_out(peer_ip) {
-        trace(
-            &ctx,
-            &format!("[{peer}] refusing connection from locked-out peer"),
-        );
+        debug::local(ctx.debug, "conn")
+            .field("event", "refused")
+            .field("reason", "locked_out")
+            .field("addr", peer.to_string())
+            .emit();
         return;
     }
 
@@ -252,13 +253,12 @@ pub async fn handle_connection(
             // just a credential mismatch. See `lockout`'s module doc for why
             // that's the deliberate choice, not an oversight.
             ctx.lockout.record_failure(peer_ip);
-            trace(
-                &ctx,
-                &format!(
-                    "[{peer}] auth rejected for {}: {e}",
-                    redact("token_id", &token_id)
-                ),
-            );
+            debug::local(ctx.debug, "conn")
+                .field("event", "auth_rejected")
+                .peer(&redact("token_id", &token_id))
+                .field("addr", peer.to_string())
+                .field("reason", e.to_string())
+                .emit();
             let _ = write
                 .send(Message::Text(
                     encode(&proto::error_with_message(
@@ -286,13 +286,11 @@ pub async fn handle_connection(
         verified.machine.clone(),
         out_tx,
     );
-    trace(
-        &ctx,
-        &format!(
-            "[{peer}] client {} authenticated",
-            redact("token_id", &verified.token_id)
-        ),
-    );
+    debug::local(ctx.debug, "conn")
+        .field("event", "authenticated")
+        .peer(&redact("token_id", &verified.token_id))
+        .field("addr", peer.to_string())
+        .emit();
 
     if write
         .send(Message::Text(
@@ -382,13 +380,12 @@ pub async fn handle_connection(
     if certain_close {
         ctx.roster.mark_gone(&verified.token_id);
     }
-    trace(
-        &ctx,
-        &format!(
-            "[{peer}] client {} disconnected",
-            redact("token_id", &verified.token_id)
-        ),
-    );
+    debug::local(ctx.debug, "conn")
+        .field("event", "disconnected")
+        .peer(&redact("token_id", &verified.token_id))
+        .field("addr", peer.to_string())
+        .field("close", if certain_close { "clean" } else { "ambiguous" })
+        .emit();
 }
 
 /// Handle a `join` first frame (spec §4.1, ADR 0015): redeem the
@@ -410,13 +407,11 @@ async fn handle_join(
     let token_id = envelope.from.clone();
     match ctx.store.redeem(&token_id, secret, hostname.to_string()) {
         Ok(result) => {
-            trace(
-                ctx,
-                &format!(
-                    "[{peer}] join succeeded for {}",
-                    redact("token_id", &token_id)
-                ),
-            );
+            debug::local(ctx.debug, "conn")
+                .field("event", "join_ok")
+                .peer(&redact("token_id", &token_id))
+                .field("addr", peer.to_string())
+                .emit();
             let reply = Envelope {
                 v: 1,
                 msg_type: MessageType::JoinOk,
@@ -435,13 +430,12 @@ async fn handle_join(
             // bad join secret is exactly the kind of connection noise this
             // control targets.
             ctx.lockout.record_failure(peer_ip);
-            trace(
-                ctx,
-                &format!(
-                    "[{peer}] join rejected for {}: {e}",
-                    redact("token_id", &token_id)
-                ),
-            );
+            debug::local(ctx.debug, "conn")
+                .field("event", "join_rejected")
+                .peer(&redact("token_id", &token_id))
+                .field("addr", peer.to_string())
+                .field("reason", e.to_string())
+                .emit();
             let _ = write
                 .send(Message::Text(
                     encode(&proto::error_with_message(
@@ -608,18 +602,13 @@ async fn handle_frame(
             // mid-exchange) is logged but otherwise a no-op, same
             // fail-open tolerance `resolve_query_err` already has for an
             // unmatched `query` reply.
-            trace(
-                ctx,
-                &format!(
-                    "<- reply session={} done={} id={}",
-                    reply_body.session, reply_body.done, envelope.id
-                ),
-            );
-            if ctx.debug == DebugLevel::Noisy {
-                if let Ok(json) = serde_json::to_string(reply_body) {
-                    trace(ctx, &format!("<- reply {json}"));
-                }
-            }
+            debug::incoming(ctx.debug, "reply")
+                .id(&envelope.id)
+                .peer(client_id)
+                .field("session", reply_body.session.as_str())
+                .field("done", reply_body.done.to_string())
+                .frame_of(|| reply_body)
+                .emit();
             ctx.talklog
                 .record_reply(&envelope.id, &reply_body.session, reply_body);
             ctx.registry
@@ -688,8 +677,11 @@ fn encode(envelope: &Envelope) -> String {
     proto::encode(envelope).expect("v1 envelope types always serialize")
 }
 
+/// One non-frame lifecycle line (connect, disconnect, authenticated, and
+/// the various "ignoring X" notes), emitted through the same envelope as
+/// the frame lines: [`Direction::Local`], type `conn`, with the detail in
+/// an `event` field. Issue #230: every line in the stream shares one
+/// grammar, so a parser never has to special-case these.
 pub(crate) fn trace(ctx: &ConnectionContext, msg: &str) {
-    if ctx.debug != DebugLevel::None {
-        eprintln!("holler-server: {msg}");
-    }
+    debug::local(ctx.debug, "conn").field("event", msg).emit();
 }
