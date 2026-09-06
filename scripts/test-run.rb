@@ -266,7 +266,21 @@ def run_cases(gh, issue_number, server_dir:, client_dir:)
             end
       full_cmd = "source \"$HOME/.cargo/env\" 2>/dev/null; #{cmd}"
       out, status = Open3.capture2e('bash', '-lc', full_cmd, chdir: dir)
-      all_ok &&= status.success?
+      seg_ok = status.success?
+
+      # A filter matching zero tests still exits 0 -- cargo has no way to
+      # say "your filter named nothing real." Catch it explicitly rather
+      # than silently recording a pass for an Automation field that
+      # doesn't actually point at a real test.
+      if seg_ok && fn && (m = out.match(/^test result: \w+\. (\d+) passed; (\d+) failed;.*?(\d+) filtered out/))
+        passed_n, failed_n = m[1].to_i, m[2].to_i
+        if passed_n.zero? && failed_n.zero?
+          seg_ok = false
+          log << "[named test '#{fn}' did not run -- filtered out or does not exist in #{file}.rs]\n"
+        end
+      end
+
+      all_ok &&= seg_ok
       log << "\n--- #{repo} (#{file || 'whole crate'}#{fn ? " / #{fn}" : ''}), exit #{status.exitstatus} ---\n"
       log << out.lines.last(25).join
     end
