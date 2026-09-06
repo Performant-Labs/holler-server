@@ -1,10 +1,53 @@
 # holler-server
 
-Your agents are just a holler away. The home: mint / list / ping / revoke tokens, route hollers, roster, interrupt, query capability. **Rust.**
+Your agents are just a holler away.
 
-See [issue #1](https://github.com/Performant-Labs/holler-server/issues/1), [dev environment](docs/dev-env.md), [how they talk](docs/protocol/talk.md), the [protocol index](docs/protocol/README.md), and [docs/adr](docs/adr/README.md).
+[![CI](https://github.com/Performant-Labs/holler-server/actions/workflows/ci.yml/badge.svg)](https://github.com/Performant-Labs/holler-server/actions/workflows/ci.yml)
 
-## Prior art
+Holler is the missing talk circuit between coding-agent sessions on different machines. A meta-orchestrator (a human, or another agent) mints a token here; a `holler-client` on the far machine joins with it; after that, the two sides prompt, reply, and interrupt each other directly — no SSH, no shared Herdr socket, and no third party's cloud in the middle. It's self-hosted, harness-agnostic (anything that speaks ACP works), and built around a persistent, revocable roster of joined machines rather than one-off shareable links.
+
+## Table of contents
+
+- [Quickstart](#quickstart)
+- [Why this is different](#why-this-is-different)
+- [Architecture](#architecture)
+- [Documentation](#documentation)
+- [Status and license](#status-and-license)
+- [Companion repo](#companion-repo)
+
+## Quickstart
+
+This repo is the server half of the circuit. A full round-trip also needs [holler-client](https://github.com/Performant-Labs/holler-client) running on the machine you're joining — this repo alone gets you through minting a token, not a live prompt/reply exchange.
+
+```
+# 1. Build
+cargo build --release
+
+# 2. Start the server (defaults to 127.0.0.1:41807; --advertise records the
+#    address others should use so `token mint` can print a working join command)
+holler serve --listen 0.0.0.0:41807 --advertise myhost.example.com:41807
+
+# 3. Mint a join token — prints the token_id/secret once, plus a ready-to-paste
+#    `holler join` command
+holler token mint --label laptop
+#   token_id: ...
+#   secret:   ...
+#   expires:  ...
+#
+#   Run on the joining machine:
+#     holler join --server ws://myhost.example.com:41807 --token <token_id>:<secret>
+
+# 4. On the joining machine, run that printed `holler join` command — the `join`
+#    subcommand ships in holler-client, not this repo
+
+# 5. Back here, see who's joined and talk to a session
+holler roster
+holler say <session> "hello"
+```
+
+`holler status`, `holler caps`, and `holler token list` are the other day-to-day operator commands; run any of them with `--help` for the full flag list.
+
+## Why this is different
 
 | Difference | Benefit |
 | --- | --- |
@@ -51,4 +94,27 @@ Gap that remains — why Holler still exists: a **small server that mints a join
 
 Full survey, including the same-machine tools, an X sampling, and the recommendations behind this decision: [ADR 0001](docs/adr/ADR-0001.md).
 
-Companion: [holler-client](https://github.com/Performant-Labs/holler-client).
+## Architecture
+
+Two hops, two protocols, and the client is the hinge. Meta-O talks to `holler-server` over the CLI; `holler-server` and `holler-client` talk **Holler protocol v1** (JSON over WebSocket, default port `41807`); `holler-client` talks **ACP v1** (JSON-RPC over stdio) to the actual coding-agent subprocess on that box. `holler-server` never speaks a harness's native API directly — that's `holler-client`'s job, on the other side of the wire.
+
+See [how server and client talk](docs/protocol/talk.md) for the interrupt and prompt/reply sequence diagrams, and the [Holler v1 spec](docs/protocol/v1.md) for the wire format itself.
+
+## Documentation
+
+- [Project intent (issue #1)](https://github.com/Performant-Labs/holler-server/issues/1) — the brief and the success test this project is building toward
+- [Development environment](docs/dev-env.md)
+- [Protocol index](docs/protocol/README.md) — every protocol Holler uses
+- [How server and client talk](docs/protocol/talk.md)
+- [Holler v1 spec](docs/protocol/v1.md)
+- [Architecture decision records](docs/adr/README.md)
+
+## Status and license
+
+Early-stage and under active development, not yet at v1. Of the 13 builder-order stories in the [v1 epic](https://github.com/Performant-Labs/holler-server/issues/27), 8 are closed — wire protocol v1, join tokens, redeem/bind, debug levels, the WebSocket listener, capability query, roster/presence, and prompt/reply-by-session-name. The fail-fast harness canary, the interrupt control path, the remaining meta-O CLI wiring, and the end-to-end acceptance gate (issues [#41](https://github.com/Performant-Labs/holler-server/issues/41), [#40](https://github.com/Performant-Labs/holler-server/issues/40), [#34](https://github.com/Performant-Labs/holler-server/issues/34), [#35](https://github.com/Performant-Labs/holler-server/issues/35), [#36](https://github.com/Performant-Labs/holler-server/issues/36)) are still open.
+
+License is `Proprietary` (see `Cargo.toml`) — this isn't an open-contribution project at this stage.
+
+## Companion repo
+
+[holler-client](https://github.com/Performant-Labs/holler-client) — the client half of the circuit: joins with a server-minted token and drives the ACP subprocess on the far machine.
