@@ -31,6 +31,10 @@ pub const CODE_NOT_CONNECTED: &str = "not_connected";
 /// expired — the specific reason goes in `error.message` (spec §4.1,
 /// §11, ADR 0015).
 pub const CODE_JOIN_FAILED: &str = "join_failed";
+/// A new `auth` for the same `token_id` replaced this connection's
+/// registry entry; sent to the superseded connection just before the
+/// server closes its socket (spec §11, issue #56).
+pub const CODE_SESSION_SUPERSEDED: &str = "session_superseded";
 
 // --------------------------------------------------------------------------
 // Envelope (spec §3)
