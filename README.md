@@ -53,6 +53,19 @@ holler say <session> "hello"
 
 `holler status`, `holler caps`, and `holler token list` are the other day-to-day operator commands; run any of them with `--help` for the full flag list.
 
+### Dev scripts
+
+Wraps steps 1–2 above per the org's `object:sub-object:verb` script-naming convention ([`Performant-Labs/playbook`](https://github.com/Performant-Labs/playbook/blob/main/frameworks/node/npm-scripts.md)), adapted for a Rust crate with no `package.json` — command names map to plain shell scripts:
+
+| Command name | Script | Does |
+|---|---|---|
+| `app:local:run` | `scripts/local-run.sh` | Build, then run `holler serve` in the foreground (auto-creates `$HOLLER_STATE_DIR`/pepper if missing) |
+| `app:local:launch` | `scripts/local-launch.sh` | Same, but backgrounded, logging to `$HOLLER_STATE_DIR/server.log`; prints the next commands to run |
+| `app:local:stop` | `scripts/local-stop.sh` | Stop a `holler serve` started by `app:local:launch` |
+| `app:local:status` | `scripts/local-status.sh` | `holler roster` + `holler status` |
+
+`HOLLER_STATE_DIR` defaults to `~/holler-state` if not exported.
+
 ## Why this is different
 
 | Difference | Benefit |
