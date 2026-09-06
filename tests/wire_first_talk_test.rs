@@ -358,6 +358,56 @@ fn auth_with_wrong_credential_is_rejected_and_server_stays_up() {
 }
 
 #[test]
+fn repeated_bad_credential_attempts_from_one_source_get_locked_out() {
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "kiwi");
+    let (_client_id, _credential) = redeem(&env, &token_id, &secret, "kiwi.local");
+    let server = ServerProcess::spawn(&env);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // The first `MAX_FAILURES` bad-credential attempts each fail the
+        // normal way: a real WebSocket handshake completes and the server
+        // replies with an `unauthenticated` error frame before closing.
+        for _ in 0..holler_server::wire::lockout::MAX_FAILURES {
+            let (mut ws, _resp) = tokio_tungstenite::connect_async(server.url())
+                .await
+                .expect("connection succeeds before this source is locked out");
+            send_json(
+                &mut ws,
+                &auth_envelope(&token_id, "hlr_live_not-the-real-one"),
+            )
+            .await;
+            let err = recv_json(&mut ws).await;
+            assert_eq!(err["type"], "error");
+            assert_eq!(err["body"]["code"], "unauthenticated");
+        }
+
+        // The next connection attempt from the same source (127.0.0.1, the
+        // only address a loopback test client can dial from) is refused
+        // before the WebSocket handshake even starts (issue #58): the
+        // server drops the raw TCP connection outright, so the client-side
+        // handshake itself fails rather than succeeding and then getting
+        // an `error` frame like the attempts above did.
+        let result = tokio_tungstenite::connect_async(server.url()).await;
+        assert!(
+            result.is_err(),
+            "a locked-out source's connection should fail the WebSocket \
+             handshake itself, not just receive an `error` frame"
+        );
+
+        // A brand-new, never-before-used token from the SAME source is
+        // also refused — the lockout is keyed by peer IP, not by
+        // `token_id`, so cycling tokens does not evade it.
+        let (other_token_id, other_secret) = mint(&env, "other");
+        let (_other_client_id, _other_credential) =
+            redeem(&env, &other_token_id, &other_secret, "other.local");
+        let result2 = tokio_tungstenite::connect_async(server.url()).await;
+        assert!(result2.is_err());
+    });
+}
+
+#[test]
 fn first_frame_must_be_auth() {
     let env = Env::new();
     let server = ServerProcess::spawn(&env);

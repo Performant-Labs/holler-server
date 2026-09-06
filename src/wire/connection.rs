@@ -2,6 +2,7 @@
 //! implementing `connect -> auth -> hello (both ways) -> query / ping`
 //! (`docs/protocol/v1.md` §4) and the fail-closed error paths of ADR 0009.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -19,6 +20,7 @@ use crate::proto::{
 use crate::token::TokenStore;
 
 use super::hello::{new_pong_envelope, server_hello};
+use super::lockout::LockoutTracker;
 use super::query;
 use super::registry::Registry;
 use super::roster::Roster;
@@ -29,6 +31,7 @@ pub struct ConnectionContext {
     pub store: Arc<TokenStore>,
     pub registry: Arc<Registry>,
     pub roster: Arc<Roster>,
+    pub lockout: Arc<LockoutTracker>,
     pub server_hostname: Arc<str>,
     pub listening: Arc<Vec<String>>,
     pub debug: DebugLevel,
@@ -50,7 +53,25 @@ struct PresenceSession {
 /// the Holler v1 session. Never panics on a misbehaving peer — every
 /// failure path logs (at `noisy`, redacted) and returns, dropping the
 /// connection.
-pub async fn handle_connection(stream: TcpStream, ctx: Arc<ConnectionContext>) {
+///
+/// `peer` is the raw TCP peer address, used only to key the failed-auth
+/// lockout tracker (issue #58, [`super::lockout`]). A source currently
+/// locked out is refused before the WebSocket handshake even starts: the
+/// socket is simply dropped, with no reply of any kind. This is both the
+/// cheapest enforcement point (skips the handshake and all frame parsing)
+/// and the safest fail-closed shape — it never gives a probing client a
+/// distinguishable "you're rate-limited" signal to react to, unlike a
+/// generic `unauthenticated` error frame would.
+pub async fn handle_connection(stream: TcpStream, ctx: Arc<ConnectionContext>, peer: SocketAddr) {
+    let peer_ip = peer.ip();
+    if ctx.lockout.is_locked_out(peer_ip) {
+        trace(
+            &ctx,
+            &format!("refusing connection from locked-out peer {peer_ip}"),
+        );
+        return;
+    }
+
     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
         Ok(s) => s,
         Err(e) => {
@@ -82,7 +103,7 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<ConnectionContext>) {
     };
     let credential = match &envelope.body {
         Body::Join(JoinBody { secret, hostname }) => {
-            handle_join(&ctx, &envelope, secret, hostname, &mut write).await;
+            handle_join(&ctx, &envelope, secret, hostname, &mut write, peer_ip).await;
             return;
         }
         Body::Auth(AuthBody { credential }) => credential,
@@ -120,6 +141,10 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<ConnectionContext>) {
     let verified = match ctx.store.verify_credential(&token_id, credential) {
         Ok(v) => v,
         Err(e) => {
+            // Any failed `auth` counts toward the lockout (issue #58) — not
+            // just a credential mismatch. See `lockout`'s module doc for why
+            // that's the deliberate choice, not an oversight.
+            ctx.lockout.record_failure(peer_ip);
             trace(
                 &ctx,
                 &format!("auth rejected for {}: {e}", redact("token_id", &token_id)),
@@ -249,6 +274,7 @@ async fn handle_join(
     secret: &str,
     hostname: &str,
     write: &mut (impl Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+    peer_ip: IpAddr,
 ) {
     let token_id = envelope.from.clone();
     match ctx.store.redeem(&token_id, secret, hostname.to_string()) {
@@ -271,6 +297,10 @@ async fn handle_join(
             let _ = write.send(Message::Text(encode(&reply).into())).await;
         }
         Err(e) => {
+            // Same lockout accounting as a failed `auth` (issue #58) — a
+            // bad join secret is exactly the kind of connection noise this
+            // control targets.
+            ctx.lockout.record_failure(peer_ip);
             trace(
                 ctx,
                 &format!("join rejected for {}: {e}", redact("token_id", &token_id)),
