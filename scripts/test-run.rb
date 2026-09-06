@@ -38,10 +38,18 @@
 # entries):
 #   "<repo>: tests/<file>.rs"        -> cargo test --test <file>
 #   "<repo>: tests/<file>.rs (<fn>)" -> cargo test --test <file> <fn>
+#   "<repo>: src/<path>.rs (<fn>)"   -> cargo test --lib <fn> -- an inline
+#     #[cfg(test)] unit test living in the crate's own src/ tree (not a
+#     separate tests/*.rs integration binary). `--lib` scopes the run to
+#     the crate's own unit-test binary so a same-named test elsewhere
+#     (an integration file, the sibling repo) can't get matched instead --
+#     verified live: `cargo test --lib <fn>` runs exactly one test, not the
+#     whole crate, for every case this form was introduced for.
 #   segments separated by "; "       -> run each; ALL must pass
 #   starts with "manual"             -> not run; stays pending for `record`
-#   unparseable (e.g. a bare src/ pointer) -> runs that repo's whole `cargo
-#     test` as a conservative fallback; evidence says a fallback ran
+#   unparseable (e.g. a bare src/ pointer with no `(<fn>)`) -> runs that
+#     repo's whole `cargo test` as a conservative fallback; evidence says
+#     a fallback ran
 #
 # Usage:
 #   ruby scripts/test-run.rb discover
@@ -241,8 +249,13 @@ def run_cases(gh, issue_number, server_dir:, client_dir:)
       file = nil
       fn = nil
 
+      lib_test = false
+
       if (m = seg.match(%r{\A([a-zA-Z0-9_-]+):\s*tests/([A-Za-z0-9_]+)\.rs(?:\s*\(([a-zA-Z0-9_]+)\))?\z}))
         repo, file, fn = m[1], m[2], m[3]
+      elsif (m = seg.match(%r{\A([a-zA-Z0-9_-]+):\s*src/[A-Za-z0-9_/]+\.rs\s*\(([a-zA-Z0-9_]+)\)\z}))
+        repo, fn = m[1], m[2]
+        lib_test = true
       elsif (m = seg.match(/\A([a-zA-Z0-9_-]+):/))
         repo = m[1]
         fallback_used = true
@@ -264,7 +277,9 @@ def run_cases(gh, issue_number, server_dir:, client_dir:)
         next
       end
 
-      cmd = if file
+      cmd = if lib_test
+              "cargo test --lib #{fn}"
+            elsif file
               fn ? "cargo test --test #{file} #{fn}" : "cargo test --test #{file}"
             else
               'cargo test'
@@ -286,7 +301,11 @@ def run_cases(gh, issue_number, server_dir:, client_dir:)
       end
 
       all_ok &&= seg_ok
-      log << "\n--- #{repo} (#{file || 'whole crate'}#{fn ? " / #{fn}" : ''}), exit #{status.exitstatus} ---\n"
+      target = if lib_test then '--lib'
+               elsif file then file
+               else 'whole crate'
+               end
+      log << "\n--- #{repo} (#{target}#{fn ? " / #{fn}" : ''}), exit #{status.exitstatus} ---\n"
       log << out.lines.last(25).join
     end
 
