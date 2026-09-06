@@ -33,9 +33,9 @@ path = "tests/proto_test.rs"
 name = "stub-acp"
 path = "tests/wire/stub_acp.rs"
 
-# Issue #29: first CLI entry point in this crate (`holler token ...`).
+# Issue #29: first CLI entry point in this crate (`holler-server token ...`).
 [[bin]]
-name = "holler"
+name = "holler-server"
 path = "src/main.rs"
 
 # Issue #40: the OS-portable process harness scaffold (the #31 e2e slots

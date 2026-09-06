@@ -1,4 +1,4 @@
-//! Integration test for `holler token mint/list/delete/ping` (issue
+//! Integration test for `holler-server token mint/list/delete/ping` (issue
 //! #29), driven through the actual built binary — not the library API
 //! — so it exercises argument parsing, process exit codes, and stdout
 //! formatting the way an operator actually sees them.
@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn holler() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_holler"))
+    Command::new(env!("CARGO_BIN_EXE_holler-server"))
 }
 
 /// A fresh, isolated state dir + pepper per test so parallel tests
@@ -202,7 +202,7 @@ fn redeem_binds_token_and_shows_up_via_client_list() {
     assert!(client_id.starts_with("cli_"));
     assert!(credential.starts_with("hlr_live_"));
 
-    // `holler token list` shows the real hostname, replacing "-".
+    // `holler-server token list` shows the real hostname, replacing "-".
     let token_list_out = env.cmd().args(["token", "list"]).output().unwrap();
     let token_list_stdout = String::from_utf8(token_list_out.stdout).unwrap();
     assert!(token_list_stdout.contains("kiwi.local"));
@@ -210,7 +210,7 @@ fn redeem_binds_token_and_shows_up_via_client_list() {
     assert!(token_list_stdout.contains("bound"));
     assert!(!token_list_stdout.contains(&credential));
 
-    // `holler client list` is the bound-token alias.
+    // `holler-server client list` is the bound-token alias.
     let client_list_out = env.cmd().args(["client", "list"]).output().unwrap();
     assert!(client_list_out.status.success());
     let client_list_stdout = String::from_utf8(client_list_out.stdout).unwrap();
@@ -317,7 +317,7 @@ fn redeem_already_bound_token_fails() {
     assert!(stderr.to_lowercase().contains("bound"));
 }
 
-/// Starts `holler serve` with the given `--advertise` (or none) bound to
+/// Starts `holler-server serve` with the given `--advertise` (or none) bound to
 /// an OS-assigned loopback port, waits for it to print its "listening
 /// on" line (proof it has already persisted its advertise state — issue
 /// #66 persists before that print), then kills it. The test does not
@@ -346,7 +346,7 @@ fn run_serve_briefly(env: &Env, advertise: Option<&str>) {
         }
         assert!(
             Instant::now() < deadline,
-            "holler serve never printed its listening line"
+            "holler-server serve never printed its listening line"
         );
     }
 

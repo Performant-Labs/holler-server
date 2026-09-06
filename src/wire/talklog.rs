@@ -1,5 +1,5 @@
 //! Durable talk log (issue #33): enough of every `prompt` -> `reply`*
-//! exchange for `holler wait` (issue #35, not yet built) to answer "what
+//! exchange for `holler-server wait` (issue #35, not yet built) to answer "what
 //! happened since I last checked" without having been connected live for
 //! it.
 //!
@@ -142,7 +142,7 @@ impl TalkLog {
     }
 
     /// Read back everything recorded for `session`, oldest first — for
-    /// `holler wait` (issue #35) and for tests to verify persistence
+    /// `holler-server wait` (issue #35) and for tests to verify persistence
     /// directly rather than trusting a write happened.
     pub fn read(&self, session: &str) -> Vec<TalkEntry> {
         let _guard = self.lock.lock().expect("talk log mutex poisoned");
