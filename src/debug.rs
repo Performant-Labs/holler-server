@@ -1,10 +1,42 @@
-//! Debug levels for holler-server: none / quiet / noisy, with secret redaction.
+//! Debug levels and output formats for holler-server, with secret redaction.
 //!
-//! Same contract as holler-client's debug levels (issue #31), mirrored here for issue #38.
-//! This module only provides the level type, its resolution logic, and redaction helpers —
-//! no flag/env wiring and no frame-logging call sites exist yet; a later story wires those in.
+//! Two independent axes, mirroring holler-client's module of the same name
+//! so both halves of the circuit produce logs an analyzer can correlate:
+//!
+//! - **Level** ([`DebugLevel`]): `none` / `quiet` / `noisy` — *how much* is
+//!   logged (issue #38, ADR 0010). Secrets are never printed in the clear.
+//! - **Format** ([`LogFormat`]): `text` / `json` — *how it is shaped*
+//!   (issue #230). `text` is a fixed-width console line for a human
+//!   tailing a session; `json` is JSON Lines for a log analyzer.
+//!
+//! Precedence for both: an explicit flag (`--debug=` / `--log-format=`)
+//! wins over the environment (`HOLLER_DEBUG` / `HOLLER_LOG_FORMAT`); if
+//! neither is set the default applies ([`DebugLevel::None`],
+//! [`LogFormat::Text`]). An invalid value at whichever precedence level
+//! wins is an error — it never silently falls back to a default.
+//!
+//! # Emission timestamp vs. frame `ts`
+//!
+//! Every line carries an **emission** timestamp: when *this* process
+//! logged the line, from *this* host's clock. That is deliberately not
+//! the frame's own `ts` field, which is the peer's claim from the peer's
+//! clock. The two diverge in practice — a measured cross-machine session
+//! showed ~180ms of skew, enough that sorting a handshake by frame `ts`
+//! reordered it against causality — so only the emission timestamp is
+//! safe to sort a log by. The frame `ts` is still present inside the
+//! frame body at `noisy`, as protocol data.
+//!
+//! # One grammar for every line
+//!
+//! Frame lines and non-frame lifecycle lines (connect / disconnect /
+//! authenticated) share a single envelope: the latter are
+//! [`Direction::Local`] events carrying an `event` field instead of a
+//! direction and frame, so a parser never has to special-case them.
 
 use std::fmt;
+
+use serde::Serialize;
+use time::OffsetDateTime;
 
 /// The three supported debug verbosity levels.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +99,433 @@ impl DebugLevel {
             return DebugLevel::parse(env_value);
         }
         Ok(DebugLevel::default())
+    }
+}
+
+/// How each debug line is shaped on the wire to stderr.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum LogFormat {
+    /// Fixed-width console line, emission timestamp first. At
+    /// [`DebugLevel::Noisy`] the redacted frame JSON is appended last, so
+    /// a line's frame can still be copied out and replayed.
+    #[default]
+    Text,
+    /// JSON Lines: the whole line is one JSON object, so `jq`/Vector/Loki
+    /// can ingest the stream directly. The frame is nested under `frame`.
+    Json,
+}
+
+impl fmt::Display for LogFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            LogFormat::Text => "text",
+            LogFormat::Json => "json",
+        })
+    }
+}
+
+impl DebugLevel {
+    /// The wire/display name of this level.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DebugLevel::None => "none",
+            DebugLevel::Quiet => "quiet",
+            DebugLevel::Noisy => "noisy",
+        }
+    }
+}
+
+impl fmt::Display for DebugLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Error returned when a `--log-format=`/`HOLLER_LOG_FORMAT` value is not
+/// one of `text`/`json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogFormatError {
+    pub value: String,
+}
+
+impl fmt::Display for LogFormatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid log format {:?}: expected one of text, json",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for LogFormatError {}
+
+impl LogFormat {
+    /// Parses a log format, case-insensitively. Only `text`/`json` are accepted.
+    pub fn parse(value: &str) -> Result<LogFormat, LogFormatError> {
+        match value.to_ascii_lowercase().as_str() {
+            "text" => Ok(LogFormat::Text),
+            "json" => Ok(LogFormat::Json),
+            _ => Err(LogFormatError {
+                value: value.to_string(),
+            }),
+        }
+    }
+
+    /// Resolves the effective log format. Same flag-wins-over-env,
+    /// fail-closed contract as [`DebugLevel::resolve`].
+    pub fn resolve(flag: Option<&str>, env: Option<&str>) -> Result<LogFormat, LogFormatError> {
+        if let Some(flag_value) = flag {
+            return LogFormat::parse(flag_value);
+        }
+        if let Some(env_value) = env {
+            return LogFormat::parse(env_value);
+        }
+        Ok(LogFormat::default())
+    }
+}
+
+/// The resolved logging configuration: how much, and in what shape.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DebugConfig {
+    pub level: DebugLevel,
+    pub format: LogFormat,
+}
+
+impl DebugConfig {
+    pub fn new(level: DebugLevel, format: LogFormat) -> Self {
+        DebugConfig { level, format }
+    }
+
+    /// Whether anything at all is logged. Call sites use this to skip work
+    /// that even building an [`Event`] would cost.
+    pub fn is_on(&self) -> bool {
+        self.level != DebugLevel::None
+    }
+}
+
+/// How important a line is — an axis **independent of** [`DebugLevel`].
+///
+/// [`DebugLevel`] answers "how much of the frame trace do you want?".
+/// Severity answers "does an operator need to see this at all?". They are
+/// not the same question, and conflating them loses exactly the lines that
+/// matter most:
+///
+/// - [`Severity::Debug`] is the frame/lifecycle trace. Gated by
+///   [`DebugLevel`] exactly as before: nothing at [`DebugLevel::None`].
+/// - [`Severity::Info`] and [`Severity::Warn`] are operational facts — a
+///   talk log could not be persisted. These printed unconditionally as
+///   bare `eprintln!` text before, so gating them by [`DebugLevel`] would
+///   be a real regression in operator visibility. They are gated only by
+///   [`LogFormat`]: always emitted, in whichever shape is configured.
+///
+/// This is why the `level` key in `json` output is a real field rather
+/// than the constant `"debug"` it started as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Severity {
+    /// Frame and lifecycle trace; only when `--debug` asks for it.
+    #[default]
+    Debug,
+    /// A normal operational fact worth recording either way.
+    Info,
+    /// Something went wrong that an operator would alert on.
+    Warn,
+}
+
+impl Severity {
+    fn as_str(self) -> &'static str {
+        match self {
+            Severity::Debug => "debug",
+            Severity::Info => "info",
+            Severity::Warn => "warn",
+        }
+    }
+
+    /// Padded to a fixed width so the column after it still lines up.
+    fn as_text(self) -> &'static str {
+        match self {
+            Severity::Debug => "DEBUG",
+            Severity::Info => "INFO ",
+            Severity::Warn => "WARN ",
+        }
+    }
+}
+
+/// Which way a frame moved, relative to this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Sent by this process.
+    Out,
+    /// Received by this process.
+    In,
+    /// Not a frame at all — a local lifecycle event (connect, disconnect,
+    /// authenticated). Rendered with a blank direction column so the rest
+    /// of the columns still line up, and with no `dir` key in `json`.
+    Local,
+}
+
+impl Direction {
+    fn as_text(self) -> &'static str {
+        match self {
+            Direction::Out => "->",
+            Direction::In => "<-",
+            Direction::Local => "  ",
+        }
+    }
+
+    fn as_json(self) -> Option<&'static str> {
+        match self {
+            Direction::Out => Some("out"),
+            Direction::In => Some("in"),
+            Direction::Local => None,
+        }
+    }
+}
+
+/// Width the `type` column is padded to in [`LogFormat::Text`]. The
+/// longest v1 frame type is `interrupt` (9); one space of slack keeps a
+/// gap before the first `k=v` pair.
+const TYPE_COLUMN_WIDTH: usize = 10;
+
+/// How many leading characters of an id/peer survive into a `text` line.
+/// Enough to stay distinctive past a `cli_`/`tok_` prefix while keeping
+/// the column narrow; `json` always carries the untruncated value.
+const SHORT_ID_LEN: usize = 12;
+
+fn short(value: &str) -> &str {
+    match value.char_indices().nth(SHORT_ID_LEN) {
+        Some((byte_idx, _)) => &value[..byte_idx],
+        None => value,
+    }
+}
+
+/// RFC 3339 UTC at fixed microsecond precision, so the timestamp column is
+/// genuinely fixed-width (27 chars) and a parser never has to handle
+/// variable fractional digits. Formatted by hand rather than via a `time`
+/// format description, which would render a variable number of subsecond
+/// digits.
+fn emission_ts() -> String {
+    let now = OffsetDateTime::now_utc();
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
+        now.microsecond(),
+    )
+}
+
+#[derive(Serialize)]
+struct JsonLine<'a> {
+    ts: String,
+    level: &'static str,
+    verbosity: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dir: Option<&'static str>,
+    #[serde(rename = "type")]
+    kind: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer: Option<&'a str>,
+    #[serde(flatten)]
+    fields: std::collections::BTreeMap<&'static str, &'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frame: Option<serde_json::Value>,
+}
+
+/// One debug line, built up field by field and rendered by [`Event::emit`]
+/// in whichever [`LogFormat`] is configured.
+///
+/// Construct with [`outgoing`], [`incoming`], or [`local`]. When the
+/// configured level is [`DebugLevel::None`] every method is a no-op and
+/// the [`Event::frame`]/[`Event::frame_of`] closures are never called, so
+/// a disabled logger costs nothing beyond the (stack-only) builder itself.
+pub struct Event<'a> {
+    cfg: DebugConfig,
+    severity: Severity,
+    dir: Direction,
+    kind: &'a str,
+    id: Option<&'a str>,
+    peer: Option<&'a str>,
+    fields: Vec<(&'static str, String)>,
+    frame: Option<String>,
+}
+
+/// A frame this process is sending.
+pub fn outgoing(cfg: DebugConfig, kind: &str) -> Event<'_> {
+    Event::new(cfg, Severity::Debug, Direction::Out, kind)
+}
+
+/// A frame this process just received.
+pub fn incoming(cfg: DebugConfig, kind: &str) -> Event<'_> {
+    Event::new(cfg, Severity::Debug, Direction::In, kind)
+}
+
+/// A local lifecycle event, not a frame — connect, disconnect,
+/// authenticated. Carries an `event` field instead of a direction, so
+/// every line in the stream still shares one grammar (issue #230).
+pub fn local(cfg: DebugConfig, kind: &str) -> Event<'_> {
+    Event::new(cfg, Severity::Debug, Direction::Local, kind)
+}
+
+/// An operational fact worth recording whether or not debug logging is
+/// on — always emitted, in whichever [`LogFormat`] is configured.
+pub fn info(cfg: DebugConfig, kind: &str) -> Event<'_> {
+    Event::new(cfg, Severity::Info, Direction::Local, kind)
+}
+
+/// Something went wrong that an operator would alert on — always emitted,
+/// in whichever [`LogFormat`] is configured. These are the lines that used
+/// to be bare `eprintln!` text and so were invisible to a log analyzer.
+pub fn warn(cfg: DebugConfig, kind: &str) -> Event<'_> {
+    Event::new(cfg, Severity::Warn, Direction::Local, kind)
+}
+
+impl<'a> Event<'a> {
+    /// Whether this line will actually be written — the one gate both
+    /// [`Event::field`] and [`Event::emit`] consult, so a `warn` at
+    /// [`DebugLevel::None`] keeps its fields instead of silently dropping
+    /// them.
+    fn will_emit(&self) -> bool {
+        match self.severity {
+            Severity::Debug => self.cfg.is_on(),
+            Severity::Info | Severity::Warn => true,
+        }
+    }
+
+    fn new(cfg: DebugConfig, severity: Severity, dir: Direction, kind: &'a str) -> Self {
+        Event {
+            cfg,
+            severity,
+            dir,
+            kind,
+            id: None,
+            peer: None,
+            fields: Vec::new(),
+            frame: None,
+        }
+    }
+
+    /// The frame's correlation id.
+    pub fn id(mut self, id: &'a str) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    /// The other end: a `token_id`, `client_id`, or `server`. Never a
+    /// secret — see [`redact`] for what must never appear.
+    pub fn peer(mut self, peer: &'a str) -> Self {
+        self.peer = Some(peer);
+        self
+    }
+
+    /// An extra `k=v` detail (session name, query cmd, outcome, ...).
+    pub fn field(mut self, key: &'static str, value: impl Into<String>) -> Self {
+        if self.will_emit() {
+            self.fields.push((key, value.into()));
+        }
+        self
+    }
+
+    /// The frame body as pre-rendered JSON text, materialized **only** at
+    /// [`DebugLevel::Noisy`] — the closure is not called at any other
+    /// level, so redaction and serialization cost nothing when they would
+    /// be thrown away.
+    ///
+    /// The caller is responsible for having already redacted secrets out
+    /// of what the closure returns (see [`redact_secret`]). Prefer
+    /// [`Event::frame_of`] for a value that is already [`Serialize`].
+    pub fn frame(mut self, render: impl FnOnce() -> String) -> Self {
+        if self.cfg.level == DebugLevel::Noisy {
+            self.frame = Some(render());
+        }
+        self
+    }
+
+    /// The frame body as a [`Serialize`] value — the ergonomic form for
+    /// this crate, whose frames are already typed. Same noisy-only
+    /// laziness as [`Event::frame`].
+    ///
+    /// [`redact_hlr_tokens`] is applied to the serialized JSON as
+    /// defense-in-depth: none of v1's server-sent frames should carry
+    /// `hlr_`-prefixed secret material, and this makes that true by
+    /// construction rather than by inspection. A value that somehow fails
+    /// to serialize drops the frame rather than risking a panic in a live
+    /// server's debug path.
+    pub fn frame_of<T: Serialize>(mut self, render: impl FnOnce() -> T) -> Self {
+        if self.cfg.level == DebugLevel::Noisy {
+            if let Ok(json) = serde_json::to_string(&render()) {
+                self.frame = Some(redact_hlr_tokens(&json));
+            }
+        }
+        self
+    }
+
+    /// Writes the line to stderr, or does nothing at [`DebugLevel::None`].
+    pub fn emit(self) {
+        if !self.will_emit() {
+            return;
+        }
+        match self.cfg.format {
+            LogFormat::Text => eprintln!("{}", self.render_text()),
+            LogFormat::Json => eprintln!("{}", self.render_json()),
+        }
+    }
+
+    fn render_text(&self) -> String {
+        let mut line = format!(
+            "{} {} {} {:<width$}",
+            emission_ts(),
+            self.severity.as_text(),
+            self.dir.as_text(),
+            self.kind,
+            width = TYPE_COLUMN_WIDTH,
+        );
+        if let Some(id) = self.id {
+            line.push_str(&format!(" id={}", short(id)));
+        }
+        if let Some(peer) = self.peer {
+            line.push_str(&format!(" peer={}", short(peer)));
+        }
+        for (key, value) in &self.fields {
+            line.push_str(&format!(" {key}={value}"));
+        }
+        if let Some(frame) = &self.frame {
+            line.push(' ');
+            line.push_str(frame);
+        }
+        line
+    }
+
+    fn render_json(&self) -> String {
+        // A frame that somehow doesn't re-parse is still worth logging:
+        // fall back to carrying it as a JSON string rather than dropping
+        // the line entirely.
+        let frame = self.frame.as_ref().map(|raw| {
+            serde_json::from_str::<serde_json::Value>(raw)
+                .unwrap_or_else(|_| serde_json::Value::String(raw.clone()))
+        });
+        let line = JsonLine {
+            ts: emission_ts(),
+            level: self.severity.as_str(),
+            verbosity: self.cfg.level.as_str(),
+            dir: self.dir.as_json(),
+            kind: self.kind,
+            id: self.id,
+            peer: self.peer,
+            fields: self.fields.iter().map(|(k, v)| (*k, v.as_str())).collect(),
+            frame,
+        };
+        serde_json::to_string(&line).unwrap_or_else(|_| {
+            format!(
+                r#"{{"ts":"{}","level":"debug","error":"unserializable log line"}}"#,
+                emission_ts()
+            )
+        })
     }
 }
 
@@ -307,5 +766,294 @@ mod tests {
     fn redact_hlr_tokens_bare_prefix_with_no_token_is_kept_verbatim() {
         let text = "saw hlr_ with nothing after it";
         assert_eq!(redact_hlr_tokens(text), text);
+    }
+
+    // --- LogFormat::resolve precedence (issue #230) ---
+
+    #[test]
+    fn log_format_defaults_to_text() {
+        assert_eq!(LogFormat::resolve(None, None), Ok(LogFormat::Text));
+    }
+
+    #[test]
+    fn log_format_flag_wins_over_env() {
+        assert_eq!(
+            LogFormat::resolve(Some("text"), Some("json")),
+            Ok(LogFormat::Text)
+        );
+    }
+
+    #[test]
+    fn log_format_env_used_when_flag_absent() {
+        assert_eq!(LogFormat::resolve(None, Some("json")), Ok(LogFormat::Json));
+    }
+
+    #[test]
+    fn log_format_invalid_flag_errors_without_consulting_env() {
+        assert_eq!(
+            LogFormat::resolve(Some("yaml"), Some("json")),
+            Err(LogFormatError {
+                value: "yaml".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn log_format_invalid_env_errors_when_flag_absent() {
+        assert!(LogFormat::resolve(None, Some("logfmt")).is_err());
+    }
+
+    #[test]
+    fn log_format_parse_is_case_insensitive() {
+        assert_eq!(LogFormat::parse("JSON"), Ok(LogFormat::Json));
+        assert_eq!(LogFormat::parse("Text"), Ok(LogFormat::Text));
+    }
+
+    // --- line rendering ---
+
+    fn noisy_json() -> DebugConfig {
+        DebugConfig::new(DebugLevel::Noisy, LogFormat::Json)
+    }
+
+    fn noisy_text() -> DebugConfig {
+        DebugConfig::new(DebugLevel::Noisy, LogFormat::Text)
+    }
+
+    #[test]
+    fn emission_ts_is_fixed_width_rfc3339_micros() {
+        let ts = emission_ts();
+        // 2026-09-06T20:59:54.712345Z
+        assert_eq!(ts.len(), 27, "ts was {ts:?}");
+        assert!(ts.ends_with('Z'));
+        assert_eq!(&ts[10..11], "T");
+        assert_eq!(&ts[19..20], ".");
+    }
+
+    #[test]
+    fn text_line_starts_with_timestamp_then_fixed_columns() {
+        let line = outgoing(noisy_text(), "prompt").id("abc123").render_text();
+        assert_eq!(&line[26..27], "Z", "ts should occupy the first column");
+        assert!(line.contains(" DEBUG -> prompt     "), "line was {line:?}");
+    }
+
+    #[test]
+    fn json_line_is_a_single_parseable_object_with_ts_first() {
+        let line = incoming(noisy_json(), "reply")
+            .id("id-1")
+            .peer("cli_e105a5cd")
+            .render_json();
+        assert!(line.starts_with(r#"{"ts":"#), "line was {line:?}");
+        let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+        assert_eq!(parsed["type"], "reply");
+        assert_eq!(parsed["dir"], "in");
+        assert_eq!(parsed["id"], "id-1");
+        assert_eq!(parsed["peer"], "cli_e105a5cd");
+    }
+
+    #[test]
+    fn json_nests_the_frame_as_an_object_not_a_string() {
+        let line = outgoing(noisy_json(), "prompt")
+            .frame(|| r#"{"v":1,"type":"prompt"}"#.to_string())
+            .render_json();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["frame"]["v"], 1);
+        assert_eq!(parsed["frame"]["type"], "prompt");
+    }
+
+    #[test]
+    fn frame_of_serializes_and_nests_a_typed_value() {
+        #[derive(Serialize)]
+        struct Body {
+            session: &'static str,
+            done: bool,
+        }
+        let line = incoming(noisy_json(), "reply")
+            .frame_of(|| Body {
+                session: "m1",
+                done: true,
+            })
+            .render_json();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["frame"]["session"], "m1");
+        assert_eq!(parsed["frame"]["done"], true);
+    }
+
+    #[test]
+    fn frame_of_redacts_hlr_secret_material_as_defense_in_depth() {
+        #[derive(Serialize)]
+        struct Body {
+            credential: &'static str,
+        }
+        let line = outgoing(noisy_json(), "join_ok")
+            .frame_of(|| Body {
+                credential: "hlr_live_abc123",
+            })
+            .render_json();
+        assert!(!line.contains("hlr_live_abc123"), "line was {line:?}");
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["frame"]["credential"], REDACTED);
+    }
+
+    #[test]
+    fn json_carries_the_full_untruncated_id() {
+        let long_id = "c14fb1a960b3d14d690e652e53b8b33a";
+        let line = outgoing(noisy_json(), "ping").id(long_id).render_json();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["id"], long_id);
+    }
+
+    #[test]
+    fn text_truncates_long_ids_for_scannability() {
+        let long_id = "c14fb1a960b3d14d690e652e53b8b33a";
+        let line = outgoing(noisy_text(), "ping").id(long_id).render_text();
+        assert!(line.contains("id=c14fb1a960b3"), "line was {line:?}");
+        assert!(!line.contains(long_id));
+    }
+
+    #[test]
+    fn quiet_never_materializes_the_frame() {
+        let cfg = DebugConfig::new(DebugLevel::Quiet, LogFormat::Json);
+        let mut called = false;
+        let line = outgoing(cfg, "prompt")
+            .frame(|| {
+                called = true;
+                "{}".to_string()
+            })
+            .render_json();
+        assert!(!called, "frame closure must not run below noisy");
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(parsed.get("frame").is_none());
+        assert_eq!(parsed["verbosity"], "quiet");
+    }
+
+    #[test]
+    fn none_level_never_materializes_the_frame_either() {
+        let cfg = DebugConfig::new(DebugLevel::None, LogFormat::Text);
+        let mut called = false;
+        outgoing(cfg, "prompt")
+            .frame(|| {
+                called = true;
+                "{}".to_string()
+            })
+            .emit();
+        assert!(!called);
+        assert!(!cfg.is_on());
+    }
+
+    #[test]
+    fn local_events_carry_an_event_field_and_no_direction() {
+        let line = local(noisy_json(), "conn")
+            .field("event", "authenticated")
+            .field("addr", "127.0.0.1:42258")
+            .render_json();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(parsed.get("dir").is_none());
+        assert!(parsed.get("frame").is_none());
+        assert_eq!(parsed["event"], "authenticated");
+        assert_eq!(parsed["addr"], "127.0.0.1:42258");
+        assert_eq!(parsed["type"], "conn");
+    }
+
+    // --- severity is independent of debug level (issue #230 follow-up) ---
+
+    #[test]
+    fn warn_is_emitted_even_at_debug_level_none() {
+        let cfg = DebugConfig::new(DebugLevel::None, LogFormat::Json);
+        let event = warn(cfg, "talklog").field("event", "persist_failed");
+        assert!(
+            event.will_emit(),
+            "a warn must survive DebugLevel::None — these lines used to be \
+             unconditional eprintln! and an operator alerts on them"
+        );
+    }
+
+    #[test]
+    fn info_is_emitted_even_at_debug_level_none() {
+        let cfg = DebugConfig::new(DebugLevel::None, LogFormat::Text);
+        assert!(info(cfg, "logging_started").will_emit());
+    }
+
+    #[test]
+    fn debug_severity_is_still_gated_by_debug_level() {
+        let none = DebugConfig::new(DebugLevel::None, LogFormat::Json);
+        assert!(!outgoing(none, "prompt").will_emit());
+        let quiet = DebugConfig::new(DebugLevel::Quiet, LogFormat::Json);
+        assert!(outgoing(quiet, "prompt").will_emit());
+    }
+
+    #[test]
+    fn warn_at_level_none_keeps_its_fields() {
+        // Regression guard: `field()` gates on the same predicate `emit()`
+        // does, so a warn below `DebugLevel::None` must not silently drop
+        // the reason an operator needs.
+        let cfg = DebugConfig::new(DebugLevel::None, LogFormat::Json);
+        let line = warn(cfg, "talklog")
+            .field("event", "persist_failed")
+            .field("session", "m1")
+            .field("reason", "No space left on device")
+            .render_json();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["level"], "warn");
+        assert_eq!(parsed["event"], "persist_failed");
+        assert_eq!(parsed["session"], "m1");
+        assert_eq!(parsed["reason"], "No space left on device");
+        assert_eq!(parsed["verbosity"], "none");
+    }
+
+    #[test]
+    fn json_level_reflects_severity_not_a_constant() {
+        let cfg = noisy_json();
+        let d: serde_json::Value =
+            serde_json::from_str(&outgoing(cfg, "prompt").render_json()).unwrap();
+        let i: serde_json::Value =
+            serde_json::from_str(&info(cfg, "logging_started").render_json()).unwrap();
+        let w: serde_json::Value =
+            serde_json::from_str(&warn(cfg, "talklog").render_json()).unwrap();
+        assert_eq!(d["level"], "debug");
+        assert_eq!(i["level"], "info");
+        assert_eq!(w["level"], "warn");
+    }
+
+    #[test]
+    fn text_severity_column_is_fixed_width() {
+        // DEBUG/INFO/WARN all occupy 5 columns, so the direction and type
+        // columns after them still line up.
+        let cfg = noisy_text();
+        for line in [
+            outgoing(cfg, "prompt").render_text(),
+            info(cfg, "logging_started").render_text(),
+            warn(cfg, "talklog").render_text(),
+        ] {
+            assert_eq!(&line[27..28], " ", "line was {line:?}");
+            assert_eq!(&line[33..34], " ", "severity column width, line {line:?}");
+        }
+    }
+
+
+    #[test]
+    fn flattened_fields_never_shadow_an_envelope_key() {
+        // `fields` is `#[serde(flatten)]`ed into the same object as the
+        // envelope keys, so a field named `verbosity`/`ts`/`level`/`type`
+        // would emit a duplicate JSON key. Callers must not reuse these
+        // names; this pins the envelope key set that is off limits.
+        let line = info(noisy_json(), "logging_started")
+            .field("format", "json")
+            .render_json();
+        for key in ["ts", "level", "verbosity", "type"] {
+            let occurrences = line.matches(&format!("\"{key}\":")).count();
+            assert_eq!(occurrences, 1, "duplicate {key:?} key in {line:?}");
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["verbosity"], "noisy");
+        assert_eq!(parsed["format"], "json");
+    }
+
+    #[test]
+    fn extra_fields_are_flattened_not_nested() {
+        let line = outgoing(noisy_json(), "query")
+            .field("cmd", "status")
+            .render_json();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["cmd"], "status", "line was {line:?}");
     }
 }
