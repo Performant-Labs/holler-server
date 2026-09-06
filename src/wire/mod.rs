@@ -155,7 +155,7 @@ pub async fn serve(config: ServeConfig) -> io::Result<ServerHandle> {
     let roster = Arc::new(Roster::new(RosterConfig::from_env()));
     let lockout = Arc::new(LockoutTracker::new());
     let state_dir = store.dir().to_path_buf();
-    let talklog = Arc::new(TalkLog::new(state_dir.clone()));
+    let talklog = Arc::new(TalkLog::new(state_dir.clone()).with_debug(config.debug));
 
     // Issue #89: probe-and-bind the control socket before doing anything
     // else observable (binding a TCP port, writing the advertise file) so

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use crate::debug::{self, DebugConfig};
 use crate::proto::ReplyBody;
 
 fn now_ts() -> String {
@@ -52,6 +53,14 @@ pub struct TalkEntry {
 /// session.
 pub struct TalkLog {
     dir: PathBuf,
+    /// This process's resolved debug level and output format, so a failed
+    /// persist is reported in the configured shape rather than as a stray
+    /// prose line. Defaults to `none`/`text`, leaving every existing
+    /// `TalkLog::new` call site unaffected; `serve()` opts in via
+    /// [`TalkLog::with_debug`]. A persist failure is a `warn`, so it is
+    /// still emitted at `none` — exactly as the bare `eprintln!` it
+    /// replaces always was.
+    debug: DebugConfig,
     /// Guards read-modify-write races between concurrent appends in this
     /// process (e.g. two `say`s in flight at once) — the filesystem
     /// itself gives no such guarantee.
@@ -63,7 +72,16 @@ impl TalkLog {
         TalkLog {
             dir: state_dir.join("talk"),
             lock: Mutex::new(()),
+            debug: DebugConfig::default(),
         }
+    }
+
+    /// Fluent setter for this log's debug config, called once in `serve()`
+    /// before the `TalkLog` is wrapped in `Arc` — same shape and rationale
+    /// as [`crate::wire::registry::Registry::with_debug`].
+    pub fn with_debug(mut self, debug: DebugConfig) -> Self {
+        self.debug = debug;
+        self
     }
 
     /// A session name, mapped to a safe filename: anything other than
@@ -115,7 +133,7 @@ impl TalkLog {
             replies: Vec::new(),
         });
         if let Err(e) = self.save(session, &entries) {
-            eprintln!("holler-server: could not persist talk log for {session:?}: {e}");
+            self.warn_persist_failed(session, &e);
         }
     }
 
@@ -137,8 +155,19 @@ impl TalkLog {
             ts: now_ts(),
         });
         if let Err(e) = self.save(session, &entries) {
-            eprintln!("holler-server: could not persist talk log for {session:?}: {e}");
+            self.warn_persist_failed(session, &e);
         }
+    }
+
+    /// A failed persist is a durability loss an operator alerts on, so it
+    /// is a `warn`: emitted at every debug level, but through the logger
+    /// so it is valid JSON in `json` mode.
+    fn warn_persist_failed(&self, session: &str, e: &std::io::Error) {
+        debug::warn(self.debug, "talklog")
+            .field("event", "persist_failed")
+            .field("session", session)
+            .field("reason", e.to_string())
+            .emit();
     }
 
     /// Read back everything recorded for `session`, oldest first — for

@@ -329,11 +329,15 @@ fn run_serve(
     let store = TokenStore::open()?;
     advertise::persist(store.dir(), resolved_advertise.as_deref())?;
 
+    // Announced only when debug logging is actually on — an Info line
+    // saying "debug logging started" would be noise on every plain
+    // `holler serve`. When it does fire it goes through the logger, so it
+    // is valid JSON in `json` mode rather than a stray prose line.
     if debug.is_on() {
-        eprintln!(
-            "holler-server: debug={} format={} — writing frames to stderr, secrets redacted",
-            debug.level, debug.format
-        );
+        holler_server::debug::info(debug, "logging_started")
+            .field("format", debug.format.to_string())
+            .field("note", "frames to stderr, secrets redacted")
+            .emit();
     }
 
     let rt = tokio::runtime::Runtime::new()?;
