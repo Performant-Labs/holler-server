@@ -20,18 +20,20 @@
 //!
 //! ## Scope cut: the local control channel
 //!
-//! `holler token ping <id>` / `holler status` are separate, one-shot CLI
-//! processes — they do not share memory with a long-running `holler
-//! serve` process, so they cannot read its in-memory [`registry::Registry`]
-//! directly. [`control`] adds a small Unix-domain-socket side channel
-//! (not part of Holler v1) for exactly this: a live server, and only a
-//! live server on the same machine, answers `ping`/`status` queries from
-//! this repo's own CLI. See `control`'s module doc for the Windows cut.
+//! `holler token ping <id>` / `holler status` / `holler roster` are
+//! separate, one-shot CLI processes — they do not share memory with a
+//! long-running `holler serve` process, so they cannot read its
+//! in-memory [`registry::Registry`] or [`roster::Roster`] directly.
+//! [`control`] adds a small Unix-domain-socket side channel (not part of
+//! Holler v1) for exactly this: a live server, and only a live server on
+//! the same machine, answers `ping`/`status`/`roster` queries from this
+//! repo's own CLI. See `control`'s module doc for the Windows cut.
 
 pub mod connection;
 pub mod control;
 pub mod hello;
 pub mod registry;
+pub mod roster;
 
 use std::io;
 use std::net::SocketAddr;
@@ -46,6 +48,7 @@ use crate::token::TokenStore;
 
 use connection::ConnectionContext;
 use registry::Registry;
+use roster::{Roster, RosterConfig};
 
 /// A `--listen`/`HOLLER_LISTEN` value did not parse as `[host:]port`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +147,7 @@ pub async fn serve(config: ServeConfig) -> io::Result<ServerHandle> {
     let hostname = local_hostname()?;
     let store = Arc::new(TokenStore::open().map_err(io::Error::other)?);
     let registry = Arc::new(Registry::new());
+    let roster = Arc::new(Roster::new(RosterConfig::from_env()));
     let state_dir = store.dir().to_path_buf();
 
     let mut listeners = Vec::with_capacity(config.listen_addrs.len());
@@ -160,6 +164,7 @@ pub async fn serve(config: ServeConfig) -> io::Result<ServerHandle> {
     let ctx = Arc::new(ConnectionContext {
         store: store.clone(),
         registry: registry.clone(),
+        roster: roster.clone(),
         server_hostname: Arc::from(hostname.as_str()),
         listening: listening_urls.clone(),
         debug: config.debug,
@@ -178,16 +183,40 @@ pub async fn serve(config: ServeConfig) -> io::Result<ServerHandle> {
     tasks.push(tokio::spawn(control::serve_control_socket(
         state_dir,
         registry,
+        roster.clone(),
         ctx.server_hostname.clone(),
         listening_urls,
-        shutdown_rx,
+        shutdown_rx.clone(),
     )));
+
+    tasks.push(tokio::spawn(roster_prune_loop(roster, shutdown_rx)));
 
     Ok(ServerHandle {
         addrs: bound_addrs,
         shutdown_tx,
         tasks,
     })
+}
+
+/// Periodically drop `Gone` roster rows old enough to prune (memory
+/// hygiene only — see `roster`'s module doc; never affects what
+/// `holler roster` reports for a row still within its prune window).
+async fn roster_prune_loop(roster: Arc<Roster>, mut shutdown_rx: watch::Receiver<bool>) {
+    let mut interval = tokio::time::interval(roster.sweep_interval());
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                match changed {
+                    Ok(()) if *shutdown_rx.borrow() => break,
+                    Ok(()) => continue,
+                    Err(_) => break,
+                }
+            }
+            _ = interval.tick() => {
+                roster.prune();
+            }
+        }
+    }
 }
 
 async fn accept_loop(

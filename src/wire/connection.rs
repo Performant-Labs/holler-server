@@ -9,24 +9,40 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
+use serde::Deserialize;
+
 use crate::debug::{redact, DebugLevel};
 use crate::proto::{
-    self, AuthBody, Body, DecodeError, Envelope, MessageType, QueryBody, CODE_UNAUTHENTICATED,
-    CODE_UNKNOWN_TYPE,
+    self, AuthBody, Body, DecodeError, Envelope, MessageType, PresenceBody, QueryBody,
+    CODE_UNAUTHENTICATED, CODE_UNKNOWN_TYPE,
 };
 use crate::token::TokenStore;
 
 use super::hello::{new_pong_envelope, server_hello, status_query_ok_body};
 use super::registry::Registry;
+use super::roster::Roster;
 
 /// Shared, read-only context every connection task needs. Grouped so
 /// `handle_connection`'s signature does not grow a parameter per field.
 pub struct ConnectionContext {
     pub store: Arc<TokenStore>,
     pub registry: Arc<Registry>,
+    pub roster: Arc<Roster>,
     pub server_hostname: Arc<str>,
     pub listening: Arc<Vec<String>>,
     pub debug: DebugLevel,
+}
+
+/// One `presence.sessions[]` entry (`docs/protocol/v1.md` §10):
+/// mirrors `HelloSession`'s `{name, harness}` shape, which the spec
+/// only informally implies for presence (the codec leaves each row an
+/// opaque `Value` — see `proto::PresenceBody`'s doc comment) since it
+/// never pins one down formally. A row that doesn't fit this shape is
+/// skipped, not fatal to the frame (issue #32).
+#[derive(Deserialize)]
+struct PresenceSession {
+    name: String,
+    harness: String,
 }
 
 /// Drive one accepted TCP connection through the WebSocket handshake and
@@ -147,7 +163,15 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<ConnectionContext>) {
             incoming = read.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        if !handle_frame(&text, &verified.token_id, &ctx, &mut write).await {
+                        if !handle_frame(
+                            &text,
+                            &verified.token_id,
+                            &verified.client_id,
+                            &ctx,
+                            &mut write,
+                        )
+                        .await
+                        {
                             break;
                         }
                     }
@@ -207,6 +231,7 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<ConnectionContext>) {
 async fn handle_frame(
     raw: &str,
     token_id: &str,
+    client_id: &str,
     ctx: &Arc<ConnectionContext>,
     write: &mut (impl Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
 ) -> bool {
@@ -265,10 +290,32 @@ async fn handle_frame(
             // than tearing down an otherwise-good session over it.
             trace(ctx, "ignoring mid-session `auth` frame");
         }
+        Body::Presence(PresenceBody { sessions }) => {
+            // No ack (research memo, message-integrity §3: `presence`
+            // is a self-healing heartbeat) and no wire error on a
+            // malformed row or a name collision — either way, the next
+            // heartbeat tick is the retry (issue #32).
+            for raw_session in sessions {
+                match serde_json::from_value::<PresenceSession>(raw_session.clone()) {
+                    Ok(session) => {
+                        if let Err(conflict) = ctx.roster.advertise(
+                            session.name.clone(),
+                            session.harness,
+                            token_id,
+                            client_id,
+                        ) {
+                            trace(ctx, &format!("presence: {conflict}, ignoring advertise"));
+                        }
+                    }
+                    Err(e) => {
+                        trace(ctx, &format!("presence: skipping malformed session row: {e}"));
+                    }
+                }
+            }
+        }
         Body::Prompt(_)
         | Body::Reply(_)
         | Body::Interrupt(_)
-        | Body::Presence(_)
         | Body::Ack(_)
         | Body::Error(_)
         | Body::QueryOk(_) => {

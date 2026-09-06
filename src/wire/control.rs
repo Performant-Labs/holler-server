@@ -27,6 +27,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::token::{ConnectionProbe, ConnectionStatus};
+use super::roster::Roster;
 
 const CONTROL_SOCKET_NAME: &str = "control.sock";
 
@@ -48,6 +49,7 @@ pub fn control_socket_path(state_dir: &Path) -> PathBuf {
 enum Request {
     Status,
     Ping { token_id: String },
+    Roster,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -70,6 +72,20 @@ pub struct StatusDoc {
     pub clients: usize,
 }
 
+/// One `holler roster` row, as answered over the control channel. The
+/// roster only exists in the live server's memory (unlike `token`,
+/// which is file-backed) — [`query_roster`] on an unreachable server
+/// returns an empty list, not an error, the same way an unbound token
+/// store legitimately has zero rows.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RosterRowDoc {
+    pub name: String,
+    pub harness: String,
+    pub client_id: String,
+    pub state: String,
+    pub last_seen_ms: u128,
+}
+
 // ---------------------------------------------------------------------
 // Server side
 // ---------------------------------------------------------------------
@@ -81,6 +97,7 @@ pub struct StatusDoc {
 pub async fn serve_control_socket(
     state_dir: PathBuf,
     registry: Arc<super::registry::Registry>,
+    roster: Arc<Roster>,
     server_hostname: Arc<str>,
     listening: Arc<Vec<String>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -113,10 +130,11 @@ pub async fn serve_control_socket(
             accepted = listener.accept() => {
                 let Ok((stream, _)) = accepted else { continue };
                 let registry = registry.clone();
+                let roster = roster.clone();
                 let server_hostname = server_hostname.clone();
                 let listening = listening.clone();
                 tokio::spawn(async move {
-                    let _ = handle_control_conn(stream, registry, server_hostname, listening).await;
+                    let _ = handle_control_conn(stream, registry, roster, server_hostname, listening).await;
                 });
             }
         }
@@ -128,6 +146,7 @@ pub async fn serve_control_socket(
 pub async fn serve_control_socket(
     _state_dir: PathBuf,
     _registry: Arc<super::registry::Registry>,
+    _roster: Arc<Roster>,
     _server_hostname: Arc<str>,
     _listening: Arc<Vec<String>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -142,6 +161,7 @@ pub async fn serve_control_socket(
 async fn handle_control_conn(
     stream: tokio::net::UnixStream,
     registry: Arc<super::registry::Registry>,
+    roster: Arc<Roster>,
     server_hostname: Arc<str>,
     listening: Arc<Vec<String>>,
 ) -> std::io::Result<()> {
@@ -180,6 +200,20 @@ async fn handle_control_conn(
                     },
                 };
                 serde_json::to_string(&reply).expect("PingReply always serializes")
+            }
+            Request::Roster => {
+                let rows: Vec<RosterRowDoc> = roster
+                    .snapshot()
+                    .into_iter()
+                    .map(|r| RosterRowDoc {
+                        name: r.name,
+                        harness: r.harness,
+                        client_id: r.client_id,
+                        state: r.state.to_string(),
+                        last_seen_ms: r.last_seen_ms_ago,
+                    })
+                    .collect();
+                serde_json::to_string(&rows).expect("roster rows always serialize")
             }
         };
         write_half.write_all(response.as_bytes()).await?;
@@ -241,6 +275,18 @@ pub fn query_status(state_dir: &Path) -> Option<StatusDoc> {
     serde_json::from_str(&line).ok()
 }
 
+/// Ask a live server for its roster. Unlike [`query_status`], no live
+/// server reachable is not distinguished from "a live server with an
+/// empty roster" — both legitimately answer "nothing to holler at",
+/// and `holler roster` has no other document shape to fall back to
+/// (there is no file-backed roster the way `token` has one).
+pub fn query_roster(state_dir: &Path) -> Vec<RosterRowDoc> {
+    let Some(line) = run_client_query(state_dir, &Request::Roster) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&line).unwrap_or_default()
+}
+
 /// [`ConnectionProbe`] backed by the control channel: the "real"
 /// liveness check that replaces [`crate::token::AlwaysDisconnected`] as
 /// `holler token ping`'s default (issue #31).
@@ -278,6 +324,7 @@ impl ConnectionProbe for LiveProbe {
 mod tests {
     use super::*;
     use crate::wire::registry::Registry;
+    use crate::wire::roster::RosterConfig;
     use tokio::sync::{mpsc, watch};
 
     #[tokio::test]
@@ -289,9 +336,11 @@ mod tests {
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let listening = Arc::new(vec!["ws://127.0.0.1:41807".to_string()]);
+        let roster = Arc::new(Roster::new(RosterConfig::default()));
         let server = tokio::spawn(serve_control_socket(
             dir.path().to_path_buf(),
             registry,
+            roster,
             Arc::from("uranus"),
             listening,
             shutdown_rx,

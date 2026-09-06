@@ -18,6 +18,7 @@ use std::net::SocketAddr;
 use clap::{Parser, Subcommand};
 use holler_server::token::{parse_ttl, PingOutcome, RedeemResult, TokenError, TokenStore, DEFAULT_TTL};
 use holler_server::wire;
+use holler_server::wire::control::RosterRowDoc;
 
 /// `holler token list` / `holler client list` share this table shape;
 /// `client list` just pre-filters to bound records.
@@ -90,6 +91,15 @@ enum Commands {
     /// one is running on this host; otherwise reports a local-only,
     /// not-connected document.
     Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Who can be hollered at: sessions advertised by `presence`,
+    /// their harness, owning client, and connected/reconnecting/gone
+    /// state (issue #32, ADR 0006). Reaches a live `holler serve`
+    /// process over the local control channel; empty (not an error) if
+    /// none is running, since the roster only exists in-memory.
+    Roster {
         #[arg(long)]
         json: bool,
     },
@@ -168,6 +178,7 @@ fn main() {
         Commands::Client(args) => run_client(args.command).map_err(Into::into),
         Commands::Serve(args) => run_serve(args),
         Commands::Status { json } => run_status(json),
+        Commands::Roster { json } => run_roster(json),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -248,6 +259,59 @@ fn run_status(json: bool) -> Result<(), Box<dyn std::error::Error>> {
         );
         println!("clients:   {clients}");
         println!("status:    {}", if live.is_some() { "healthy" } else { "not running" });
+    }
+    Ok(())
+}
+
+fn print_roster_table(rows: &[RosterRowDoc]) {
+    const HEADERS: [&str; 5] = ["SESSION", "HARNESS", "CLIENT_ID", "STATE", "LAST_SEEN"];
+    let last_seen_cells: Vec<String> = rows
+        .iter()
+        .map(|r| format!("{}s ago", r.last_seen_ms / 1000))
+        .collect();
+    let rows_cells: Vec<[&str; 5]> = rows
+        .iter()
+        .zip(last_seen_cells.iter())
+        .map(|(r, last_seen)| {
+            [
+                r.name.as_str(),
+                r.harness.as_str(),
+                r.client_id.as_str(),
+                r.state.as_str(),
+                last_seen.as_str(),
+            ]
+        })
+        .collect();
+
+    let mut widths = HEADERS.map(str::len);
+    for row in &rows_cells {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+
+    let print_row = |cells: &[&str; 5]| {
+        let line: Vec<String> = cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{c:<width$}", width = widths[i]))
+            .collect();
+        println!("{}", line.join("  ").trim_end());
+    };
+
+    print_row(&HEADERS);
+    for row in &rows_cells {
+        print_row(row);
+    }
+}
+
+fn run_roster(json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let store = TokenStore::open()?;
+    let rows = wire::control::query_roster(store.dir());
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        print_roster_table(&rows);
     }
     Ok(())
 }
