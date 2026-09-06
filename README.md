@@ -1,6 +1,6 @@
 # holler-server
 
-Talk circuit for the herd. The home: mint / list / ping / revoke tokens, route hollers, roster, interrupt, query capability. **Rust.**
+Your agents are just a holler away. The home: mint / list / ping / revoke tokens, route hollers, roster, interrupt, query capability. **Rust.**
 
 See [issue #1](https://github.com/Performant-Labs/holler-server/issues/1), [dev environment](docs/dev-env.md), [how they talk](docs/protocol/talk.md), the [protocol index](docs/protocol/README.md), and [docs/adr](docs/adr/README.md).
 

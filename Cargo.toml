@@ -2,7 +2,7 @@
 name = "holler-server"
 version = "0.1.0"
 edition = "2021"
-description = "Talk circuit for the herd"
+description = "Your agents are just a holler away"
 license = "Proprietary"
 
 [lib]
