@@ -608,6 +608,18 @@ async fn handle_frame(
             // mid-exchange) is logged but otherwise a no-op, same
             // fail-open tolerance `resolve_query_err` already has for an
             // unmatched `query` reply.
+            trace(
+                ctx,
+                &format!(
+                    "<- reply session={} done={} id={}",
+                    reply_body.session, reply_body.done, envelope.id
+                ),
+            );
+            if ctx.debug == DebugLevel::Noisy {
+                if let Ok(json) = serde_json::to_string(reply_body) {
+                    trace(ctx, &format!("<- reply {json}"));
+                }
+            }
             ctx.talklog
                 .record_reply(&envelope.id, &reply_body.session, reply_body);
             ctx.registry

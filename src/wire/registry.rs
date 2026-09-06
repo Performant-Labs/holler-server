@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::debug::DebugLevel;
 use crate::proto::{Envelope, ErrorBody, QueryOkBody, ReplyBody};
 use crate::token::ConnectionStatus;
 
@@ -179,11 +180,55 @@ struct Entry {
 pub struct Registry {
     entries: Mutex<HashMap<String, Entry>>,
     confirmed_harnesses: Mutex<HashMap<String, HashSet<String>>>,
+    /// This process's `--debug`/`HOLLER_DEBUG` level (issue #207), consulted
+    /// by [`Registry::trace`]. Defaults to [`DebugLevel::None`] (via
+    /// `#[derive(Default)]`), so every existing `Registry::new()` call site
+    /// — the ~20+ tests in this module included — is unaffected; the real
+    /// `serve()` path opts in via [`Registry::with_debug`].
+    debug: DebugLevel,
 }
 
 impl Registry {
     pub fn new() -> Self {
         Registry::default()
+    }
+
+    /// Fluent setter for this registry's debug level (issue #207). Called
+    /// once, right after construction and before the `Registry` is wrapped
+    /// in `Arc` in `src/wire/mod.rs::serve` — `Arc<Registry>` has no safe
+    /// way to hand back a `&mut Registry` once it is shared across
+    /// connection tasks, so this takes `self` by value and returns it,
+    /// rather than being a `&mut self` setter called later.
+    pub fn with_debug(mut self, debug: DebugLevel) -> Self {
+        self.debug = debug;
+        self
+    }
+
+    /// Mirrors `connection.rs`'s free `trace()` helper: prints one line to
+    /// stderr, prefixed the same way, whenever this process's debug level
+    /// is anything other than [`DebugLevel::None`] (issue #207). Callers
+    /// that also want a noisy-only line carrying the full frame/body JSON
+    /// gate that separately on `self.debug == DebugLevel::Noisy` — `trace`
+    /// itself fires at both `Quiet` and `Noisy`, same as `connection::trace`.
+    fn trace(&self, msg: &str) {
+        if self.debug != DebugLevel::None {
+            eprintln!("holler-server: {msg}");
+        }
+    }
+
+    /// A second, noisy-only trace line carrying `value`'s full JSON
+    /// (issue #38/#207) — a no-op unless `self.debug == DebugLevel::Noisy`,
+    /// so `quiet` stays body-free. None of v1's frame/body types can fail
+    /// to serialize (all plain strings/bools/numbers/`Value`), but this
+    /// silently drops the line rather than risk a live server ever
+    /// panicking over a debug trace.
+    fn trace_noisy_json(&self, prefix: &str, value: &impl serde::Serialize) {
+        if self.debug != DebugLevel::Noisy {
+            return;
+        }
+        if let Ok(json) = serde_json::to_string(value) {
+            self.trace(&format!("{prefix} {json}"));
+        }
     }
 
     /// Register a newly authenticated connection. Replaces any prior
@@ -302,17 +347,26 @@ impl Registry {
         }
 
         let envelope = crate::wire::hello::new_ping_envelope(&ping_id, server_hostname);
+        self.trace(&format!("-> ping id={ping_id} from=server"));
+        self.trace_noisy_json("-> ping", &envelope);
         if out_tx.send(envelope).is_err() {
             self.forget_pending(token_id, &ping_id);
             return ConnectionStatus::Disconnected;
         }
 
         match tokio::time::timeout(PING_TIMEOUT, rx).await {
-            Ok(Ok(rtt)) => ConnectionStatus::Connected {
-                hostname,
-                rtt_ms: rtt.as_millis() as u64,
-            },
+            Ok(Ok(rtt)) => {
+                self.trace(&format!(
+                    "<- pong id={ping_id} hostname={hostname} rtt_ms={}",
+                    rtt.as_millis()
+                ));
+                ConnectionStatus::Connected {
+                    hostname,
+                    rtt_ms: rtt.as_millis() as u64,
+                }
+            }
             _ => {
+                self.trace(&format!("<- pong id={ping_id} outcome=timeout"));
                 self.forget_pending(token_id, &ping_id);
                 ConnectionStatus::Disconnected
             }
@@ -429,16 +483,29 @@ impl Registry {
             pending.insert(query_id.clone(), tx);
         }
 
-        let envelope = crate::wire::hello::new_query_envelope(&query_id, cmd, args);
+        let envelope = crate::wire::hello::new_query_envelope(&query_id, cmd.clone(), args);
+        self.trace(&format!(
+            "-> query cmd={cmd} id={query_id} target={token_id}"
+        ));
+        self.trace_noisy_json("-> query", &envelope);
         if out_tx.send(envelope).is_err() {
             self.forget_pending_query(token_id, &query_id);
             return QueryOutcome::Disconnected;
         }
 
         match tokio::time::timeout(QUERY_TIMEOUT, rx).await {
-            Ok(Ok(PendingQueryReply::Ok(body))) => QueryOutcome::Ok(body),
-            Ok(Ok(PendingQueryReply::Err(body))) => QueryOutcome::Err(body),
+            Ok(Ok(PendingQueryReply::Ok(body))) => {
+                self.trace(&format!("<- query_ok id={query_id}"));
+                self.trace_noisy_json("<- query_ok", &body);
+                QueryOutcome::Ok(body)
+            }
+            Ok(Ok(PendingQueryReply::Err(body))) => {
+                self.trace(&format!("<- query id={query_id} outcome=err"));
+                self.trace_noisy_json("<- query", &body);
+                QueryOutcome::Err(body)
+            }
             _ => {
+                self.trace(&format!("<- query id={query_id} outcome=timeout"));
                 self.forget_pending_query(token_id, &query_id);
                 QueryOutcome::Disconnected
             }
@@ -524,7 +591,12 @@ impl Registry {
             pending.insert(prompt_id.clone(), (session.clone(), tx));
         }
 
-        let envelope = crate::wire::hello::new_prompt_envelope(&prompt_id, session, text, meta);
+        let envelope =
+            crate::wire::hello::new_prompt_envelope(&prompt_id, session.clone(), text, meta);
+        self.trace(&format!(
+            "-> prompt session={session} id={prompt_id} from=server"
+        ));
+        self.trace_noisy_json("-> prompt", &envelope);
         if out_tx.send(envelope).is_err() {
             self.forget_pending_prompt(token_id, &prompt_id);
             return PromptOutcome::Disconnected;
@@ -534,6 +606,11 @@ impl Registry {
         loop {
             match tokio::time::timeout(PROMPT_TIMEOUT, rx.recv()).await {
                 Ok(Some(PromptEvent::Reply(reply))) => {
+                    self.trace(&format!(
+                        "<- reply session={session} done={} id={prompt_id}",
+                        reply.done
+                    ));
+                    self.trace_noisy_json("<- reply", &reply);
                     if let Some(t) = reply.text {
                         pieces.push(t);
                     }
@@ -547,14 +624,24 @@ impl Registry {
                     }
                 }
                 Ok(Some(PromptEvent::Err(body))) => {
+                    self.trace(&format!(
+                        "<- reply session={session} id={prompt_id} outcome=err"
+                    ));
+                    self.trace_noisy_json("<- reply", &body);
                     self.forget_pending_prompt(token_id, &prompt_id);
                     return PromptOutcome::Err(body);
                 }
                 Ok(Some(PromptEvent::Cancelled)) => {
+                    self.trace(&format!(
+                        "<- reply session={session} id={prompt_id} outcome=cancelled"
+                    ));
                     self.forget_pending_prompt(token_id, &prompt_id);
                     return PromptOutcome::Cancelled;
                 }
                 Ok(None) | Err(_) => {
+                    self.trace(&format!(
+                        "<- reply session={session} id={prompt_id} outcome=timeout"
+                    ));
                     self.forget_pending_prompt(token_id, &prompt_id);
                     return PromptOutcome::Disconnected;
                 }
@@ -651,6 +738,10 @@ impl Registry {
         }
 
         let envelope = crate::wire::hello::new_interrupt_envelope(&interrupt_id, session.clone());
+        self.trace(&format!(
+            "-> interrupt session={session} id={interrupt_id} from=server"
+        ));
+        self.trace_noisy_json("-> interrupt", &envelope);
         if out_tx.send(envelope).is_err() {
             self.forget_pending_interrupt(token_id, &interrupt_id);
             return InterruptOutcome::Disconnected;
@@ -658,6 +749,9 @@ impl Registry {
 
         match tokio::time::timeout(INTERRUPT_ACK_TIMEOUT, rx).await {
             Ok(Ok(())) => {
+                self.trace(&format!(
+                    "<- ack session={session} id={interrupt_id} outcome=acked"
+                ));
                 // The client just confirmed this session's turn is
                 // cancelled (issue #82): wake any `holler say` still
                 // waiting on this same session's `prompt` right now,
@@ -673,7 +767,12 @@ impl Registry {
             // immediately, not after the full timeout: a torn-down
             // connection is known right away, not a "may not have
             // landed" ambiguity.
-            Ok(Err(_)) => InterruptOutcome::Disconnected,
+            Ok(Err(_)) => {
+                self.trace(&format!(
+                    "<- ack session={session} id={interrupt_id} outcome=disconnected"
+                ));
+                InterruptOutcome::Disconnected
+            }
             Err(_) => {
                 self.forget_pending_interrupt(token_id, &interrupt_id);
                 // The timeout elapsed with no `ack` — but is the
@@ -684,8 +783,14 @@ impl Registry {
                 // stale `TimedOut`) is the honest report.
                 let entries = self.entries.lock().expect("registry mutex poisoned");
                 if entries.contains_key(token_id) {
+                    self.trace(&format!(
+                        "<- ack session={session} id={interrupt_id} outcome=timeout"
+                    ));
                     InterruptOutcome::TimedOut
                 } else {
+                    self.trace(&format!(
+                        "<- ack session={session} id={interrupt_id} outcome=disconnected"
+                    ));
                     InterruptOutcome::Disconnected
                 }
             }
@@ -969,6 +1074,66 @@ mod tests {
         assert!(matches!(outcome, QueryOutcome::Disconnected));
     }
 
+    /// Issue #207: `ping` and `query` gained trace calls in the same sweep
+    /// as `prompt`/`interrupt` (item 6 of the fix) — same "outcome
+    /// unchanged at noisy debug" guarantee as the `prompt`/`interrupt`
+    /// noisy tests above.
+    #[tokio::test]
+    async fn ping_round_trip_resolves_the_same_way_at_noisy_debug() {
+        let registry = Registry::new().with_debug(DebugLevel::Noisy);
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+
+        let registry = std::sync::Arc::new(registry);
+        let registry2 = registry.clone();
+        let responder = tokio::spawn(async move {
+            let envelope = out_rx.recv().await.expect("ping envelope sent");
+            registry2.resolve_pong("tok_1", &envelope.id);
+        });
+
+        let status = registry.ping("tok_1", "ping-1".to_string(), "srv").await;
+        responder.await.unwrap();
+        match status {
+            ConnectionStatus::Connected { hostname, .. } => assert_eq!(hostname, "kiwi"),
+            ConnectionStatus::Disconnected => panic!("expected Connected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn query_round_trip_resolves_the_same_way_at_noisy_debug() {
+        let registry = Registry::new().with_debug(DebugLevel::Noisy);
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+
+        let registry = std::sync::Arc::new(registry);
+        let registry2 = registry.clone();
+        let responder = tokio::spawn(async move {
+            let envelope = out_rx.recv().await.expect("query envelope sent");
+            registry2.resolve_query_ok(
+                "tok_1",
+                &envelope.id,
+                QueryOkBody {
+                    cmd: "support".to_string(),
+                    rest: serde_json::json!({ "ok": true }),
+                },
+            );
+        });
+
+        let outcome = registry
+            .query(
+                "tok_1",
+                "support".to_string(),
+                vec!["opencode".to_string()],
+                "q-1".to_string(),
+            )
+            .await;
+        responder.await.unwrap();
+        match outcome {
+            QueryOutcome::Ok(body) => assert_eq!(body.rest["ok"], true),
+            _ => panic!("expected QueryOutcome::Ok"),
+        }
+    }
+
     #[tokio::test]
     async fn prompt_against_unknown_token_is_disconnected() {
         let registry = Registry::new();
@@ -1042,6 +1207,90 @@ mod tests {
             }
             _ => panic!("expected PromptOutcome::Done"),
         }
+    }
+
+    /// Issue #207: `noisy` (and `quiet`) must not change `Registry::prompt`'s
+    /// behavior — only add trace output. This exercises the exact same
+    /// round trip as `prompt_round_trip_resolves_once_done_is_true`, but
+    /// with `with_debug(DebugLevel::Noisy)`, so every new `self.trace(...)`/
+    /// `self.trace_noisy_json(...)` call in the dispatch-and-loop path above
+    /// actually executes (including the `serde_json::to_string` calls on the
+    /// envelope and every `ReplyBody`) without panicking and without
+    /// changing the resolved outcome.
+    #[tokio::test]
+    async fn prompt_round_trip_resolves_the_same_way_at_noisy_debug() {
+        let registry = Registry::new().with_debug(DebugLevel::Noisy);
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+
+        let registry = std::sync::Arc::new(registry);
+        let registry2 = registry.clone();
+        let responder = tokio::spawn(async move {
+            let envelope = out_rx.recv().await.expect("prompt envelope sent");
+            registry2.resolve_reply(
+                "tok_1",
+                &envelope.id,
+                ReplyBody {
+                    session: "alpha".to_string(),
+                    text: Some("hi ".to_string()),
+                    chunks: vec![],
+                    done: false,
+                    exit: None,
+                },
+            );
+            registry2.resolve_reply(
+                "tok_1",
+                &envelope.id,
+                ReplyBody {
+                    session: "alpha".to_string(),
+                    text: Some("there".to_string()),
+                    chunks: vec![],
+                    done: true,
+                    exit: Some(0),
+                },
+            );
+        });
+
+        let outcome = registry
+            .prompt(
+                "tok_1",
+                "p-1".to_string(),
+                "alpha".to_string(),
+                "hello".to_string(),
+                None,
+            )
+            .await;
+        responder.await.unwrap();
+        match outcome {
+            PromptOutcome::Done { text, exit } => {
+                assert_eq!(text, "hi there");
+                assert_eq!(exit, Some(0));
+            }
+            _ => panic!("expected PromptOutcome::Done"),
+        }
+    }
+
+    /// Same guarantee as the `prompt` test above, for `Registry::interrupt`'s
+    /// new trace calls (issue #207): `noisy` debug must not change the
+    /// resolved `InterruptOutcome`.
+    #[tokio::test]
+    async fn interrupt_round_trip_resolves_the_same_way_at_noisy_debug() {
+        let registry = Registry::new().with_debug(DebugLevel::Noisy);
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+
+        let registry = std::sync::Arc::new(registry);
+        let registry2 = registry.clone();
+        let responder = tokio::spawn(async move {
+            let envelope = out_rx.recv().await.expect("interrupt envelope sent");
+            registry2.resolve_interrupt_ack("tok_1", &envelope.id);
+        });
+
+        let outcome = registry
+            .interrupt("tok_1", "i-1".to_string(), "alpha".to_string())
+            .await;
+        responder.await.unwrap();
+        assert!(matches!(outcome, InterruptOutcome::Acked));
     }
 
     #[tokio::test]
