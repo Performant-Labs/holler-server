@@ -63,7 +63,7 @@ holler say <session> "hello"
 | Direct connection with nothing in the middle — loopback `ws` or your own `wss`/TLS (vs. Warp's Remote Control publishing every session to Warp's cloud, **even when the agent inside it is a third-party one like Claude Code or Codex** — Warp's own docs confirm the cloud relay is required for Remote Control regardless of which agent you chose) | No third party has access to session content or commands, and the connection keeps working even if a third-party cloud has an outage. Picking a different agent doesn't get you out of the intermediary with Warp — it's tied to the *feature*, not the agent |
 | Works with any harness that speaks ACP — a new one is a config row, not a vendor decision (vs. Warp's Remote Control being limited to a fixed, vendor-curated agent list: Claude Code, Codex, OpenCode as of this writing) | Not gated by which agents a third party has chosen to support — a harness Warp hasn't added yet, or never will, works with Holler the same day |
 | Cooperative interrupt as a protocol-level primitive — ACP `session/cancel`, session survives (vs. UI-level approve/redirect controls) | The guarantee is structural, part of the wire protocol both sides implement, not dependent on a specific client app's UI behavior |
-| Self-hosted with no cloud intermediary at all, regardless of either party's license (Warp open-sourced its terminal client in April 2026 under AGPL-3.0/MIT, but the cloud relay and agent-orchestration backend that actually routes sessions — Oz — remains closed; Holler's own source is not currently public, license `Proprietary` in `Cargo.toml`) | Even Warp's own open-source move doesn't let you audit the piece that sees your traffic — the client being open doesn't open the relay. Holler sidesteps the question entirely: because there's no third-party intermediary in the first place, there's nothing closed-source standing between you and your own session data to worry about |
+| Self-hosted with no cloud intermediary at all, and no closed backend anywhere in the stack (Warp open-sourced its terminal client in April 2026 under AGPL-3.0/MIT, but the cloud relay and agent-orchestration backend that actually routes sessions — Oz — remains closed; Holler is AGPL-3.0-or-later end to end, hub and body both, with no equivalent closed piece) | Warp's own open-source move doesn't let you audit the piece that sees your traffic — the client being open doesn't open the relay. Holler doesn't have that gap: because there's no third-party intermediary in the first place, and the whole thing is open source, there's nothing closed standing between you and your own session data |
 
 Nobody has shipped this exact cut. Several projects overlap a piece of it — Holler steals **ideas** from them, not code.
 
@@ -121,7 +121,7 @@ The [v1 epic](https://github.com/Performant-Labs/holler-server/issues/27) is com
 
 A handful of small, non-blocking follow-ups from that gate run remain open: roster staleness on an explicit disconnect, an unwired `sessions` count in the status document, and an error-message wording issue on an interrupted `say`. None of them affect correctness of routing, interrupt, or isolation.
 
-License is `Proprietary` (see `Cargo.toml`) — this isn't an open-contribution project at this stage.
+License is `AGPL-3.0-or-later` (see [`LICENSE`](LICENSE) and [ADR-0016](https://github.com/Performant-Labs/holler-server/issues/17)) — outside PRs are welcome, see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Companion repo
 

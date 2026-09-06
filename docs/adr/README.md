@@ -21,6 +21,7 @@ Architecture decision records for holler-server.
 | 0013 | #14 | Rust, because we want the official ACP SDK |
 | 0014 | #15 | Versioning: SemVer per crate, starting at 0.1.0, independent per repo |
 | 0015 | #16 | Join redeem is a dedicated wire frame, not overloaded `auth` |
-| 0016–0025 | #17–#26 | reserved |
+| 0016 | #17 | License: AGPL-3.0-or-later, outside PRs now welcome |
+| 0017–0025 | #18–#26 | reserved |
 
 Issue #1 is the project brief, not an ADR.
