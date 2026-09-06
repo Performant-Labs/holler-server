@@ -6,6 +6,15 @@ See [issue #1](https://github.com/Performant-Labs/holler-server/issues/1), [dev 
 
 ## Prior art
 
+| Difference | Benefit |
+| --- | --- |
+| Self-hosted, not routed through a vendor's cloud (vs. Warp publishing sessions through Warp's relay) | You control your own data path end to end — no third party's infrastructure ever sees your session traffic, and nothing stops working because another company's cloud has an outage or the company itself stops operating it |
+| Minted, revocable token identity — mint / list / ping / delete (vs. Warp's shareable link) | Durable, auditable, centrally-managed identity per machine: you can see exactly what was minted and kill it on demand, instead of "whoever has the link has access until someone remembers to revoke it" |
+| A persistent roster of joined machines (vs. republishing a one-off session each time) | Standing infrastructure you can see at a glance — what's joined, what's alive — rather than re-publishing and re-sharing a link every time you want someone else in |
+| Direct connection with nothing in the middle — loopback `ws` or your own `wss`/TLS (vs. Warp sitting in the middle of every session) | No third party has access to session content or commands, and the connection keeps working even if a third-party cloud has an outage |
+| Cooperative interrupt as a protocol-level primitive — ACP `session/cancel`, session survives (vs. UI-level approve/redirect controls) | The guarantee is structural, part of the wire protocol both sides implement, not dependent on a specific client app's UI behavior |
+| Self-hosted with no cloud intermediary at all, regardless of either party's license (Warp open-sourced its terminal client in April 2026 under AGPL-3.0/MIT, but the cloud relay and agent-orchestration backend that actually routes sessions — Oz — remains closed; Holler's own source is not currently public, license `Proprietary` in `Cargo.toml`) | Even Warp's own open-source move doesn't let you audit the piece that sees your traffic — the client being open doesn't open the relay. Holler sidesteps the question entirely: because there's no third-party intermediary in the first place, there's nothing closed-source standing between you and your own session data to worry about |
+
 Nobody has shipped this exact cut. Several projects overlap a piece of it — Holler steals **ideas** from them, not code.
 
 | Project | What it is | vs Holler |
