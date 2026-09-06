@@ -48,7 +48,7 @@ Lives in `tests/wire/selftest/` and is run with **`cargo test`**. Does **not** r
 
 - **Test of tests:** first. CI must be able to go red.
 - **Design + stub + runner scaffold:** early (after protocol types exist).
-- **First talk:** mint → join → `hello` → `holler status` / `holler token ping` (server story “WebSocket listener”, client story “WebSocket session”).
+- **First talk:** mint → join → `hello` → `holler status` / `holler-server token ping` (server story “WebSocket listener”, client story “WebSocket session”).
 - Every later story **adds cases** to this harness (query, roster, say, interrupt). Do not invent a second test stack.
 - Acceptance gate still uses **real OpenCode** on a Herdr-free box. The stub does not replace that gate.
 

@@ -51,7 +51,7 @@ Local-machine plumbing that never touches the Holler circuit — listed here so 
 
 | Name | What it's for | Why it's not Holler v1 | Where |
 | --- | --- | --- | --- |
-| Admin control channel | Unix-domain socket, private to `HOLLER_STATE_DIR`, letting a one-shot `holler status` / `holler token ping` CLI invocation ask a *live* `holler serve` process about its in-memory registry | Never carries a credential; a UDS has no network path off the local machine; filesystem-gated (socket mode `0600`) the same way the token store is. Not reachable by a `holler-client`, not versioned, not part of `v1.md`'s envelope | [`src/wire/control.rs`](../../src/wire/control.rs) |
+| Admin control channel | Unix-domain socket, private to `HOLLER_STATE_DIR`, letting a one-shot `holler status` / `holler-server token ping` CLI invocation ask a *live* `holler-server serve` process about its in-memory registry | Never carries a credential; a UDS has no network path off the local machine; filesystem-gated (socket mode `0600`) the same way the token store is. Not reachable by a `holler-client`, not versioned, not part of `v1.md`'s envelope | [`src/wire/control.rs`](../../src/wire/control.rs) |
 
 Windows has no Unix domain sockets, so on that platform the control channel is a no-op (`LiveProbe`/`query_status` always report "no live server reachable") — see the module doc comment in `control.rs`.
 
