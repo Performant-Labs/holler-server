@@ -278,7 +278,7 @@ mod tests {
         assert_eq!(caps.len(), PROTOCOL_FEATURES.len() + HARNESSES_KNOWN.len());
         assert_eq!(caps["query"]["ok"], true);
         assert_eq!(caps["query"]["kind"], "feature");
-        assert_eq!(caps["interrupt"]["ok"], false);
+        assert_eq!(caps["interrupt"]["ok"], true);
         assert_eq!(caps["opencode"]["ok"], false);
         assert_eq!(caps["opencode"]["kind"], "harness");
     }
@@ -300,8 +300,18 @@ mod tests {
 
     #[test]
     fn support_is_false_for_a_vocabulary_only_feature() {
-        let body = support_body(&["interrupt".to_string()], &[]).unwrap();
+        // `wait` is in the v1 vocabulary but no story has wired it up yet
+        // (see `hello::SERVER_FEATURES`'s doc comment) — unlike
+        // `interrupt`, which issue #34 moved into `SERVER_FEATURES`.
+        let body = support_body(&["wait".to_string()], &[]).unwrap();
         assert_eq!(body.rest["ok"], false);
+        assert_eq!(body.rest["kind"], "feature");
+    }
+
+    #[test]
+    fn support_is_true_for_interrupt_now_that_issue_34_implements_it() {
+        let body = support_body(&["interrupt".to_string()], &[]).unwrap();
+        assert_eq!(body.rest["ok"], true);
         assert_eq!(body.rest["kind"], "feature");
     }
 

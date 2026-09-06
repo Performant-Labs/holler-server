@@ -2,9 +2,10 @@
 //! implementing `connect -> auth -> hello (both ways) -> query / ping`
 //! (`docs/protocol/v1.md` §4) and the fail-closed error paths of ADR 0009.
 //! `reply` is routed by [`super::registry::Registry`] (issue #33: `holler
-//! say <session>`, resolved by [`super::roster::Roster`]); `prompt` /
-//! `interrupt` / `ack` inbound (this server never sends the former two,
-//! and defines no use for the latter) remain accepted-but-ignored.
+//! say <session>`, resolved by [`super::roster::Roster`]); `ack` resolves
+//! a pending outbound `interrupt` (issue #34, ADR 0005). Inbound `prompt`
+//! / `interrupt` (this server only ever sends the latter, never receives
+//! it) remain accepted-but-ignored.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -595,11 +596,22 @@ async fn handle_frame(
             ctx.registry
                 .resolve_reply(token_id, &envelope.id, reply_body.clone());
         }
-        Body::Prompt(_) | Body::Interrupt(_) | Body::Ack(_) => {
-            // Not wired up by issue #31 (talk/roster land in later
-            // stories); accept the frame without erroring so a client
-            // speaking ahead of this server's capabilities does not get
-            // disconnected over it.
+        Body::Ack(ack) => {
+            // The client acknowledging an `interrupt` this server sent
+            // (issue #34): `of` must name the acknowledged frame's id
+            // (spec note, issue #59(b)) — an `ack` with no `of`, or one
+            // that matches no outstanding interrupt, resolves nothing
+            // (fail-closed: never a spurious `Acked`).
+            match &ack.of {
+                Some(of) => ctx.registry.resolve_interrupt_ack(token_id, of),
+                None => trace(ctx, "ignoring `ack` with no `of`"),
+            }
+        }
+        Body::Prompt(_) | Body::Interrupt(_) => {
+            // Server → client only, in this story's scope (issue #31/
+            // #34): this server never expects either inbound. Accept the
+            // frame without erroring so a client speaking ahead of this
+            // server's capabilities does not get disconnected over it.
             trace(
                 ctx,
                 &format!("ignoring unimplemented frame type {:?}", envelope.msg_type),

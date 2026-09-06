@@ -292,7 +292,12 @@ pub struct PongBody {
 }
 
 /// `ack` body (spec §10): optional receipt referencing the
-/// acknowledged frame id. Shape unspecified; kept minimal.
+/// acknowledged frame id. Required only for `interrupt` (issue #34,
+/// spec note from the message-integrity research memo, issue #59(b)):
+/// the client sends `ack` with `of` set to the `interrupt` frame's `id`
+/// once — and only once — it has actually *applied* the cancel (called
+/// ACP `session/cancel` or the OpenCode HTTP fallback), not merely
+/// parsed the frame. No other v1 frame requires an `ack`.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct AckBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]

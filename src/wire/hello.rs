@@ -5,17 +5,18 @@
 //!
 //! Advertise only what this process actually implements
 //! (`docs/protocol/v1.md` §6: "Advertise only what is real"): `query`
-//! (the full dispatcher, issue #37), `ping`, `token`, and, as of issue
-//! #32, `presence`/`roster`. Not `interrupt`/`wait`, which no story has
-//! wired yet — see [`PROTOCOL_FEATURES`] for the full vocabulary those
-//! unimplemented ids come from.
+//! (the full dispatcher, issue #37), `ping`, `token`, `presence`/`roster`
+//! (issue #32), and, as of issue #34, `interrupt`. Not `wait`, which no
+//! story has wired yet — see [`PROTOCOL_FEATURES`] for the full
+//! vocabulary those unimplemented ids come from.
 
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::proto::{
-    Body, Envelope, HelloBody, MessageType, PingBody, PongBody, PromptBody, QueryBody, Role,
+    Body, Envelope, HelloBody, InterruptBody, MessageType, PingBody, PongBody, PromptBody,
+    QueryBody, Role,
 };
 
 /// This binary's protocol version (spec §2): every process today has
@@ -24,9 +25,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Protocol features this server process actually implements: `query
 /// status` and `ping`/`pong` (issue #31), `presence`/`roster` (issue
-/// #32). `token` describes the CLI's own token-management surface,
-/// which is real regardless of the wire.
-pub const SERVER_FEATURES: &[&str] = &["query", "ping", "token", "presence", "roster"];
+/// #32), `interrupt` (issue #34, ADR 0005). `token` describes the CLI's
+/// own token-management surface, which is real regardless of the wire.
+pub const SERVER_FEATURES: &[&str] = &["query", "ping", "token", "presence", "roster", "interrupt"];
 
 /// The full v1 protocol-feature vocabulary (spec §9) — every id `holler
 /// caps`/`holler support` knows to report on, independent of what this
@@ -138,6 +139,24 @@ pub fn new_prompt_envelope(id: &str, session: String, text: String, meta: Option
         ts: now_ts(),
         from: "server".to_string(),
         body: Body::Prompt(PromptBody { session, text, meta }),
+    }
+}
+
+/// An `interrupt` envelope the registry sends to a live connection to
+/// route `holler interrupt <session>` (issue #34, ADR 0005) by session
+/// name — a **control** frame, not a `prompt`: it never touches
+/// [`super::registry::Registry`]'s `pending_prompts` map, so it reaches
+/// the connection immediately even while a `prompt` round trip for the
+/// same (or a sibling) session is still in flight on the same
+/// connection's unbounded outbound channel.
+pub fn new_interrupt_envelope(id: &str, session: String) -> Envelope {
+    Envelope {
+        v: 1,
+        msg_type: MessageType::Interrupt,
+        id: id.to_string(),
+        ts: now_ts(),
+        from: "server".to_string(),
+        body: Body::Interrupt(InterruptBody { session }),
     }
 }
 

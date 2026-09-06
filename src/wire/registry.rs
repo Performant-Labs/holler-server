@@ -46,6 +46,28 @@ pub const QUERY_TIMEOUT: Duration = PING_TIMEOUT;
 /// peer-to-peer round trip, a `prompt` may wait on a real model turn.
 pub const PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long [`Registry::interrupt`] waits for the matching `ack` before
+/// reporting the outcome as [`InterruptOutcome::TimedOut`] (issue #34,
+/// ADR 0005; the two-state distinction is issue #54's). This is its own
+/// constant, not a reuse of [`PING_TIMEOUT`]/[`QUERY_TIMEOUT`], because it
+/// answers a different question ("did the client *apply* the cancel?",
+/// spec-note from the message-integrity memo, issue #59(b)) even though
+/// today's value happens to match: a real `session/cancel` is still a
+/// single local round trip (no model turn to wait on, unlike
+/// [`PROMPT_TIMEOUT`]), so the same "generous for a loopback round trip"
+/// budget applies. Deliberately far shorter than the roster's ~45s
+/// dead-connection/heartbeat-miss threshold (`super::roster::RosterConfig
+/// ::reconnect_after`) — issue #54 requires these stay two separate
+/// clocks, never conflated into one error. Must also stay comfortably
+/// under `super::control::CLIENT_TIMEOUT` (5s), which bounds the whole
+/// control-channel round trip a `holler interrupt` CLI process waits on,
+/// or the CLI would report "no live server" before this timeout ever gets
+/// to fire. The exact number is a judgment call (message-integrity memo:
+/// "pick a clip 2–3x normal RTT and revisit after real usage") — 3s here,
+/// same figure this codebase already treats as "generous" for one
+/// loopback hop; revisit once real interrupt latency is observed.
+pub const INTERRUPT_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// The outcome of [`Registry::query`]. `Disconnected` covers every
 /// failure mode uniformly (no such connection, the outbound channel is
 /// closed, or no reply arrived within [`QUERY_TIMEOUT`]) — mirrors
@@ -83,6 +105,26 @@ enum PromptEvent {
     Err(ErrorBody),
 }
 
+/// The outcome of [`Registry::interrupt`] (issue #34, ADR 0005). Unlike
+/// [`QueryOutcome`]/[`PromptOutcome`], failure is **not** collapsed into
+/// one `Disconnected` case: issue #54 requires telling "the connection
+/// died while the interrupt was outstanding" apart from "the connection
+/// is still alive, but its `ack` didn't arrive in time" — the operator-
+/// facing difference between "not connected" and "the cancel may not
+/// have landed."
+pub enum InterruptOutcome {
+    /// The client sent `ack` (`of` matching this interrupt's id) within
+    /// [`INTERRUPT_ACK_TIMEOUT`] — the turn is cancelled.
+    Acked,
+    /// [`INTERRUPT_ACK_TIMEOUT`] elapsed with no matching `ack`, but the
+    /// connection is (as of the check right after) still registered —
+    /// the socket looks fine, but the cancel may not have taken effect.
+    TimedOut,
+    /// No such connection at all, or it closed (registry entry removed)
+    /// before or while this interrupt was outstanding.
+    Disconnected,
+}
+
 /// One live connection's outward-facing handle: enough for the registry
 /// to push frames at it (`ping`, `query`) and to answer `holler
 /// status`'s client count / hostnames.
@@ -102,6 +144,13 @@ struct Entry {
     /// (unlike `pending`/`pending_queries`): a `prompt` may see several
     /// `done: false` replies before the one that finishes it.
     pending_prompts: Mutex<HashMap<String, mpsc::UnboundedSender<PromptEvent>>>,
+    /// Outstanding outbound `interrupt`s this connection has not yet
+    /// `ack`ed, keyed by the interrupt envelope's `id` (which the `ack`
+    /// body's `of` must echo back). Deliberately its own map, never
+    /// `pending_prompts`: an `interrupt` is a control frame (ADR 0005),
+    /// not a queued prompt, and must resolve/expire independently of any
+    /// `prompt` in flight on the same connection.
+    pending_interrupts: Mutex<HashMap<String, oneshot::Sender<()>>>,
 }
 
 /// Shared, process-wide table of live connections, keyed by `token_id`,
@@ -146,6 +195,7 @@ impl Registry {
                     pending: Mutex::new(HashMap::new()),
                     pending_queries: Mutex::new(HashMap::new()),
                     pending_prompts: Mutex::new(HashMap::new()),
+                    pending_interrupts: Mutex::new(HashMap::new()),
                 },
             )
         };
@@ -532,6 +582,108 @@ impl Registry {
             }
         }
     }
+
+    /// Send `interrupt` for `session` to `token_id`'s live connection and
+    /// wait for the matching `ack` (issue #34, ADR 0005). A **control**
+    /// frame: this never touches `pending_prompts`, so it is sent over the
+    /// connection's outbound channel immediately, even while a `prompt`
+    /// for this (or a sibling) session is still awaiting its `reply` on
+    /// the very same connection — the unbounded `mpsc` outbound channel
+    /// carries both independently, in send order, with no queueing beyond
+    /// that.
+    ///
+    /// Unlike [`Registry::ping`]/[`Registry::query`]/[`Registry::prompt`],
+    /// failure is not collapsed into one `Disconnected` outcome — see
+    /// [`InterruptOutcome`]'s doc comment for why (issue #54).
+    pub async fn interrupt(
+        &self,
+        token_id: &str,
+        interrupt_id: String,
+        session: String,
+    ) -> InterruptOutcome {
+        let out_tx = {
+            let entries = self.entries.lock().expect("registry mutex poisoned");
+            match entries.get(token_id) {
+                Some(entry) => entry.out_tx.clone(),
+                None => return InterruptOutcome::Disconnected,
+            }
+        };
+
+        let (tx, rx) = oneshot::channel();
+        {
+            let entries = self.entries.lock().expect("registry mutex poisoned");
+            let Some(entry) = entries.get(token_id) else {
+                return InterruptOutcome::Disconnected;
+            };
+            let mut pending = entry
+                .pending_interrupts
+                .lock()
+                .expect("pending-interrupt mutex poisoned");
+            pending.insert(interrupt_id.clone(), tx);
+        }
+
+        let envelope = crate::wire::hello::new_interrupt_envelope(&interrupt_id, session);
+        if out_tx.send(envelope).is_err() {
+            self.forget_pending_interrupt(token_id, &interrupt_id);
+            return InterruptOutcome::Disconnected;
+        }
+
+        match tokio::time::timeout(INTERRUPT_ACK_TIMEOUT, rx).await {
+            Ok(Ok(())) => InterruptOutcome::Acked,
+            // The `oneshot::Sender` was dropped without sending — that
+            // only happens when `Registry::remove` drops this
+            // connection's whole `Entry` (and every pending map in it)
+            // out from under an in-flight `interrupt`. Resolves
+            // immediately, not after the full timeout: a torn-down
+            // connection is known right away, not a "may not have
+            // landed" ambiguity.
+            Ok(Err(_)) => InterruptOutcome::Disconnected,
+            Err(_) => {
+                self.forget_pending_interrupt(token_id, &interrupt_id);
+                // The timeout elapsed with no `ack` — but is the
+                // connection still there? If so, this is the narrower
+                // "socket's fine, cancel may not have landed" signal
+                // (issue #54); if the entry is gone too, both failure
+                // modes coincide here, and `Disconnected` (rather than a
+                // stale `TimedOut`) is the honest report.
+                let entries = self.entries.lock().expect("registry mutex poisoned");
+                if entries.contains_key(token_id) {
+                    InterruptOutcome::TimedOut
+                } else {
+                    InterruptOutcome::Disconnected
+                }
+            }
+        }
+    }
+
+    fn forget_pending_interrupt(&self, token_id: &str, interrupt_id: &str) {
+        let entries = self.entries.lock().expect("registry mutex poisoned");
+        if let Some(entry) = entries.get(token_id) {
+            let mut pending = entry
+                .pending_interrupts
+                .lock()
+                .expect("pending-interrupt mutex poisoned");
+            pending.remove(interrupt_id);
+        }
+    }
+
+    /// Called from a connection task when an `ack` arrives: resolves the
+    /// matching pending outbound `interrupt`, if any. `of_id` is the
+    /// `ack` body's `of` field (spec note, issue #59(b)) — an `ack` with
+    /// no `of`, or one that matches no outstanding interrupt, is a no-op
+    /// (fail-closed: silence, not a spurious `Acked`).
+    pub fn resolve_interrupt_ack(&self, token_id: &str, of_id: &str) {
+        let entries = self.entries.lock().expect("registry mutex poisoned");
+        if let Some(entry) = entries.get(token_id) {
+            let mut pending = entry
+                .pending_interrupts
+                .lock()
+                .expect("pending-interrupt mutex poisoned");
+            if let Some(tx) = pending.remove(of_id) {
+                let _ = tx.send(());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -869,6 +1021,124 @@ mod tests {
             PromptOutcome::Err(body) => assert_eq!(body.code, "unknown_session"),
             _ => panic!("expected PromptOutcome::Err"),
         }
+    }
+
+    #[tokio::test]
+    async fn interrupt_against_unknown_token_is_disconnected() {
+        let registry = Registry::new();
+        let outcome = registry
+            .interrupt("tok_nope", "id-1".to_string(), "alpha".to_string())
+            .await;
+        assert!(matches!(outcome, InterruptOutcome::Disconnected));
+    }
+
+    #[tokio::test]
+    async fn interrupt_round_trip_resolves_once_ack_arrives() {
+        let registry = Registry::new();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+
+        let registry = std::sync::Arc::new(registry);
+        let registry2 = registry.clone();
+        let responder = tokio::spawn(async move {
+            let envelope = out_rx.recv().await.expect("interrupt envelope sent");
+            let crate::proto::Body::Interrupt(crate::proto::InterruptBody { session }) =
+                envelope.body
+            else {
+                panic!("expected an Interrupt body");
+            };
+            assert_eq!(session, "alpha");
+            registry2.resolve_interrupt_ack("tok_1", &envelope.id);
+        });
+
+        let outcome = registry
+            .interrupt("tok_1", "i-1".to_string(), "alpha".to_string())
+            .await;
+        responder.await.unwrap();
+        assert!(matches!(outcome, InterruptOutcome::Acked));
+    }
+
+    #[tokio::test]
+    async fn interrupt_is_not_acked_by_an_unrelated_ack() {
+        // An `ack` whose `of` matches nothing outstanding is a no-op
+        // (fail-closed), not a spurious `Acked` for some other pending
+        // interrupt.
+        let registry = Registry::new();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+
+        let registry = std::sync::Arc::new(registry);
+        let registry2 = registry.clone();
+        let responder = tokio::spawn(async move {
+            let _envelope = out_rx.recv().await.expect("interrupt envelope sent");
+            registry2.resolve_interrupt_ack("tok_1", "not-the-right-id");
+        });
+
+        let outcome = registry
+            .interrupt("tok_1", "i-1".to_string(), "alpha".to_string())
+            .await;
+        responder.await.unwrap();
+        assert!(matches!(outcome, InterruptOutcome::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn interrupt_times_out_but_reports_timed_out_when_still_connected() {
+        let registry = Registry::new();
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        // Keep `_out_rx` alive (so the send succeeds) but never ack.
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+
+        let outcome = tokio::time::timeout(
+            INTERRUPT_ACK_TIMEOUT + Duration::from_secs(1),
+            registry.interrupt("tok_1", "i-1".to_string(), "alpha".to_string()),
+        )
+        .await
+        .expect("interrupt itself must resolve within its own timeout budget");
+        assert!(matches!(outcome, InterruptOutcome::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn interrupt_reports_disconnected_immediately_when_the_connection_closes_mid_flight() {
+        // The connection tears down (registry.remove) *while* the
+        // interrupt is outstanding — this must resolve right away as
+        // `Disconnected`, not wait out the full `INTERRUPT_ACK_TIMEOUT`
+        // only to report a misleading `TimedOut` (issue #54).
+        let registry = Registry::new();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+
+        let registry = std::sync::Arc::new(registry);
+        let registry2 = registry.clone();
+        let closer = tokio::spawn(async move {
+            let _envelope = out_rx.recv().await.expect("interrupt envelope sent");
+            registry2.remove("tok_1");
+        });
+
+        let outcome = tokio::time::timeout(
+            INTERRUPT_ACK_TIMEOUT,
+            registry.interrupt("tok_1", "i-1".to_string(), "alpha".to_string()),
+        )
+        .await
+        .expect(
+            "a mid-flight disconnect must resolve well before the ack timeout, \
+             not time out itself",
+        );
+        closer.await.unwrap();
+        assert!(matches!(outcome, InterruptOutcome::Disconnected));
+    }
+
+    #[tokio::test]
+    async fn interrupt_after_disconnect_is_disconnected() {
+        let registry = Registry::new();
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+        drop(out_rx);
+        registry.remove("tok_1");
+
+        let outcome = registry
+            .interrupt("tok_1", "i-1".to_string(), "alpha".to_string())
+            .await;
+        assert!(matches!(outcome, InterruptOutcome::Disconnected));
     }
 
     #[tokio::test]

@@ -33,7 +33,7 @@ use super::roster::Roster;
 use super::talklog::TalkLog;
 
 use super::query;
-use super::registry::{PromptOutcome, QueryOutcome};
+use super::registry::{InterruptOutcome, PromptOutcome, QueryOutcome};
 
 const CONTROL_SOCKET_NAME: &str = "control.sock";
 
@@ -76,6 +76,10 @@ enum Request {
     /// name, resolved via the roster (ADR 0007) to whichever live
     /// connection currently hosts it.
     Say { session: String, text: String },
+    /// `holler interrupt <session>` (issue #34, ADR 0005): cancel a
+    /// session's in-flight turn — a **control** frame, resolved via the
+    /// roster the same way `Say` is, but never queued behind a `prompt`.
+    Interrupt { session: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -115,6 +119,22 @@ pub enum SayReply {
     Err {
         error: ErrorBody,
     },
+}
+
+/// Answer to a [`Request::Interrupt`] (issue #34, ADR 0005; the
+/// three-outcome split is issue #54's): the client `ack`ed the cancel
+/// (`Ok`), the connection is alive but no `ack` arrived within
+/// [`super::registry::INTERRUPT_ACK_TIMEOUT`] (`TimedOut` — "may not have
+/// landed," not "not connected"), the connection is gone (`Disconnected`),
+/// or this server's own `unknown_session` when the roster names no live
+/// connection for the session at all (`Err`).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum InterruptReply {
+    Ok,
+    TimedOut,
+    Disconnected,
+    Err { error: ErrorBody },
 }
 
 /// The live server's self-report, as answered over the control channel.
@@ -363,6 +383,29 @@ async fn handle_control_conn(
                 };
                 serde_json::to_string(&reply).expect("SayReply always serializes")
             }
+            Request::Interrupt { session } => {
+                let reply = match roster.resolve_session(&session) {
+                    None => InterruptReply::Err {
+                        error: ErrorBody {
+                            code: CODE_UNKNOWN_SESSION.to_string(),
+                            cmd: None,
+                            message: Some(format!("unknown session: {session}")),
+                        },
+                    },
+                    Some(token_id) => {
+                        let interrupt_id = super::hello::new_id();
+                        match registry
+                            .interrupt(&token_id, interrupt_id, session.clone())
+                            .await
+                        {
+                            InterruptOutcome::Acked => InterruptReply::Ok,
+                            InterruptOutcome::TimedOut => InterruptReply::TimedOut,
+                            InterruptOutcome::Disconnected => InterruptReply::Disconnected,
+                        }
+                    }
+                };
+                serde_json::to_string(&reply).expect("InterruptReply always serializes")
+            }
         };
         write_half.write_all(response.as_bytes()).await?;
         write_half.write_all(b"\n").await?;
@@ -464,6 +507,17 @@ pub fn run_query(
 /// nothing to route to without a live roster).
 pub fn run_say(state_dir: &Path, session: String, text: String) -> Option<SayReply> {
     let req = Request::Say { session, text };
+    let line = run_client_query(state_dir, &req)?;
+    serde_json::from_str(&line).ok()
+}
+
+/// `holler interrupt <session>` (issue #34, ADR 0005): ask a live server
+/// (if any) to send a control-frame `interrupt` to whichever connection
+/// currently hosts `session` and wait for its outcome. `None` means no
+/// live server is reachable at all — `holler interrupt` has no local
+/// fallback, the same as `holler say`.
+pub fn run_interrupt(state_dir: &Path, session: String) -> Option<InterruptReply> {
+    let req = Request::Interrupt { session };
     let line = run_client_query(state_dir, &req)?;
     serde_json::from_str(&line).ok()
 }
@@ -750,7 +804,12 @@ mod tests {
         registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
         let roster = Arc::new(Roster::new(RosterConfig::default()));
         roster
-            .advertise("alpha".to_string(), "opencode".to_string(), "tok_1", "cli_1")
+            .advertise(
+                "alpha".to_string(),
+                "opencode".to_string(),
+                "tok_1",
+                "cli_1",
+            )
             .unwrap();
         let (server, _shutdown_tx, talklog) =
             spawn_control_server_with_roster(dir.path(), registry.clone(), roster).await;
@@ -804,6 +863,102 @@ mod tests {
         assert_eq!(entries[0].replies.len(), 1);
         assert_eq!(entries[0].replies[0].text.as_deref(), Some("hi there"));
         assert!(entries[0].replies[0].done);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn interrupt_to_an_unrostered_session_is_unknown_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Registry::new());
+        let roster = Arc::new(Roster::new(RosterConfig::default()));
+        let (server, _shutdown_tx, _talklog) =
+            spawn_control_server_with_roster(dir.path(), registry, roster).await;
+
+        let reply = tokio::task::spawn_blocking({
+            let dir = dir.path().to_path_buf();
+            move || run_interrupt(&dir, "alpha".to_string())
+        })
+        .await
+        .unwrap()
+        .expect("the control socket answers even for an unrostered session");
+        match reply {
+            InterruptReply::Err { error } => assert_eq!(error.code, "unknown_session"),
+            other => panic!("expected InterruptReply::Err(unknown_session), got {other:?}"),
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn interrupt_round_trip_reports_ok_once_acked() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Registry::new());
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+        let roster = Arc::new(Roster::new(RosterConfig::default()));
+        roster
+            .advertise(
+                "alpha".to_string(),
+                "opencode".to_string(),
+                "tok_1",
+                "cli_1",
+            )
+            .unwrap();
+        let (server, _shutdown_tx, _talklog) =
+            spawn_control_server_with_roster(dir.path(), registry.clone(), roster).await;
+
+        let responder = tokio::spawn(async move {
+            let envelope = out_rx.recv().await.expect("interrupt envelope sent");
+            let crate::proto::Body::Interrupt(crate::proto::InterruptBody { session }) =
+                envelope.body
+            else {
+                panic!("expected an Interrupt body");
+            };
+            assert_eq!(session, "alpha");
+            registry.resolve_interrupt_ack("tok_1", &envelope.id);
+        });
+
+        let reply = tokio::task::spawn_blocking({
+            let dir = dir.path().to_path_buf();
+            move || run_interrupt(&dir, "alpha".to_string())
+        })
+        .await
+        .unwrap()
+        .expect("a live server relays the interrupt and its ack");
+        assert!(matches!(reply, InterruptReply::Ok));
+        responder.await.unwrap();
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn interrupt_reports_disconnected_for_a_session_whose_connection_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Registry::new());
+        let roster = Arc::new(Roster::new(RosterConfig::default()));
+        // Advertise `alpha` against a token that was never actually
+        // registered as a live connection — mirrors a stale roster row
+        // whose owning connection has already dropped.
+        roster
+            .advertise(
+                "alpha".to_string(),
+                "opencode".to_string(),
+                "tok_gone",
+                "cli_gone",
+            )
+            .unwrap();
+        let (server, _shutdown_tx, _talklog) =
+            spawn_control_server_with_roster(dir.path(), registry, roster).await;
+
+        let reply = tokio::task::spawn_blocking({
+            let dir = dir.path().to_path_buf();
+            move || run_interrupt(&dir, "alpha".to_string())
+        })
+        .await
+        .unwrap()
+        .expect("the control socket answers even for a dead-connection session");
+        assert!(matches!(reply, InterruptReply::Disconnected));
 
         server.abort();
     }
