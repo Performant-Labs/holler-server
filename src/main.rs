@@ -498,6 +498,18 @@ fn run_interrupt(session: String) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// `holler token delete` / `client detach` (issue #78): after the durable
+/// on-disk revoke (`store.delete`, already done by the time this is
+/// called) succeeds, best-effort-notify a live `holler serve` process to
+/// also force-close the token's live connection, so `holler
+/// status`/`roster` stop reporting it connected. No live server reachable
+/// is not a failure — the on-disk revoke is what mattered, and the CLI
+/// still reports success either way (same tolerance `run_say`/
+/// `run_interrupt` have for "no live server").
+fn notify_live_revoke(state_dir: &std::path::Path, id: &str) {
+    let _ = wire::control::run_revoke(state_dir, id.to_string());
+}
+
 /// Pretty-print a `status`/`caps` `query_ok` body the way `holler
 /// status` has always looked; `caps` additionally lists its
 /// `capabilities` map.
@@ -591,6 +603,7 @@ fn run_token(command: TokenCommands) -> Result<(), TokenError> {
         }
         TokenCommands::Delete { id } => {
             let new_state = store.delete(&id)?;
+            notify_live_revoke(store.dir(), &id);
             println!("token {id} is now {new_state}");
             Ok(())
         }
@@ -663,6 +676,7 @@ fn run_client(command: ClientCommands) -> Result<(), TokenError> {
         }
         ClientCommands::Detach { id } => {
             let new_state = store.delete(&id)?;
+            notify_live_revoke(store.dir(), &id);
             println!("client {id} is now {new_state}");
             Ok(())
         }

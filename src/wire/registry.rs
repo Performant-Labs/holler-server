@@ -220,10 +220,17 @@ impl Registry {
         }
     }
 
-    /// Remove a connection (socket closed / errored).
-    pub fn remove(&self, token_id: &str) {
+    /// Remove a connection — socket closed/errored, or a live force-close
+    /// requested over the control channel (`holler token delete` / `client
+    /// detach`, issue #78). Returns whether an entry was actually present.
+    /// Dropping the removed [`Entry`] here drops its `out_tx`, which is
+    /// what actually closes a still-live socket: `handle_connection`'s
+    /// session loop is selecting on that channel, and its next
+    /// `out_rx.recv()` sees the close and breaks the loop, same as the
+    /// supersede path in [`Registry::insert`].
+    pub fn remove(&self, token_id: &str) -> bool {
         let mut entries = self.entries.lock().expect("registry mutex poisoned");
-        entries.remove(token_id);
+        entries.remove(token_id).is_some()
     }
 
     /// How many live connections are currently registered (for `holler
