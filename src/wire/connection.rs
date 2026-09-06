@@ -2,12 +2,14 @@
 //! implementing `connect -> auth -> hello (both ways) -> query / ping`
 //! (`docs/protocol/v1.md` §4) and the fail-closed error paths of ADR 0009.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
 use serde::Deserialize;
@@ -25,6 +27,66 @@ use super::query;
 use super::registry::Registry;
 use super::roster::Roster;
 
+/// Connection/message hygiene limits (issue #57, `docs/research-security-hijack-dos.md`
+/// §4 "do now" cluster): confirmed-absent gaps in the accept/auth path that #31
+/// ("first talk") deliberately cut as follow-on hardening, not an oversight.
+///
+/// Mirrors `RosterConfig`'s "env override, sane compiled-in default" convention
+/// (`super::roster::RosterConfig`) so nothing needs to be configured to get the safe
+/// behavior, and integration tests can exercise these paths without waiting out real
+/// multi-second/hundred-connection windows.
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectionLimits {
+    /// Ceiling passed as both `max_message_size` and `max_frame_size` to
+    /// `tokio_tungstenite::accept_async_with_config`, replacing the library's 64
+    /// MiB/16 MiB defaults. v1's entire vocabulary is small JSON control envelopes —
+    /// the largest legitimate frame is a `hello` with a long session list or a
+    /// `reply` with many `chunks` — sized generously above either. Default 2 MiB.
+    pub max_frame_bytes: usize,
+    /// How long a connection may sit open before its first frame (`auth`/`join`,
+    /// spec §4/§4.1) arrives before it is closed with no reply — mirrors SSH's
+    /// `LoginGraceTime` (default 120s), tightened for a loopback/LAN client.
+    /// Default 20s.
+    pub pre_auth_timeout: Duration,
+    /// Ceiling on connections accepted but not yet past `auth`/`join` (mirrors SSH's
+    /// `MaxStartups`). Never a limit on already-authenticated live sessions: each
+    /// connection's slot is released the moment auth succeeds (or, for `join`, when
+    /// the one-shot bootstrap finishes) — see [`handle_connection`]. Default 75.
+    pub max_unauth_connections: usize,
+}
+
+impl Default for ConnectionLimits {
+    fn default() -> Self {
+        ConnectionLimits {
+            max_frame_bytes: 2 * 1024 * 1024,
+            pre_auth_timeout: Duration::from_secs(20),
+            max_unauth_connections: 75,
+        }
+    }
+}
+
+impl ConnectionLimits {
+    /// Reads `HOLLER_MAX_FRAME_BYTES` / `HOLLER_PRE_AUTH_TIMEOUT_MS` /
+    /// `HOLLER_MAX_UNAUTH_CONNECTIONS`, falling back to
+    /// [`ConnectionLimits::default`] for any that are unset or unparseable.
+    pub fn from_env() -> Self {
+        let default = ConnectionLimits::default();
+        ConnectionLimits {
+            max_frame_bytes: env_parsed("HOLLER_MAX_FRAME_BYTES")
+                .unwrap_or(default.max_frame_bytes),
+            pre_auth_timeout: env_parsed::<u64>("HOLLER_PRE_AUTH_TIMEOUT_MS")
+                .map(Duration::from_millis)
+                .unwrap_or(default.pre_auth_timeout),
+            max_unauth_connections: env_parsed("HOLLER_MAX_UNAUTH_CONNECTIONS")
+                .unwrap_or(default.max_unauth_connections),
+        }
+    }
+}
+
+fn env_parsed<T: std::str::FromStr>(key: &str) -> Option<T> {
+    std::env::var(key).ok().and_then(|v| v.trim().parse().ok())
+}
+
 /// Shared, read-only context every connection task needs. Grouped so
 /// `handle_connection`'s signature does not grow a parameter per field.
 pub struct ConnectionContext {
@@ -35,6 +97,13 @@ pub struct ConnectionContext {
     pub server_hostname: Arc<str>,
     pub listening: Arc<Vec<String>>,
     pub debug: DebugLevel,
+    pub limits: ConnectionLimits,
+    /// Slots for connections still working through their first frame
+    /// (issue #57's `max_unauth_connections`) — `accept_loop` acquires one
+    /// per accepted socket before spawning `handle_connection`, which
+    /// releases it once auth/`join` finishes (see `handle_connection`'s doc
+    /// comment).
+    pub unauth_slots: Arc<Semaphore>,
 }
 
 /// One `presence.sessions[]` entry (`docs/protocol/v1.md` §10):
@@ -54,42 +123,73 @@ struct PresenceSession {
 /// failure path logs (at `noisy`, redacted) and returns, dropping the
 /// connection.
 ///
-/// `peer` is the raw TCP peer address, used only to key the failed-auth
-/// lockout tracker (issue #58, [`super::lockout`]). A source currently
-/// locked out is refused before the WebSocket handshake even starts: the
-/// socket is simply dropped, with no reply of any kind. This is both the
-/// cheapest enforcement point (skips the handshake and all frame parsing)
-/// and the safest fail-closed shape — it never gives a probing client a
-/// distinguishable "you're rate-limited" signal to react to, unlike a
-/// generic `unauthenticated` error frame would.
-pub async fn handle_connection(stream: TcpStream, ctx: Arc<ConnectionContext>, peer: SocketAddr) {
+/// `peer` is the raw TCP peer address: used to key the failed-auth lockout
+/// tracker (issue #58, [`super::lockout`]) and to release `permit`'s slot
+/// in `ctx`'s unauthenticated-connection cap (issue #57) once this
+/// connection is done working through its first frame — on successful
+/// `auth` (just before the connection is registered and enters its
+/// session loop) or when `handle_join` returns (`join` is a one-shot
+/// bootstrap, never a session). A source currently locked out is refused
+/// before the WebSocket handshake even starts: the socket is simply
+/// dropped, with no reply of any kind, which is both the cheapest
+/// enforcement point and the safest fail-closed shape — it never gives a
+/// probing client a distinguishable "you're rate-limited" signal to react
+/// to. Every other early-return path (handshake failure, pre-auth
+/// timeout, decode failure, bad credential) also releases `permit`, via
+/// ordinary drop-on-return.
+pub async fn handle_connection(
+    stream: TcpStream,
+    peer: SocketAddr,
+    permit: OwnedSemaphorePermit,
+    ctx: Arc<ConnectionContext>,
+) {
     let peer_ip = peer.ip();
     if ctx.lockout.is_locked_out(peer_ip) {
         trace(
             &ctx,
-            &format!("refusing connection from locked-out peer {peer_ip}"),
+            &format!("[{peer}] refusing connection from locked-out peer"),
         );
         return;
     }
 
-    let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+    let ws_config = WebSocketConfig::default()
+        .max_message_size(Some(ctx.limits.max_frame_bytes))
+        .max_frame_size(Some(ctx.limits.max_frame_bytes));
+    let ws_stream = match tokio_tungstenite::accept_async_with_config(stream, Some(ws_config)).await
+    {
         Ok(s) => s,
         Err(e) => {
-            trace(&ctx, &format!("websocket handshake failed: {e}"));
+            trace(&ctx, &format!("[{peer}] websocket handshake failed: {e}"));
             return;
         }
     };
     let (mut write, mut read) = ws_stream.split();
 
-    // 1. First frame must be `auth` or `join` (spec §4, §4.1; ADR 0015).
-    // Anything else — wrong type, undecodable, or a version/type the
-    // codec already rejects — fails closed: reply `error` and close, per
-    // ADR 0009. `join` is a one-shot bootstrap: it never falls through
-    // to the `auth` path below, on success or failure alike (see
-    // `handle_join`), so a connection sends `join` or `auth`, never both.
-    let raw = match next_text_frame(&mut read).await {
-        Some(t) => t,
-        None => return,
+    // 1. First frame must arrive within the pre-auth window (issue #57) and
+    // be `auth` or `join` (spec §4, §4.1; ADR 0015). A connection that never
+    // sends one is closed with no reply — nothing has authenticated, so
+    // there is no one to usefully send an error to, and a distinguishable
+    // response would only help a slow-loris-style prober. Anything else —
+    // wrong type, undecodable, or a version/type the codec already rejects
+    // — fails closed: reply `error` and close, per ADR 0009. `join` is a
+    // one-shot bootstrap: it never falls through to the `auth` path below,
+    // on success or failure alike (see `handle_join`), so a connection
+    // sends `join` or `auth`, never both.
+    let raw = match tokio::time::timeout(ctx.limits.pre_auth_timeout, next_text_frame(&mut read))
+        .await
+    {
+        Ok(Some(t)) => t,
+        Ok(None) => return,
+        Err(_) => {
+            trace(
+                &ctx,
+                &format!(
+                    "[{peer}] closing: no first frame within {:?}",
+                    ctx.limits.pre_auth_timeout
+                ),
+            );
+            return;
+        }
     };
     let envelope = match proto::decode(&raw) {
         Ok(e) => e,
@@ -97,13 +197,13 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<ConnectionContext>, p
             let _ = write
                 .send(Message::Text(encode(&decode_error_envelope(&err)).into()))
                 .await;
-            trace(&ctx, &format!("first frame did not decode: {err}"));
+            trace(&ctx, &format!("[{peer}] first frame did not decode: {err}"));
             return;
         }
     };
     let credential = match &envelope.body {
         Body::Join(JoinBody { secret, hostname }) => {
-            handle_join(&ctx, &envelope, secret, hostname, &mut write, peer_ip).await;
+            handle_join(&ctx, peer, &envelope, secret, hostname, &mut write).await;
             return;
         }
         Body::Auth(AuthBody { credential }) => credential,
@@ -147,7 +247,10 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<ConnectionContext>, p
             ctx.lockout.record_failure(peer_ip);
             trace(
                 &ctx,
-                &format!("auth rejected for {}: {e}", redact("token_id", &token_id)),
+                &format!(
+                    "[{peer}] auth rejected for {}: {e}",
+                    redact("token_id", &token_id)
+                ),
             );
             let _ = write
                 .send(Message::Text(
@@ -163,6 +266,10 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<ConnectionContext>, p
             return;
         }
     };
+    // Auth succeeded: the accept-before-auth window is over for this
+    // connection, so its slot in the unauthenticated-connection cap is
+    // released now, before it becomes a live session (issue #57).
+    drop(permit);
 
     // 2. Authenticated: register the connection and exchange `hello`.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Envelope>();
@@ -175,7 +282,7 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<ConnectionContext>, p
     trace(
         &ctx,
         &format!(
-            "client {} authenticated",
+            "[{peer}] client {} authenticated",
             redact("token_id", &verified.token_id)
         ),
     );
@@ -255,7 +362,7 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<ConnectionContext>, p
     trace(
         &ctx,
         &format!(
-            "client {} disconnected",
+            "[{peer}] client {} disconnected",
             redact("token_id", &verified.token_id)
         ),
     );
@@ -270,18 +377,22 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<ConnectionContext>, p
 /// session (the client reconnects via `auth` to actually start one).
 async fn handle_join(
     ctx: &Arc<ConnectionContext>,
+    peer: SocketAddr,
     envelope: &Envelope,
     secret: &str,
     hostname: &str,
     write: &mut (impl Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
-    peer_ip: IpAddr,
 ) {
+    let peer_ip = peer.ip();
     let token_id = envelope.from.clone();
     match ctx.store.redeem(&token_id, secret, hostname.to_string()) {
         Ok(result) => {
             trace(
                 ctx,
-                &format!("join succeeded for {}", redact("token_id", &token_id)),
+                &format!(
+                    "[{peer}] join succeeded for {}",
+                    redact("token_id", &token_id)
+                ),
             );
             let reply = Envelope {
                 v: 1,
@@ -303,7 +414,10 @@ async fn handle_join(
             ctx.lockout.record_failure(peer_ip);
             trace(
                 ctx,
-                &format!("join rejected for {}: {e}", redact("token_id", &token_id)),
+                &format!(
+                    "[{peer}] join rejected for {}: {e}",
+                    redact("token_id", &token_id)
+                ),
             );
             let _ = write
                 .send(Message::Text(
@@ -506,7 +620,7 @@ fn encode(envelope: &Envelope) -> String {
     proto::encode(envelope).expect("v1 envelope types always serialize")
 }
 
-fn trace(ctx: &ConnectionContext, msg: &str) {
+pub(crate) fn trace(ctx: &ConnectionContext, msg: &str) {
     if ctx.debug != DebugLevel::None {
         eprintln!("holler-server: {msg}");
     }

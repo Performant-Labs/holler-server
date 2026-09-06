@@ -42,13 +42,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::debug::DebugLevel;
 use crate::token::TokenStore;
 
-use connection::ConnectionContext;
+use connection::{ConnectionContext, ConnectionLimits};
 use lockout::LockoutTracker;
 use registry::Registry;
 use roster::{Roster, RosterConfig};
@@ -165,6 +165,9 @@ pub async fn serve(config: ServeConfig) -> io::Result<ServerHandle> {
     let listening_urls: Arc<Vec<String>> =
         Arc::new(bound_addrs.iter().map(|a| format!("ws://{a}")).collect());
 
+    let limits = ConnectionLimits::from_env();
+    let unauth_slots = Arc::new(Semaphore::new(limits.max_unauth_connections));
+
     let ctx = Arc::new(ConnectionContext {
         store: store.clone(),
         registry: registry.clone(),
@@ -173,6 +176,8 @@ pub async fn serve(config: ServeConfig) -> io::Result<ServerHandle> {
         server_hostname: Arc::from(hostname.as_str()),
         listening: listening_urls.clone(),
         debug: config.debug,
+        limits,
+        unauth_slots,
     });
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -224,11 +229,11 @@ async fn roster_prune_loop(roster: Arc<Roster>, mut shutdown_rx: watch::Receiver
     }
 }
 
-/// `peer` (the accepted socket's remote address) is threaded through to
-/// [`connection::handle_connection`] so it can key the failed-auth lockout
-/// tracker (issue #58, [`lockout`]) by source IP. If issue #57's
-/// concurrent-connection work lands separately and also wants the peer
-/// address, this is the same capture point — avoid adding a second one.
+/// `peer` (the accepted socket's remote address) is captured once here and
+/// threaded through to [`connection::handle_connection`], which uses it
+/// both to key the failed-auth lockout tracker (issue #58, [`lockout`]) and
+/// to log against the unauthenticated-connection cap's `permit` (issue
+/// #57) — a single capture point for both.
 async fn accept_loop(
     listener: TcpListener,
     ctx: Arc<ConnectionContext>,
@@ -246,9 +251,28 @@ async fn accept_loop(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, peer)) => {
+                        // Reject before completing the WebSocket handshake
+                        // (issue #57): the cheapest point to turn away a
+                        // connection once the unauthenticated-connection cap
+                        // is hit. Dropping `stream` here closes the raw TCP
+                        // socket with no reply. (A locked-out peer, issue
+                        // #58, is checked separately inside
+                        // `handle_connection` itself, after this cap check.)
+                        let permit = match ctx.unauth_slots.clone().try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                connection::trace(
+                                    &ctx,
+                                    &format!(
+                                        "[{peer}] rejecting: unauthenticated-connection cap reached"
+                                    ),
+                                );
+                                continue;
+                            }
+                        };
                         let ctx = ctx.clone();
                         tokio::spawn(async move {
-                            connection::handle_connection(stream, ctx, peer).await;
+                            connection::handle_connection(stream, peer, permit, ctx).await;
                         });
                     }
                     Err(_) => continue,
