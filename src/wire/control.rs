@@ -21,6 +21,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -31,7 +32,11 @@ const CONTROL_SOCKET_NAME: &str = "control.sock";
 
 /// How long the CLI side waits for a control-channel round trip before
 /// reporting "no live server" — generous for a loopback UDS hop, short
-/// enough `holler token ping` / `holler status` never hang.
+/// enough `holler token ping` / `holler status` never hang. Only the
+/// Unix `run_client_query` uses this (see the module scope note for the
+/// non-Unix fallback), so it is cfg-gated to avoid a dead-code warning
+/// on other platforms.
+#[cfg(unix)]
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn control_socket_path(state_dir: &Path) -> PathBuf {
