@@ -912,3 +912,244 @@ fn say_routes_a_prompt_by_session_name_and_persists_the_talk_log() {
         let _ = responder.await;
     });
 }
+
+// ---------------------------------------------------------------------
+// Interrupt control path (issue #34, ADR 0005): `holler interrupt
+// <session>` against a real WS client that advertises two sibling
+// sessions on one connection, then answers (or withholds) `ack`.
+// ---------------------------------------------------------------------
+
+/// Answer every `ping` normally. For `interrupt`, only reply with an
+/// `ack` (`of` echoing the interrupt frame's id) when the body's
+/// `session` is in `ack_sessions` — lets a test exercise "acked" and
+/// "silently withheld" on two sibling sessions of the very same
+/// connection. Every `interrupt` seen is also pushed to `seen`, a shared
+/// collector the test reads back *after* aborting the task — a
+/// `JoinHandle`'s own return value is lost on abort, so the record has to
+/// live outside it.
+fn spawn_interrupt_responder(
+    mut write: impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + Unpin
+        + Send
+        + 'static,
+    mut read: impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin
+        + Send
+        + 'static,
+    token_id: String,
+    ack_sessions: Vec<&'static str>,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(Ok(Message::Text(text))) = read.next().await {
+            let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            match v["type"].as_str() {
+                Some("ping") => {
+                    let pong = json!({
+                        "v": 1, "type": "pong", "id": v["id"], "ts": "2026-09-05T00:00:00Z",
+                        "from": token_id, "body": {}
+                    });
+                    if write
+                        .send(Message::Text(pong.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Some("interrupt") => {
+                    seen.lock().unwrap().push(v.clone());
+                    let session = v["body"]["session"].as_str().unwrap_or_default();
+                    if ack_sessions.contains(&session) {
+                        let ack = json!({
+                            "v": 1, "type": "ack", "id": v["id"], "ts": "2026-09-05T00:00:00Z",
+                            "from": token_id, "body": { "of": v["id"] }
+                        });
+                        if write
+                            .send(Message::Text(ack.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    // Sessions not in `ack_sessions` are deliberately left
+                    // hanging — no ack, no error — to exercise the
+                    // "connection alive, no ack in time" timeout path.
+                }
+                _ => continue,
+            }
+        }
+    })
+}
+
+#[test]
+fn interrupt_acks_and_scopes_to_the_named_session_only() {
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "kiwi");
+    let (client_id, credential) = redeem(&env, &token_id, &secret, "kiwi.local");
+    let server = ServerProcess::spawn(&env);
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    #[allow(clippy::async_yields_async)]
+    let responder = rt.block_on(async {
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(server.url())
+            .await
+            .unwrap();
+        send_json(&mut ws, &auth_envelope(&token_id, &credential)).await;
+        let _server_hello = recv_json(&mut ws).await;
+        send_json(&mut ws, &client_hello_envelope(&token_id, &client_id)).await;
+
+        // Two sibling sessions on one connection (ADR 0007) — only
+        // `alpha` will ever be interrupted in this test.
+        send_json(
+            &mut ws,
+            &presence_envelope(
+                &token_id,
+                json!([
+                    { "name": "alpha", "harness": "opencode" },
+                    { "name": "beta", "harness": "opencode" }
+                ]),
+            ),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (write, read) = ws.split();
+        spawn_interrupt_responder(write, read, token_id.clone(), vec!["alpha"], seen.clone())
+    });
+
+    // `holler interrupt alpha`, a separate CLI process, is acked.
+    let out = env.cmd().args(["interrupt", "alpha"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("alpha"), "{stdout:?}");
+
+    // The session survives on the roster (ADR 0005: "the session
+    // stays") and stays promptable/interruptible — a second interrupt
+    // to the SAME session still works.
+    let out2 = env.cmd().args(["interrupt", "alpha"]).output().unwrap();
+    assert!(out2.status.success(), "{out2:?}");
+
+    // A name the roster has never heard of fails closed.
+    let unknown_out = env.cmd().args(["interrupt", "nope"]).output().unwrap();
+    assert!(!unknown_out.status.success());
+    let unknown_stderr = String::from_utf8(unknown_out.stderr).unwrap();
+    assert!(
+        unknown_stderr.contains("unknown_session"),
+        "{unknown_stderr:?}"
+    );
+
+    rt.block_on(async {
+        responder.abort();
+        let _ = responder.await;
+    });
+    // Assert per-session scoping directly against what the responder
+    // actually saw: `beta` (the sibling session on this same connection)
+    // must never have received an `interrupt`.
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    for envelope in seen.iter() {
+        assert_eq!(envelope["body"]["session"], "alpha", "{seen:?}");
+    }
+}
+
+#[test]
+fn interrupt_reports_timed_out_when_the_connection_never_acks() {
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "kiwi");
+    let (client_id, credential) = redeem(&env, &token_id, &secret, "kiwi.local");
+    let server = ServerProcess::spawn(&env);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    #[allow(clippy::async_yields_async)]
+    let responder = rt.block_on(async {
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(server.url())
+            .await
+            .unwrap();
+        send_json(&mut ws, &auth_envelope(&token_id, &credential)).await;
+        let _server_hello = recv_json(&mut ws).await;
+        send_json(&mut ws, &client_hello_envelope(&token_id, &client_id)).await;
+        send_json(
+            &mut ws,
+            &presence_envelope(
+                &token_id,
+                json!([{ "name": "alpha", "harness": "opencode" }]),
+            ),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (write, read) = ws.split();
+        // No session ever gets an ack.
+        spawn_interrupt_responder(
+            write,
+            read,
+            token_id.clone(),
+            vec![],
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        )
+    });
+
+    // The connection stays open and answers `ping` throughout, but never
+    // acks — this must be reported distinctly from "not connected"
+    // (issue #54), and the CLI call itself must still return (bounded by
+    // `INTERRUPT_ACK_TIMEOUT`), not hang.
+    let out = env.cmd().args(["interrupt", "alpha"]).output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap().to_lowercase();
+    assert!(
+        stderr.contains("may not have landed") && !stderr.contains("gone"),
+        "{stderr:?}"
+    );
+
+    rt.block_on(async {
+        responder.abort();
+        let _ = responder.await;
+    });
+}
+
+#[test]
+fn interrupt_reports_disconnected_when_the_connection_is_already_gone() {
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "kiwi");
+    let (client_id, credential) = redeem(&env, &token_id, &secret, "kiwi.local");
+    let server = ServerProcess::spawn(&env);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(server.url())
+            .await
+            .unwrap();
+        send_json(&mut ws, &auth_envelope(&token_id, &credential)).await;
+        let _server_hello = recv_json(&mut ws).await;
+        send_json(&mut ws, &client_hello_envelope(&token_id, &client_id)).await;
+        send_json(
+            &mut ws,
+            &presence_envelope(
+                &token_id,
+                json!([{ "name": "alpha", "harness": "opencode" }]),
+            ),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Actually close the socket, same as `query_to_a_disconnected_client_is_an_error`.
+        ws.close(None).await.unwrap();
+    });
+    std::thread::sleep(Duration::from_millis(200));
+
+    // This must fail quickly (well under `INTERRUPT_ACK_TIMEOUT`) and
+    // with a message distinct from the timeout case above.
+    let started = std::time::Instant::now();
+    let out = env.cmd().args(["interrupt", "alpha"]).output().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a dead connection must be reported promptly, not after the ack timeout"
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap().to_lowercase();
+    assert!(stderr.contains("gone"), "{stderr:?}");
+}

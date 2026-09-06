@@ -142,6 +142,16 @@ enum Commands {
     /// `unknown_session` if the roster does not know `<session>`, or its
     /// owning connection is gone.
     Say { session: String, text: String },
+    /// `holler interrupt <session>`: cancel a session's in-flight turn
+    /// (ADR 0005) — a **control** frame, not a queued `prompt`: it reaches
+    /// the session's connection immediately, even mid-turn, and the
+    /// session stays on the roster afterward, promptable again. Routed by
+    /// the roster the same way `say` is. Reports `unknown_session` if the
+    /// roster does not know `<session>`; reports (non-zero exit) if the
+    /// connection is gone, or if it is still alive but did not `ack` the
+    /// cancel within the interrupt's own short timeout — "may not have
+    /// landed," distinct from "not connected" (issue #54).
+    Interrupt { session: String },
 }
 
 /// The four `query` `cmd`s the protocol defines (spec §7). `holler
@@ -235,6 +245,7 @@ fn main() {
         Commands::Query { args, json } => run_query(args, json),
         Commands::Roster { json } => run_roster(json),
         Commands::Say { session, text } => run_say(session, text),
+        Commands::Interrupt { session } => run_interrupt(session),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -450,6 +461,37 @@ fn run_say(session: String, text: String) -> Result<(), Box<dyn std::error::Erro
             Ok(())
         }
         Some(wire::control::SayReply::Err { error }) => {
+            Err(format!("{}: {}", error.code, error.message.unwrap_or_default()).into())
+        }
+        None => Err("no live `holler serve` process is reachable on this host".into()),
+    }
+}
+
+/// `holler interrupt <session>` (issue #34, ADR 0005): reach a live
+/// `holler serve` process over the control channel and send a control-
+/// frame `interrupt` to whichever connection the roster says hosts
+/// `<session>`. No local fallback — there is no roster to consult without
+/// a live server. `TimedOut` and `Disconnected` are reported with
+/// distinct messages (issue #54): a live-but-silent connection ("may not
+/// have landed") is not the same operator-facing fact as no connection at
+/// all.
+fn run_interrupt(session: String) -> Result<(), Box<dyn std::error::Error>> {
+    let store = TokenStore::open()?;
+    let state_dir = store.dir().to_path_buf();
+    match wire::control::run_interrupt(&state_dir, session.clone()) {
+        Some(wire::control::InterruptReply::Ok) => {
+            println!("interrupted {session}");
+            Ok(())
+        }
+        Some(wire::control::InterruptReply::TimedOut) => Err(format!(
+            "interrupt sent to {session:?}, but no ack arrived in time — \
+             the connection is alive but the cancel may not have landed"
+        )
+        .into()),
+        Some(wire::control::InterruptReply::Disconnected) => {
+            Err(format!("session {session:?}'s connection is gone").into())
+        }
+        Some(wire::control::InterruptReply::Err { error }) => {
             Err(format!("{}: {}", error.code, error.message.unwrap_or_default()).into())
         }
         None => Err("no live `holler serve` process is reachable on this host".into()),
