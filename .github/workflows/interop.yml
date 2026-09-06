@@ -2,15 +2,20 @@ name: interop
 
 # Issue #94: a real cross-platform interop test harness — a `holler-server`
 # on Linux talking over a real network (through a Cloudflare quick tunnel)
-# to a real `holler-client` on macOS and on Windows. See the issue's
-# "Design decided — recording before implementation" comment for the full
-# rationale.
+# to a real `holler-client` on macOS. See the issue's "Design decided —
+# recording before implementation" comment for the full rationale.
 #
-# Manual dispatch only, deliberately: this spins up two GitHub-hosted
-# macOS/Windows runners (billed at ~10x/~2x the Linux per-minute rate) plus
-# a public Cloudflare tunnel, none of which should run on every push/PR.
-# Whether to add an automatic trigger later (e.g. on release tags) is an
-# open question this workflow does not answer — flagging it rather than
+# Linux + macOS only for now: the windows-client job (and its matching
+# verification steps in linux-server) is commented out, not deleted —
+# see those comments further down — because holler-client does not
+# currently compile on Windows at all (holler-client#60), which would
+# make it guaranteed-red on every run. Uncomment once that's fixed.
+#
+# Manual dispatch only, deliberately: this spins up a GitHub-hosted macOS
+# runner (billed at ~10x the Linux per-minute rate) plus a public
+# Cloudflare tunnel, neither of which should run on every push/PR. Whether
+# to add an automatic trigger later (e.g. on release tags) is an open
+# question this workflow does not answer — flagging it rather than
 # deciding it here.
 on:
   workflow_dispatch: {}
@@ -24,7 +29,7 @@ on:
 
 permissions:
   contents: read
-  # The client jobs poll the Actions API and download an artifact from
+  # macos-client polls the Actions API and downloads an artifact from
   # this same run (see "Wait for the server's tunnel + join token" below)
   # — that needs read access to the run's own artifacts/metadata.
   actions: read
@@ -40,26 +45,25 @@ env:
 
 jobs:
   # Builds and runs the real `holler-server`, exposes it to the internet
-  # via a Cloudflare quick tunnel (TLS-terminating, so the client legs
-  # dial a real wss:// URL per ADR-0004), mints one join token per client
-  # job, then does the actual protocol-level verification (roster/say/
-  # interrupt) once both client jobs have had a chance to join — see the
+  # via a Cloudflare quick tunnel (TLS-terminating, so the client leg
+  # dials a real wss:// URL per ADR-0004), mints a join token for
+  # macos-client, then does the actual protocol-level verification
+  # (roster/say/interrupt) once it's had a chance to join — see the
   # module note on `HOLLER_STATE_DIR`'s control channel below for why the
-  # verification happens here and not on the client legs themselves.
+  # verification happens here and not on the client leg itself.
   #
-  # Deliberately NOT gated by `needs:` from the client jobs, and the
-  # client jobs are not gated by `needs: linux-server` either — a job
-  # dependent via `needs:` only starts after the needed job *fully
-  # completes*, but this job's own server + tunnel processes die the
-  # instant it completes (a GitHub-hosted runner's VM is destroyed at job
-  # end; this org's self-hosted-linux pool is even more immediate — each
-  # container is single-job-ephemeral and deregisters/exits right after).
-  # So the three jobs run concurrently from the same trigger, and the
-  # tunnel URL + join tokens are handed to the client jobs via an
-  # uploaded artifact (visible to sibling jobs in the same run as soon as
-  # the upload step finishes, unlike a `needs.<job>.outputs` value, which
-  # only resolves after the whole producing job is done) instead of job
-  # outputs.
+  # Deliberately NOT gated by `needs:` from macos-client, and macos-client
+  # is not gated by `needs: linux-server` either — a job dependent via
+  # `needs:` only starts after the needed job *fully completes*, but this
+  # job's own server + tunnel processes die the instant it completes (a
+  # GitHub-hosted runner's VM is destroyed at job end; this org's
+  # self-hosted-linux pool is even more immediate — each container is
+  # single-job-ephemeral and deregisters/exits right after). So the two
+  # jobs run concurrently from the same trigger, and the tunnel URL +
+  # join token are handed to macos-client via an uploaded artifact
+  # (visible to a sibling job in the same run as soon as the upload step
+  # finishes, unlike a `needs.<job>.outputs` value, which only resolves
+  # after the whole producing job is done) instead of job outputs.
   linux-server:
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
@@ -135,23 +139,26 @@ jobs:
       # exposure) the raw token briefly sits somewhere readable by anyone
       # who can see this run. A short TTL bounds that window tightly
       # rather than defaulting to the production 24h.
+      # windows-client is disabled below (holler-client#60), so its token
+      # mint is commented out here too — re-enable both together.
       - name: Mint join tokens and publish the handoff artifact
         run: |
           mac_out=$(./target/release/holler token mint --label macos-client --ttl 15m)
           mac_id=$(echo "$mac_out" | awk -F': *' '/^token_id:/ {print $2}')
           mac_secret=$(echo "$mac_out" | awk -F': *' '/^secret:/ {print $2}')
 
-          win_out=$(./target/release/holler token mint --label windows-client --ttl 15m)
-          win_id=$(echo "$win_out" | awk -F': *' '/^token_id:/ {print $2}')
-          win_secret=$(echo "$win_out" | awk -F': *' '/^secret:/ {print $2}')
+          # win_out=$(./target/release/holler token mint --label windows-client --ttl 15m)
+          # win_id=$(echo "$win_out" | awk -F': *' '/^token_id:/ {print $2}')
+          # win_secret=$(echo "$win_out" | awk -F': *' '/^secret:/ {print $2}')
 
           cat > /tmp/handoff.json <<EOF
           {
             "tunnel_url": "${{ steps.tunnel.outputs.url }}",
-            "macos_token": "${mac_id}:${mac_secret}",
-            "windows_token": "${win_id}:${win_secret}"
+            "macos_token": "${mac_id}:${mac_secret}"
           }
           EOF
+          # Add back above once windows-client is re-enabled:
+          #   "windows_token": "${win_id}:${win_secret}"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -168,7 +175,7 @@ jobs:
       # what happened when this job's own fixed-length wait ran long
       # enough that the macOS client's job (and its runner) had already
       # finished and been torn down before this check ran. 3 minutes is
-      # generous for both client jobs' checkout + build + artifact poll +
+      # generous for macos-client's checkout + build + artifact poll +
       # join to reach a live presence frame.
       - name: Verify macOS session joined (poll the roster)
         id: macos_roster
@@ -188,7 +195,7 @@ jobs:
       # to this machine's HOLLER_STATE_DIR, not reachable over the
       # network the tunnel exposes. So the actual protocol-level
       # verification runs here, on the same machine as the live server,
-      # not on the client legs. Runs immediately after the roster check
+      # not on the client leg. Runs immediately after the roster check
       # above confirms state=connected, not after a separate wait, so
       # there's no gap for the client to have gone stale in between.
       - name: Exercise say/interrupt against the macOS session
@@ -196,28 +203,31 @@ jobs:
           ./target/release/holler say macos-session "ping from linux-server"
           ./target/release/holler interrupt macos-session
 
-      # Known, already-accepted limitation (holler-client#60): holler-client
-      # does not currently compile on Windows at all, so windows-client
-      # (below) is expected to fail before it ever joins. Best-effort only
-      # — never fails this job. Short budget: no point waiting long for a
-      # leg that's expected to have failed at its build step.
-      - name: Verify Windows session (best-effort — see holler-client#60)
-        continue-on-error: true
-        run: |
-          state=""
-          for i in $(seq 1 30); do
-            state=$(./target/release/holler roster --json | grep -A3 '"name": "windows-session"' | grep -oE '"state": "[a-z]+"' | cut -d'"' -f4)
-            [ "$state" = "connected" ] && break
-            sleep 2
-          done
-          ./target/release/holler roster
-          [ "$state" = "connected" ]
-
-      - name: Exercise say/interrupt against the Windows session (best-effort)
-        continue-on-error: true
-        run: |
-          ./target/release/holler say windows-session "ping from linux-server"
-          ./target/release/holler interrupt windows-session
+      # windows-client (and its verification below) is disabled — not
+      # deleted — pending holler-client#60: holler-client does not
+      # currently compile on Windows at all (a pre-existing,
+      # already-tracked, unrelated break), so this leg would be
+      # guaranteed-red on every run with no signal to show for it.
+      # Uncomment this block (and the windows-client job + its token
+      # mint above) once holler-client#60 is fixed.
+      #
+      # - name: Verify Windows session (best-effort — see holler-client#60)
+      #   continue-on-error: true
+      #   run: |
+      #     state=""
+      #     for i in $(seq 1 30); do
+      #       state=$(./target/release/holler roster --json | grep -A3 '"name": "windows-session"' | grep -oE '"state": "[a-z]+"' | cut -d'"' -f4)
+      #       [ "$state" = "connected" ] && break
+      #       sleep 2
+      #     done
+      #     ./target/release/holler roster
+      #     [ "$state" = "connected" ]
+      #
+      # - name: Exercise say/interrupt against the Windows session (best-effort)
+      #   continue-on-error: true
+      #   run: |
+      #     ./target/release/holler say windows-session "ping from linux-server"
+      #     ./target/release/holler interrupt windows-session
 
       - name: Stop cloudflared and holler serve
         if: always()
@@ -302,85 +312,90 @@ jobs:
         if: always()
         run: cat run.log || true
 
-  windows-client:
-    runs-on: windows-latest
-    # Known, already-tracked, pre-existing issue (holler-client#60):
-    # holler-client does not compile on Windows at all right now
-    # (instance_lock.rs unconditionally uses Unix-only APIs), unrelated to
-    # this harness. Matches how ci.yml already handles this same gap.
-    # Remove once holler-client#60 is fixed.
-    continue-on-error: true
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      # TEMPORARY — see the identical note on macos-client above
-      # (Performant-Labs/holler-client#65 / #66).
-      - uses: actions/checkout@v4
-        with:
-          repository: Performant-Labs/holler-client
-          ref: fix/65-tls-feature
-
-      - name: Install Rust
-        run: rustup toolchain install stable
-
-      - name: Build holler-client
-        run: cargo build --release
-
-      # See the long note on `linux-server` (top of this file): this job
-      # runs concurrently with it (no `needs:`), so the tunnel URL and
-      # this job's join token arrive via an artifact linux-server uploads
-      # mid-run, polled for here via the Actions API.
-      - name: Wait for the server's tunnel + join token
-        id: handoff
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $artifactId = $null
-          for ($i = 0; $i -lt 60; $i++) {
-            $artifacts = gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" | ConvertFrom-Json
-            $match = $artifacts.artifacts | Where-Object { $_.name -eq "interop-handoff" } | Select-Object -First 1
-            if ($match) { $artifactId = $match.id; break }
-            Start-Sleep -Seconds 5
-          }
-          if (-not $artifactId) {
-            Write-Host "::error::interop-handoff artifact never appeared within budget"
-            exit 1
-          }
-
-          gh run download "${{ github.run_id }}" --repo "${{ github.repository }}" -n interop-handoff -D handoff
-          Get-Content handoff/handoff.json
-
-          $json = Get-Content handoff/handoff.json -Raw | ConvertFrom-Json
-          Write-Host "::add-mask::$($json.windows_token)"
-          echo "tunnel_url=$($json.tunnel_url)" >> $env:GITHUB_OUTPUT
-          echo "token=$($json.windows_token)" >> $env:GITHUB_OUTPUT
-
-      - name: Join the tunneled server
-        run: |
-          $tunnelUrl = "${{ steps.handoff.outputs.tunnel_url }}"
-          $host_ = $tunnelUrl -replace '^https://', ''
-          $wssUrl = "wss://${host_}:443"
-          ./target/release/holler.exe join --server $wssUrl --token "${{ steps.handoff.outputs.token }}"
-
-      - name: Write a local sessions.toml (stub-acp fixture, zero-cost)
-        run: |
-          $stubPath = (Resolve-Path "target/release/stub-acp.exe").Path -replace '\\', '/'
-          @"
-          [[session]]
-          name = "windows-session"
-          harness = "stub-acp"
-          command = ["$stubPath"]
-          "@ | Set-Content -Path sessions.toml
-
-      - name: Run in the background and stay alive for the server's verification window
-        run: |
-          Start-Process -FilePath "./target/release/holler.exe" -ArgumentList "run --config sessions.toml" `
-            -RedirectStandardOutput "run.log" -RedirectStandardError "run.err.log" -PassThru | Out-Null
-          Start-Sleep -Seconds 300
-
-      - name: Show run log
-        if: always()
-        run: |
-          Get-Content run.log -ErrorAction SilentlyContinue
-          Get-Content run.err.log -ErrorAction SilentlyContinue
+  # windows-client is disabled — not deleted — pending holler-client#60
+  # (see the comment in linux-server above). Uncomment this whole job
+  # (and the matching token-mint + verification steps in linux-server)
+  # once that issue is fixed.
+  #
+  # windows-client:
+  #   runs-on: windows-latest
+  #   # Known, already-tracked, pre-existing issue (holler-client#60):
+  #   # holler-client does not compile on Windows at all right now
+  #   # (instance_lock.rs unconditionally uses Unix-only APIs), unrelated to
+  #   # this harness. Matches how ci.yml already handles this same gap.
+  #   # Remove once holler-client#60 is fixed.
+  #   continue-on-error: true
+  #   defaults:
+  #     run:
+  #       shell: pwsh
+  #   steps:
+  #     # TEMPORARY — see the identical note on macos-client above
+  #     # (Performant-Labs/holler-client#65 / #66).
+  #     - uses: actions/checkout@v4
+  #       with:
+  #         repository: Performant-Labs/holler-client
+  #         ref: fix/65-tls-feature
+  #
+  #     - name: Install Rust
+  #       run: rustup toolchain install stable
+  #
+  #     - name: Build holler-client
+  #       run: cargo build --release
+  #
+  #     # See the long note on `linux-server` (top of this file): this job
+  #     # runs concurrently with it (no `needs:`), so the tunnel URL and
+  #     # this job's join token arrive via an artifact linux-server uploads
+  #     # mid-run, polled for here via the Actions API.
+  #     - name: Wait for the server's tunnel + join token
+  #       id: handoff
+  #       env:
+  #         GH_TOKEN: ${{ github.token }}
+  #       run: |
+  #         $artifactId = $null
+  #         for ($i = 0; $i -lt 60; $i++) {
+  #           $artifacts = gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" | ConvertFrom-Json
+  #           $match = $artifacts.artifacts | Where-Object { $_.name -eq "interop-handoff" } | Select-Object -First 1
+  #           if ($match) { $artifactId = $match.id; break }
+  #           Start-Sleep -Seconds 5
+  #         }
+  #         if (-not $artifactId) {
+  #           Write-Host "::error::interop-handoff artifact never appeared within budget"
+  #           exit 1
+  #         }
+  #
+  #         gh run download "${{ github.run_id }}" --repo "${{ github.repository }}" -n interop-handoff -D handoff
+  #         Get-Content handoff/handoff.json
+  #
+  #         $json = Get-Content handoff/handoff.json -Raw | ConvertFrom-Json
+  #         Write-Host "::add-mask::$($json.windows_token)"
+  #         echo "tunnel_url=$($json.tunnel_url)" >> $env:GITHUB_OUTPUT
+  #         echo "token=$($json.windows_token)" >> $env:GITHUB_OUTPUT
+  #
+  #     - name: Join the tunneled server
+  #       run: |
+  #         $tunnelUrl = "${{ steps.handoff.outputs.tunnel_url }}"
+  #         $host_ = $tunnelUrl -replace '^https://', ''
+  #         $wssUrl = "wss://${host_}:443"
+  #         ./target/release/holler.exe join --server $wssUrl --token "${{ steps.handoff.outputs.token }}"
+  #
+  #     - name: Write a local sessions.toml (stub-acp fixture, zero-cost)
+  #       run: |
+  #         $stubPath = (Resolve-Path "target/release/stub-acp.exe").Path -replace '\\', '/'
+  #         @"
+  #         [[session]]
+  #         name = "windows-session"
+  #         harness = "stub-acp"
+  #         command = ["$stubPath"]
+  #         "@ | Set-Content -Path sessions.toml
+  #
+  #     - name: Run in the background and stay alive for the server's verification window
+  #       run: |
+  #         Start-Process -FilePath "./target/release/holler.exe" -ArgumentList "run --config sessions.toml" `
+  #           -RedirectStandardOutput "run.log" -RedirectStandardError "run.err.log" -PassThru | Out-Null
+  #         Start-Sleep -Seconds 300
+  #
+  #     - name: Show run log
+  #       if: always()
+  #       run: |
+  #         Get-Content run.log -ErrorAction SilentlyContinue
+  #         Get-Content run.err.log -ErrorAction SilentlyContinue
