@@ -149,3 +149,168 @@ fn delete_alias_rm_works() {
     let out = env.cmd().args(["token", "rm", &token_id]).output().unwrap();
     assert!(out.status.success(), "{out:?}");
 }
+
+fn mint(env: &Env, label: &str) -> (String, String) {
+    let mint_out = env
+        .cmd()
+        .args(["token", "mint", "--label", label])
+        .output()
+        .unwrap();
+    assert!(mint_out.status.success(), "{mint_out:?}");
+    let mint_stdout = String::from_utf8(mint_out.stdout).unwrap();
+    let secret = mint_stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("secret:").map(|s| s.trim().to_string()))
+        .expect("mint prints a secret line");
+    let token_id = mint_stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("token_id:").map(|s| s.trim().to_string()))
+        .expect("mint prints a token_id line");
+    (token_id, secret)
+}
+
+#[test]
+fn redeem_binds_token_and_shows_up_via_client_list() {
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "laptop");
+
+    let redeem_out = env
+        .cmd()
+        .args([
+            "token",
+            "redeem",
+            &token_id,
+            "--secret",
+            &secret,
+            "--machine",
+            "kiwi.local",
+        ])
+        .output()
+        .unwrap();
+    assert!(redeem_out.status.success(), "{redeem_out:?}");
+    let redeem_stdout = String::from_utf8(redeem_out.stdout).unwrap();
+    let client_id = redeem_stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("client_id:").map(|s| s.trim().to_string()))
+        .expect("redeem prints a client_id line");
+    let credential = redeem_stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("credential:").map(|s| s.trim().to_string()))
+        .expect("redeem prints a credential line");
+    assert!(client_id.starts_with("cli_"));
+    assert!(credential.starts_with("hlr_live_"));
+
+    // `holler token list` shows the real hostname, replacing "-".
+    let token_list_out = env.cmd().args(["token", "list"]).output().unwrap();
+    let token_list_stdout = String::from_utf8(token_list_out.stdout).unwrap();
+    assert!(token_list_stdout.contains("kiwi.local"));
+    assert!(token_list_stdout.contains(&client_id));
+    assert!(token_list_stdout.contains("bound"));
+    assert!(!token_list_stdout.contains(&credential));
+
+    // `holler client list` is the bound-token alias.
+    let client_list_out = env.cmd().args(["client", "list"]).output().unwrap();
+    assert!(client_list_out.status.success());
+    let client_list_stdout = String::from_utf8(client_list_out.stdout).unwrap();
+    assert!(client_list_stdout.contains(&client_id));
+    assert!(client_list_stdout.contains("kiwi.local"));
+    assert!(!client_list_stdout.contains(&credential));
+}
+
+#[test]
+fn redeem_with_wrong_secret_fails_and_leaves_token_unused() {
+    let env = Env::new();
+    let (token_id, _secret) = mint(&env, "phone");
+
+    let redeem_out = env
+        .cmd()
+        .args([
+            "token",
+            "redeem",
+            &token_id,
+            "--secret",
+            "hlr_totally-wrong",
+            "--machine",
+            "kiwi.local",
+        ])
+        .output()
+        .unwrap();
+    assert!(!redeem_out.status.success());
+    let stderr = String::from_utf8(redeem_out.stderr).unwrap();
+    assert!(stderr.to_lowercase().contains("wrong secret"));
+
+    let list_out = env.cmd().args(["token", "list"]).output().unwrap();
+    let list_stdout = String::from_utf8(list_out.stdout).unwrap();
+    assert!(list_stdout.contains("unused"));
+}
+
+#[test]
+fn client_detach_revokes_a_bound_token() {
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "desktop");
+    env.cmd()
+        .args([
+            "token",
+            "redeem",
+            &token_id,
+            "--secret",
+            &secret,
+            "--machine",
+            "kiwi.local",
+        ])
+        .output()
+        .unwrap();
+
+    let detach_out = env
+        .cmd()
+        .args(["client", "detach", &token_id])
+        .output()
+        .unwrap();
+    assert!(detach_out.status.success(), "{detach_out:?}");
+    let detach_stdout = String::from_utf8(detach_out.stdout).unwrap();
+    assert!(detach_stdout.contains("revoked"));
+
+    let list_out = env.cmd().args(["token", "list"]).output().unwrap();
+    let list_stdout = String::from_utf8(list_out.stdout).unwrap();
+    assert!(list_stdout.contains("revoked"));
+
+    // A revoked token no longer shows up under `client list`.
+    let client_list_out = env.cmd().args(["client", "list"]).output().unwrap();
+    let client_list_stdout = String::from_utf8(client_list_out.stdout).unwrap();
+    assert!(!client_list_stdout.contains(&token_id));
+}
+
+#[test]
+fn redeem_already_bound_token_fails() {
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "tablet");
+    env.cmd()
+        .args([
+            "token",
+            "redeem",
+            &token_id,
+            "--secret",
+            &secret,
+            "--machine",
+            "first.local",
+        ])
+        .output()
+        .unwrap();
+
+    let second = env
+        .cmd()
+        .args([
+            "token",
+            "redeem",
+            &token_id,
+            "--secret",
+            &secret,
+            "--machine",
+            "second.local",
+        ])
+        .output()
+        .unwrap();
+    assert!(!second.status.success());
+    let stderr = String::from_utf8(second.stderr).unwrap();
+    assert!(stderr.to_lowercase().contains("bound"));
+}
