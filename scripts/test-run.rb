@@ -38,16 +38,33 @@
 # entries):
 #   "<repo>: tests/<file>.rs"        -> cargo test --test <file>
 #   "<repo>: tests/<file>.rs (<fn>)" -> cargo test --test <file> <fn>
+#   "<repo>: src/<path>.rs (<fn>)"   -> cargo test --lib <fn> -- an inline
+#     #[cfg(test)] unit test living in the crate's own src/ tree (not a
+#     separate tests/*.rs integration binary). `--lib` scopes the run to
+#     the crate's own unit-test binary so a same-named test elsewhere
+#     (an integration file, the sibling repo) can't get matched instead --
+#     verified live: `cargo test --lib <fn>` runs exactly one test, not the
+#     whole crate, for every case this form was introduced for.
 #   segments separated by "; "       -> run each; ALL must pass
 #   starts with "manual"             -> not run; stays pending for `record`
-#   unparseable (e.g. a bare src/ pointer) -> runs that repo's whole `cargo
-#     test` as a conservative fallback; evidence says a fallback ran
+#   unparseable (e.g. a bare src/ pointer with no `(<fn>)`) -> runs that
+#     repo's whole `cargo test` as a conservative fallback; evidence says
+#     a fallback ran
 #
 # Usage:
 #   ruby scripts/test-run.rb discover
 #   ruby scripts/test-run.rb start [--applies server|client|both|all] [--type auto|manual|all]
 #   ruby scripts/test-run.rb run ISSUE --server-dir DIR --client-dir DIR
 #   ruby scripts/test-run.rb record ISSUE TEST_ID pass|fail [note]
+#   ruby scripts/test-run.rb exec TEST_ID [--server-dir DIR] [--client-dir DIR]
+#     Runs ONE test case's Automation field locally, right now, streaming
+#     real `cargo test` output live -- no GitHub write of any kind (no
+#     test-run issue, no comment). For "I have a Test ID from an issue and
+#     just want to run that one test" -- you don't need to know its
+#     file/function, just the ID (e.g. `exec hlrsvr-1000`). Exits with the
+#     same status the underlying `cargo test` exits with. --server-dir and
+#     --client-dir default to ~/Projects/holler-server and
+#     ~/Projects/holler-client (this machine's layout) if omitted.
 
 require 'octokit'
 require 'time'
@@ -207,6 +224,61 @@ end
 # ---------------------------------------------------------------------------
 # run: execute pending automated cases in a test-run issue for real.
 # ---------------------------------------------------------------------------
+Segment = Struct.new(:repo, :file, :fn, :lib_test, :fallback_used, :dir, :cmd, :error, keyword_init: true)
+
+# Parses one ';'-separated Automation segment into a Segment describing what
+# to run, using exactly the grammar documented at the top of this file.
+# Shared by run_cases (captures output) and exec_test (streams it live) so
+# the two can't silently drift onto different grammars over time.
+def parse_segment(seg, server_dir:, client_dir:)
+  seg = seg.strip
+  repo = file = fn = nil
+  lib_test = false
+  fallback_used = false
+
+  if (m = seg.match(%r{\A([a-zA-Z0-9_-]+):\s*tests/([A-Za-z0-9_]+)\.rs(?:\s*\(([a-zA-Z0-9_]+)\))?\z}))
+    repo, file, fn = m[1], m[2], m[3]
+  elsif (m = seg.match(%r{\A([a-zA-Z0-9_-]+):\s*src/[A-Za-z0-9_/]+\.rs\s*\(([a-zA-Z0-9_]+)\)\z}))
+    repo, fn = m[1], m[2]
+    lib_test = true
+  elsif (m = seg.match(/\A([a-zA-Z0-9_-]+):/))
+    repo = m[1]
+    fallback_used = true
+  else
+    return Segment.new(error: "[unparseable automation segment: #{seg}]\n")
+  end
+
+  dir = { 'holler-server' => server_dir, 'holler-client' => client_dir }[repo]
+  return Segment.new(repo: repo, error: "[unknown repo in automation: #{repo}]\n") unless dir
+  return Segment.new(repo: repo, error: "[no checkout at #{dir} for #{repo}]\n") unless Dir.exist?(dir)
+
+  cmd = if lib_test
+          "cargo test --lib #{fn}"
+        elsif file
+          fn ? "cargo test --test #{file} #{fn}" : "cargo test --test #{file}"
+        else
+          'cargo test'
+        end
+
+  Segment.new(repo: repo, file: file, fn: fn, lib_test: lib_test,
+              fallback_used: fallback_used, dir: dir, cmd: cmd)
+end
+
+# Runs a fully-resolved Segment's command for real via bash -lc (so
+# ~/.cargo/env gets sourced), returning [ok, output, exitstatus]. A filter
+# matching zero tests still exits 0 -- cargo has no way to say "your filter
+# named nothing real" -- so a named-fn segment with 0 passed/0 failed is
+# treated as a failure rather than silently recorded as a pass.
+def exec_segment_captured(seg)
+  full_cmd = "source \"$HOME/.cargo/env\" 2>/dev/null; #{seg.cmd}"
+  out, status = Open3.capture2e('bash', '-lc', full_cmd, chdir: seg.dir)
+  ok = status.success?
+  if ok && seg.fn && (m = out.match(/^test result: \w+\. (\d+) passed; (\d+) failed;.*?(\d+) filtered out/))
+    ok = false if m[1].to_i.zero? && m[2].to_i.zero?
+  end
+  [ok, out, status.exitstatus]
+end
+
 def run_cases(gh, issue_number, server_dir:, client_dir:)
   issue = gh.issue(REPO, issue_number)
   catalog = discover(gh)
@@ -235,58 +307,29 @@ def run_cases(gh, issue_number, server_dir:, client_dir:)
     fallback_used = false
     log = +''
 
-    automation.split(';').each do |seg|
-      seg = seg.strip
-      repo = nil
-      file = nil
-      fn = nil
-
-      if (m = seg.match(%r{\A([a-zA-Z0-9_-]+):\s*tests/([A-Za-z0-9_]+)\.rs(?:\s*\(([a-zA-Z0-9_]+)\))?\z}))
-        repo, file, fn = m[1], m[2], m[3]
-      elsif (m = seg.match(/\A([a-zA-Z0-9_-]+):/))
-        repo = m[1]
-        fallback_used = true
-      else
+    automation.split(';').each do |raw_seg|
+      seg = parse_segment(raw_seg, server_dir: server_dir, client_dir: client_dir)
+      if seg.error
         all_ok = false
-        log << "[unparseable automation segment: #{seg}]\n"
+        log << seg.error
         next
       end
+      fallback_used ||= seg.fallback_used
 
-      dir = { 'holler-server' => server_dir, 'holler-client' => client_dir }[repo]
-      unless dir
-        all_ok = false
-        log << "[unknown repo in automation: #{repo}]\n"
-        next
-      end
-      unless Dir.exist?(dir)
-        all_ok = false
-        log << "[no checkout at #{dir} for #{repo}]\n"
-        next
-      end
-
-      cmd = if file
-              fn ? "cargo test --test #{file} #{fn}" : "cargo test --test #{file}"
-            else
-              'cargo test'
-            end
-      full_cmd = "source \"$HOME/.cargo/env\" 2>/dev/null; #{cmd}"
-      out, status = Open3.capture2e('bash', '-lc', full_cmd, chdir: dir)
-      seg_ok = status.success?
-
-      # A filter matching zero tests still exits 0 -- cargo has no way to
-      # say "your filter named nothing real." Catch it explicitly rather
-      # than silently recording a pass for an Automation field that
-      # doesn't actually point at a real test.
-      if seg_ok && fn && (m = out.match(/^test result: \w+\. (\d+) passed; (\d+) failed;.*?(\d+) filtered out/))
-        passed_n, failed_n = m[1].to_i, m[2].to_i
-        if passed_n.zero? && failed_n.zero?
-          seg_ok = false
-          log << "[named test '#{fn}' did not run -- filtered out or does not exist in #{file}.rs]\n"
+      seg_ok, out, exitstatus = exec_segment_captured(seg)
+      if !seg_ok && seg.fn
+        m = out.match(/^test result: \w+\. (\d+) passed; (\d+) failed;.*?(\d+) filtered out/)
+        if m && m[1].to_i.zero? && m[2].to_i.zero?
+          log << "[named test '#{seg.fn}' did not run -- filtered out or does not exist#{seg.file ? " in #{seg.file}.rs" : ''}]\n"
         end
       end
 
       all_ok &&= seg_ok
-      log << "\n--- #{repo} (#{file || 'whole crate'}#{fn ? " / #{fn}" : ''}), exit #{status.exitstatus} ---\n"
+      target = if seg.lib_test then '--lib'
+               elsif seg.file then seg.file
+               else 'whole crate'
+               end
+      log << "\n--- #{seg.repo} (#{target}#{seg.fn ? " / #{seg.fn}" : ''}), exit #{exitstatus} ---\n"
       log << out.lines.last(25).join
     end
 
@@ -336,6 +379,44 @@ def record(gh, issue_number, target_id, result, note)
 end
 
 # ---------------------------------------------------------------------------
+# exec: run ONE test case's Automation field locally, live, for a human at
+# a terminal -- no GitHub write of any kind (no test-run issue, no comment).
+# Streams real `cargo test` output as it happens instead of capturing it,
+# and exits with the same status the underlying command(s) exit with, so
+# it composes with shell scripting ("test-run.rb exec hlrsvr-1000 || ...").
+# ---------------------------------------------------------------------------
+def exec_test(gh, test_id, server_dir:, client_dir:)
+  catalog = discover(gh)
+  cat = catalog.find { |c| c[:id] == test_id }
+  abort("error: exec: test id '#{test_id}' not found in the catalog") unless cat
+
+  automation = cat[:automation]
+  if automation.nil? || automation.empty? || automation =~ /\Amanual/i
+    abort("error: exec: #{test_id} is a manual case with no automated command to run " \
+          "(Automation: #{automation.inspect})")
+  end
+
+  puts "==> #{test_id}: #{automation}"
+  overall_ok = true
+
+  automation.split(';').each do |raw_seg|
+    seg = parse_segment(raw_seg, server_dir: server_dir, client_dir: client_dir)
+    if seg.error
+      warn seg.error
+      overall_ok = false
+      next
+    end
+
+    puts "--- #{seg.repo} $ #{seg.cmd} (in #{seg.dir}) ---"
+    full_cmd = "source \"$HOME/.cargo/env\" 2>/dev/null; #{seg.cmd}"
+    ok = system('bash', '-lc', full_cmd, chdir: seg.dir)
+    overall_ok &&= ok
+  end
+
+  exit(overall_ok ? 0 : 1)
+end
+
+# ---------------------------------------------------------------------------
 def main
   cmd = ARGV.shift
   gh = client
@@ -367,8 +448,19 @@ def main
     result = ARGV.shift or abort('usage: record ISSUE TEST_ID pass|fail [note]')
     note = ARGV.shift || ''
     record(gh, issue.to_i, test_id, result, note)
+  when 'exec'
+    test_id = ARGV.shift or abort('usage: exec TEST_ID [--server-dir DIR] [--client-dir DIR]')
+    opts = {
+      server: File.expand_path('~/Projects/holler-server'),
+      client: File.expand_path('~/Projects/holler-client')
+    }
+    OptionParser.new do |o|
+      o.on('--server-dir DIR') { |v| opts[:server] = v }
+      o.on('--client-dir DIR') { |v| opts[:client] = v }
+    end.parse!(ARGV)
+    exec_test(gh, test_id, server_dir: opts[:server], client_dir: opts[:client])
   else
-    abort("usage: #{$PROGRAM_NAME} {discover|start|run|record} ...")
+    abort("usage: #{$PROGRAM_NAME} {discover|start|run|record|exec} ...")
   end
 end
 
