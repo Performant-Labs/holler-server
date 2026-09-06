@@ -16,6 +16,7 @@
 use std::net::SocketAddr;
 
 use clap::{Parser, Subcommand};
+use holler_server::advertise::{self, AdvertiseState};
 use holler_server::token::{parse_ttl, PingOutcome, RedeemResult, TokenError, TokenStore, DEFAULT_TTL};
 use holler_server::wire;
 use holler_server::wire::control::RosterRowDoc;
@@ -148,6 +149,14 @@ struct ServeArgs {
     /// Defaults to `HOLLER_LISTEN`, then `127.0.0.1:41807`.
     #[arg(long)]
     listen: Vec<String>,
+    /// `host[:port]` naming how others should reach this server (issue
+    /// #66), e.g. `myhost.example.com:41807`. Persisted so a later
+    /// `holler token mint` can print a ready-to-run `holler join`
+    /// command. If omitted, falls back to `--listen` when that is
+    /// already a real, non-loopback address; otherwise `mint` warns
+    /// instead of guessing.
+    #[arg(long)]
+    advertise: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -250,6 +259,13 @@ fn resolve_listen_addrs(flag_values: &[String]) -> Result<Vec<SocketAddr>, Box<d
 fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let listen_addrs = resolve_listen_addrs(&args.listen)?;
     let debug = holler_server::debug::DebugLevel::resolve(None, std::env::var("HOLLER_DEBUG").ok().as_deref())?;
+
+    // Persist what this run resolved to advertise (issue #66) before
+    // accepting any connections, so a `mint` invocation racing right
+    // after `serve` starts always sees it.
+    let resolved_advertise = advertise::resolve_advertise(args.advertise.as_deref(), &listen_addrs);
+    let store = TokenStore::open()?;
+    advertise::persist(store.dir(), resolved_advertise.as_deref())?;
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
@@ -487,6 +503,7 @@ fn run_token(command: TokenCommands) -> Result<(), TokenError> {
             println!("secret:   {}", minted.secret);
             println!("expires:  {}", minted.expires);
             println!("\nThis secret is shown once and is not stored. Save it now.");
+            print_join_command(store.dir(), &minted.token_id, &minted.secret);
             Ok(())
         }
         TokenCommands::List { json } => {
@@ -521,6 +538,28 @@ fn run_token(command: TokenCommands) -> Result<(), TokenError> {
             let redeemed = store.redeem(&id, &secret, machine)?;
             print_redeem_result(&redeemed);
             Ok(())
+        }
+    }
+}
+
+/// Prints a ready-to-run `holler join` command for a freshly minted
+/// token (issue #66), using whatever `serve` recorded as its reachable
+/// address — or a clear warning in place of a command that would be
+/// wrong for anyone but a same-machine test. `--token` is
+/// `<token_id>:<secret>`, the format holler-client's `join`/`join_ok`
+/// implementation (ADR 0015) expects.
+fn print_join_command(state_dir: &std::path::Path, token_id: &str, secret: &str) {
+    match advertise::read(state_dir) {
+        AdvertiseState::Reachable(address) => {
+            println!("\nRun on the joining machine:");
+            println!("  holler join --server ws://{address} --token {token_id}:{secret}");
+        }
+        AdvertiseState::LoopbackOnly | AdvertiseState::Unknown => {
+            println!(
+                "\nwarning: server is bound to loopback only (or has not been started) — no \
+                 reachable address to advertise; set --advertise on `holler serve`, or \
+                 construct the join command manually with the correct address."
+            );
         }
     }
 }
