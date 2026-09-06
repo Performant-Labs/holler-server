@@ -1,14 +1,71 @@
 //! `holler` CLI (issue #29: the first entry point in this crate).
 //!
-//! Only `token mint/list/delete/ping` exists today. `Cli`/`Commands`
-//! are shaped so a later story (#35, "Meta-O CLI wiring") can add
-//! sibling top-level subcommands (`status`, `support`, `roster`,
-//! `say`, ...) without restructuring this file.
+//! `token mint/list/delete/ping/redeem` and `client list/detach`
+//! (aliases of the bound-token list/delete paths, issue #30) exist
+//! today. `Cli`/`Commands` are shaped so a later story (#35, "Meta-O
+//! CLI wiring") can add sibling top-level subcommands (`status`,
+//! `support`, `roster`, `say`, ...) without restructuring this file.
+//!
+//! `token redeem` is a manual-testing convenience, not the production
+//! path: real redemption is triggered by a live `holler-client` `join`
+//! over the WebSocket listener (issue #31, not yet built), which calls
+//! [`holler_server::token::TokenStore::redeem`] directly. This verb
+//! exists only so an operator can exercise the same library call from
+//! a shell without a real client.
 
 use clap::{Parser, Subcommand};
 use holler_server::token::{
-    parse_ttl, AlwaysDisconnected, PingOutcome, TokenError, TokenStore, DEFAULT_TTL,
+    parse_ttl, AlwaysDisconnected, PingOutcome, RedeemResult, TokenError, TokenStore, DEFAULT_TTL,
 };
+
+/// `holler token list` / `holler client list` share this table shape;
+/// `client list` just pre-filters to bound records.
+fn print_table(views: &[holler_server::token::TokenView]) {
+    const HEADERS: [&str; 7] = [
+        "TOKEN_ID",
+        "STATE",
+        "CLIENT_ID",
+        "MACHINE",
+        "LABEL",
+        "LAST_SEEN",
+        "EXPIRES",
+    ];
+    let rows: Vec<[&str; 7]> = views
+        .iter()
+        .map(|v| {
+            [
+                v.token_id.as_str(),
+                v.state.as_str(),
+                v.client_id.as_str(),
+                v.machine.as_str(),
+                v.label.as_str(),
+                v.last_seen.as_str(),
+                v.expires.as_str(),
+            ]
+        })
+        .collect();
+
+    let mut widths = HEADERS.map(str::len);
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+
+    let print_row = |cells: &[&str; 7]| {
+        let line: Vec<String> = cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{c:<width$}", width = widths[i]))
+            .collect();
+        println!("{}", line.join("  ").trim_end());
+    };
+
+    print_row(&HEADERS);
+    for row in &rows {
+        print_row(row);
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "holler", about = "Talk circuit for the herd")]
@@ -21,6 +78,9 @@ struct Cli {
 enum Commands {
     /// Manage join tokens.
     Token(TokenArgs),
+    /// Manage bound clients — aliases of the bound-token list/detach
+    /// paths under `token`, scoped to records that are actually bound.
+    Client(ClientArgs),
 }
 
 #[derive(clap::Args)]
@@ -50,12 +110,41 @@ enum TokenCommands {
     Delete { id: String },
     /// Check whether a bound token's client is connected.
     Ping { id: String },
+    /// Redeem a join token's secret: bind it to `machine` and mint a
+    /// client_id + credential. Manual-testing convenience — the
+    /// production path is a live client's `join` (issue #31).
+    Redeem {
+        id: String,
+        #[arg(long)]
+        secret: String,
+        #[arg(long)]
+        machine: String,
+    },
+}
+
+#[derive(clap::Args)]
+struct ClientArgs {
+    #[command(subcommand)]
+    command: ClientCommands,
+}
+
+#[derive(Subcommand)]
+enum ClientCommands {
+    /// List bound clients (alias of `token list`, filtered to `bound`).
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Detach (revoke) a bound client (alias of `token delete`).
+    #[command(alias = "rm", alias = "remove")]
+    Detach { id: String },
 }
 
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Commands::Token(args) => run_token(args.command),
+        Commands::Client(args) => run_client(args.command),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -99,50 +188,46 @@ fn run_token(command: TokenCommands) -> Result<(), TokenError> {
             }
             Err(e) => Err(e),
         },
-    }
-}
-
-fn print_table(views: &[holler_server::token::TokenView]) {
-    const HEADERS: [&str; 6] = [
-        "TOKEN_ID",
-        "STATE",
-        "MACHINE",
-        "LABEL",
-        "LAST_SEEN",
-        "EXPIRES",
-    ];
-    let rows: Vec<[&str; 6]> = views
-        .iter()
-        .map(|v| {
-            [
-                v.token_id.as_str(),
-                v.state.as_str(),
-                v.machine.as_str(),
-                v.label.as_str(),
-                v.last_seen.as_str(),
-                v.expires.as_str(),
-            ]
-        })
-        .collect();
-
-    let mut widths = HEADERS.map(str::len);
-    for row in &rows {
-        for (i, cell) in row.iter().enumerate() {
-            widths[i] = widths[i].max(cell.len());
+        TokenCommands::Redeem {
+            id,
+            secret,
+            machine,
+        } => {
+            let redeemed = store.redeem(&id, &secret, machine)?;
+            print_redeem_result(&redeemed);
+            Ok(())
         }
     }
+}
 
-    let print_row = |cells: &[&str; 6]| {
-        let line: Vec<String> = cells
-            .iter()
-            .enumerate()
-            .map(|(i, c)| format!("{c:<width$}", width = widths[i]))
-            .collect();
-        println!("{}", line.join("  ").trim_end());
-    };
+fn print_redeem_result(redeemed: &RedeemResult) {
+    println!("token_id:   {}", redeemed.token_id);
+    println!("client_id:  {}", redeemed.client_id);
+    println!("credential: {}", redeemed.credential);
+    println!("\nThis credential is shown once and is not stored. Save it now.");
+}
 
-    print_row(&HEADERS);
-    for row in &rows {
-        print_row(row);
+fn run_client(command: ClientCommands) -> Result<(), TokenError> {
+    let store = TokenStore::open()?;
+    match command {
+        ClientCommands::List { json } => {
+            let views: Vec<_> = store
+                .list()?
+                .into_iter()
+                .filter(|v| v.state == "bound")
+                .collect();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&views)?);
+            } else {
+                print_table(&views);
+            }
+            Ok(())
+        }
+        ClientCommands::Detach { id } => {
+            let new_state = store.delete(&id)?;
+            println!("client {id} is now {new_state}");
+            Ok(())
+        }
     }
 }
+

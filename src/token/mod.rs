@@ -53,6 +53,18 @@ pub enum TokenError {
     Unbound(String),
     /// `ping` on a bound token with no live connection to it.
     Disconnected(String),
+    /// `redeem` presented a secret that does not match the stored hash.
+    /// Fails closed: no state mutation happens on this path.
+    WrongSecret(String),
+    /// `redeem` on a token that was already redeemed once (secrets are
+    /// single-use; same `token_id`, but a second `join` needs a new mint).
+    AlreadyBound(String),
+    /// `redeem` on a token that was invalidated (deleted while unused).
+    Invalidated(String),
+    /// `redeem` on a token that was revoked (deleted while bound).
+    Revoked(String),
+    /// `redeem` on a token whose unused secret's TTL has elapsed.
+    Stale(String),
     Io(io::Error),
     Serde(serde_json::Error),
     /// The OS CSPRNG failed to produce randomness.
@@ -77,6 +89,17 @@ impl fmt::Display for TokenError {
                 write!(f, "token {id} has not been redeemed; nothing to ping")
             }
             TokenError::Disconnected(id) => write!(f, "token {id} is bound but not connected"),
+            TokenError::WrongSecret(id) => write!(f, "wrong secret for token {id}"),
+            TokenError::AlreadyBound(id) => {
+                write!(f, "token {id} was already redeemed and is bound to a client")
+            }
+            TokenError::Invalidated(id) => {
+                write!(f, "token {id} was invalidated and cannot be redeemed")
+            }
+            TokenError::Revoked(id) => write!(f, "token {id} was revoked and cannot be redeemed"),
+            TokenError::Stale(id) => {
+                write!(f, "token {id}'s secret has expired and cannot be redeemed")
+            }
             TokenError::Io(e) => write!(f, "token store I/O error: {e}"),
             TokenError::Serde(e) => write!(f, "token store is corrupt: {e}"),
             TokenError::Rng(e) => write!(f, "failed to generate randomness: {e}"),
@@ -165,9 +188,18 @@ pub struct TokenRecord {
     secret_hash: String,
     state: StoredState,
     pub label: Option<String>,
-    /// OS hostname of the redeeming client. Filled at redeem (#30);
-    /// `None` until then.
+    /// OS hostname of the redeeming client. Filled at redeem; `None`
+    /// until then.
     pub machine: Option<String>,
+    /// Identifier for the redeeming client, distinct from `token_id`
+    /// (the join token survives a `client_id` reissue if we ever add
+    /// one; today it's minted once, at redeem). `None` until bound.
+    pub client_id: Option<String>,
+    /// HMAC-SHA-256(pepper, credential) — same discipline as
+    /// `secret_hash`, never the plaintext. Cleared on revoke so a
+    /// revoked record can never validate a credential again even by
+    /// accident. `None` until bound.
+    credential_hash: Option<String>,
     pub created_at: String,
     /// RFC 3339 expiry of the *unused secret*. Irrelevant once bound.
     pub expires: String,
@@ -198,6 +230,10 @@ pub struct TokenView {
     pub token_id: String,
     pub state: String,
     pub machine: String,
+    /// Shown once bound — `holler client list` needs something that
+    /// identifies *the client*, not just the token that provisioned it.
+    /// `"-"` until bound.
+    pub client_id: String,
     pub label: String,
     pub last_seen: String,
     pub expires: String,
@@ -209,6 +245,7 @@ impl TokenView {
             token_id: record.token_id.clone(),
             state: record.display_state(now).to_string(),
             machine: record.machine.clone().unwrap_or_else(|| "-".to_string()),
+            client_id: record.client_id.clone().unwrap_or_else(|| "-".to_string()),
             label: record.label.clone().unwrap_or_else(|| "-".to_string()),
             last_seen: record.last_seen.clone().unwrap_or_else(|| "-".to_string()),
             expires: record.expires.clone(),
@@ -223,6 +260,21 @@ pub struct MintResult {
     pub token_id: String,
     pub secret: String,
     pub expires: String,
+}
+
+/// Result of a successful redeem: the client credential is returned
+/// here and nowhere else — the store never holds it, only its hash
+/// (mirrors [`MintResult`]'s one-time-shown-secret shape).
+#[derive(Debug)]
+pub struct RedeemResult {
+    /// Unchanged — the same `token_id` the join token was minted with.
+    pub token_id: String,
+    /// New identifier for the redeeming client (prefixed `cli_`).
+    pub client_id: String,
+    /// The long-lived client credential (prefixed `hlr_live_`, per ADR
+    /// 0010's naming for join secret vs. client credential). Shown
+    /// once; refreshing it is a later story's concern, not this one's.
+    pub credential: String,
 }
 
 /// The outcome of a successful `ping` against a bound token.
@@ -338,6 +390,8 @@ impl TokenStore {
             state: StoredState::Unused,
             label,
             machine: None,
+            client_id: None,
+            credential_hash: None,
             created_at,
             expires: expires.clone(),
             last_seen: None,
@@ -366,7 +420,11 @@ impl TokenStore {
 
     /// Transition a record's state: unused/stale -> invalidated,
     /// bound -> revoked. The actual socket-drop for a bound token
-    /// lands with #30; this only corrects the stored state.
+    /// lands with #31 (needs a live listener); this corrects the
+    /// stored state and, for a revoke, clears `credential_hash` so the
+    /// revoked record can never validate a credential again even by
+    /// accident (the credential itself was never stored, only its
+    /// hash, but a cleared hash removes even that comparison target).
     pub fn delete(&self, token_id: &str) -> Result<DisplayState, TokenError> {
         let mut records = self.load()?;
         let record = records
@@ -375,7 +433,10 @@ impl TokenStore {
             .ok_or_else(|| TokenError::NotFound(token_id.to_string()))?;
 
         record.state = match record.state {
-            StoredState::Bound => StoredState::Revoked,
+            StoredState::Bound => {
+                record.credential_hash = None;
+                StoredState::Revoked
+            }
             StoredState::Unused | StoredState::Invalidated | StoredState::Revoked => {
                 StoredState::Invalidated
             }
@@ -383,6 +444,74 @@ impl TokenStore {
         let new_state = record.display_state(OffsetDateTime::now_utc());
         self.save(&records)?;
         Ok(new_state)
+    }
+
+    /// Redeem a join token: verify the presented secret, consume it
+    /// (single-use), and bind the record to a newly minted client
+    /// identity + credential. Same `token_id`; `state` becomes `Bound`.
+    ///
+    /// Fails closed the same way `mint` does if the pepper is unset,
+    /// and fails closed on a wrong secret or on any state other than
+    /// `Unused` — no partial mutation happens on any error path.
+    pub fn redeem(
+        &self,
+        token_id: &str,
+        secret: &str,
+        machine: String,
+    ) -> Result<RedeemResult, TokenError> {
+        let pepper = std::env::var(PEPPER_ENV).map_err(|_| TokenError::PepperMissing)?;
+        if pepper.is_empty() {
+            return Err(TokenError::PepperMissing);
+        }
+        self.redeem_with_pepper(pepper.as_bytes(), token_id, secret, machine)
+    }
+
+    /// The pepper-taking core of [`TokenStore::redeem`] (see
+    /// [`TokenStore::mint_with_pepper`] for why this split exists).
+    fn redeem_with_pepper(
+        &self,
+        pepper: &[u8],
+        token_id: &str,
+        secret: &str,
+        machine: String,
+    ) -> Result<RedeemResult, TokenError> {
+        let mut records = self.load()?;
+        let now = OffsetDateTime::now_utc();
+        let record = records
+            .iter_mut()
+            .find(|r| r.token_id == token_id)
+            .ok_or_else(|| TokenError::NotFound(token_id.to_string()))?;
+
+        match record.display_state(now) {
+            DisplayState::Unused => {}
+            DisplayState::Bound => return Err(TokenError::AlreadyBound(token_id.to_string())),
+            DisplayState::Invalidated => {
+                return Err(TokenError::Invalidated(token_id.to_string()))
+            }
+            DisplayState::Revoked => return Err(TokenError::Revoked(token_id.to_string())),
+            DisplayState::Stale => return Err(TokenError::Stale(token_id.to_string())),
+        }
+
+        if !verify_secret(pepper, secret, &record.secret_hash) {
+            return Err(TokenError::WrongSecret(token_id.to_string()));
+        }
+
+        let client_id = format!("cli_{}", random_hex(16)?);
+        let credential = format!("hlr_live_{}", random_hex(32)?);
+        let credential_hash = hash_secret(pepper, &credential);
+
+        record.state = StoredState::Bound;
+        record.machine = Some(machine);
+        record.client_id = Some(client_id.clone());
+        record.credential_hash = Some(credential_hash);
+
+        self.save(&records)?;
+
+        Ok(RedeemResult {
+            token_id: token_id.to_string(),
+            client_id,
+            credential,
+        })
     }
 
     /// CLI contract for `holler token ping <id>`: unused/stale/deleted
@@ -434,6 +563,16 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
+fn from_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
 /// HMAC-SHA-256(pepper, secret), hex-encoded (ADR 0010). Persisted in
 /// place of the plaintext secret, which is never stored anywhere.
 fn hash_secret(pepper: &[u8], secret: &str) -> String {
@@ -441,6 +580,20 @@ fn hash_secret(pepper: &[u8], secret: &str) -> String {
         HmacSha256::new_from_slice(pepper).expect("HMAC-SHA-256 accepts a key of any length");
     mac.update(secret.as_bytes());
     to_hex(&mac.finalize().into_bytes())
+}
+
+/// Verify `secret` against a stored HMAC hex digest in **constant
+/// time** (ADR 0010: "compare HMAC in constant time") via
+/// [`Mac::verify_slice`] rather than comparing hex strings.
+fn verify_secret(pepper: &[u8], secret: &str, expected_hash_hex: &str) -> bool {
+    let expected = match from_hex(expected_hash_hex) {
+        Some(bytes) => bytes,
+        None => return false,
+    };
+    let mut mac =
+        HmacSha256::new_from_slice(pepper).expect("HMAC-SHA-256 accepts a key of any length");
+    mac.update(secret.as_bytes());
+    mac.verify_slice(&expected).is_ok()
 }
 
 /// Parse a `--ttl` value: `<n><s|m|h|d>`, e.g. `30m`, `24h`, `7d`.
@@ -683,6 +836,198 @@ mod tests {
                 assert_eq!(rtt_ms, 12);
             }
         }
+    }
+
+    #[test]
+    fn redeem_transitions_unused_to_bound_and_issues_client_id_and_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let minted = store
+            .mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL)
+            .unwrap();
+
+        let result = store
+            .redeem_with_pepper(
+                TEST_PEPPER,
+                &minted.token_id,
+                &minted.secret,
+                "kiwi.local".to_string(),
+            )
+            .unwrap();
+
+        assert_eq!(result.token_id, minted.token_id);
+        assert!(result.client_id.starts_with("cli_"));
+        assert!(result.credential.starts_with("hlr_live_"));
+
+        // Only the hash lives on disk — the plaintext credential never
+        // appears in the store file (same discipline as the join secret).
+        let raw = fs::read_to_string(dir.path().join(STATE_FILE)).unwrap();
+        assert!(!raw.contains(&result.credential));
+
+        let records = store.load().unwrap();
+        assert_eq!(records[0].state, StoredState::Bound);
+        assert_eq!(records[0].machine.as_deref(), Some("kiwi.local"));
+        assert_eq!(records[0].client_id.as_deref(), Some(result.client_id.as_str()));
+
+        let views = store.list().unwrap();
+        assert_eq!(views[0].state, "bound");
+        assert_eq!(views[0].machine, "kiwi.local");
+        assert_eq!(views[0].client_id, result.client_id);
+    }
+
+    #[test]
+    fn redeem_with_wrong_secret_fails_closed_without_mutating_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let minted = store
+            .mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL)
+            .unwrap();
+
+        let err = store
+            .redeem_with_pepper(
+                TEST_PEPPER,
+                &minted.token_id,
+                "hlr_not-the-real-secret",
+                "kiwi.local".to_string(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, TokenError::WrongSecret(_)));
+
+        let records = store.load().unwrap();
+        assert_eq!(records[0].state, StoredState::Unused);
+        assert_eq!(records[0].machine, None);
+        assert_eq!(records[0].client_id, None);
+    }
+
+    #[test]
+    fn redeem_unknown_token_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let err = store
+            .redeem_with_pepper(TEST_PEPPER, "tok_nope", "hlr_x", "kiwi.local".to_string())
+            .unwrap_err();
+        assert!(matches!(err, TokenError::NotFound(_)));
+    }
+
+    #[test]
+    fn redeem_already_bound_token_fails_with_already_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let minted = store
+            .mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL)
+            .unwrap();
+        store
+            .redeem_with_pepper(
+                TEST_PEPPER,
+                &minted.token_id,
+                &minted.secret,
+                "first.local".to_string(),
+            )
+            .unwrap();
+
+        let err = store
+            .redeem_with_pepper(
+                TEST_PEPPER,
+                &minted.token_id,
+                &minted.secret,
+                "second.local".to_string(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, TokenError::AlreadyBound(_)));
+
+        // The original bind is untouched by the failed second redeem.
+        let records = store.load().unwrap();
+        assert_eq!(records[0].machine.as_deref(), Some("first.local"));
+    }
+
+    #[test]
+    fn redeem_invalidated_token_fails_with_invalidated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let minted = store
+            .mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL)
+            .unwrap();
+        store.delete(&minted.token_id).unwrap();
+
+        let err = store
+            .redeem_with_pepper(
+                TEST_PEPPER,
+                &minted.token_id,
+                &minted.secret,
+                "kiwi.local".to_string(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, TokenError::Invalidated(_)));
+    }
+
+    #[test]
+    fn redeem_revoked_token_fails_with_revoked() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let minted = store
+            .mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL)
+            .unwrap();
+        store
+            .redeem_with_pepper(
+                TEST_PEPPER,
+                &minted.token_id,
+                &minted.secret,
+                "kiwi.local".to_string(),
+            )
+            .unwrap();
+        store.delete(&minted.token_id).unwrap();
+
+        let err = store
+            .redeem_with_pepper(
+                TEST_PEPPER,
+                &minted.token_id,
+                &minted.secret,
+                "kiwi.local".to_string(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, TokenError::Revoked(_)));
+    }
+
+    #[test]
+    fn redeem_stale_token_fails_with_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let minted = store
+            .mint_with_pepper(TEST_PEPPER, None, Duration::seconds(-1))
+            .unwrap();
+
+        let err = store
+            .redeem_with_pepper(
+                TEST_PEPPER,
+                &minted.token_id,
+                &minted.secret,
+                "kiwi.local".to_string(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, TokenError::Stale(_)));
+    }
+
+    #[test]
+    fn delete_on_bound_clears_the_credential_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let minted = store
+            .mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL)
+            .unwrap();
+        store
+            .redeem_with_pepper(
+                TEST_PEPPER,
+                &minted.token_id,
+                &minted.secret,
+                "kiwi.local".to_string(),
+            )
+            .unwrap();
+
+        store.delete(&minted.token_id).unwrap();
+
+        let records = store.load().unwrap();
+        assert_eq!(records[0].state, StoredState::Revoked);
+        assert_eq!(records[0].credential_hash, None);
     }
 
     #[test]
