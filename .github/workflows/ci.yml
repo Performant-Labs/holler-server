@@ -9,16 +9,15 @@ jobs:
   test:
     strategy:
       fail-fast: false
+      # Windows is deliberately OFF the matrix (not soft-failed) as of
+      # 2026-09-06 -- a real ~2s connect-refused latency on GitHub's
+      # Windows runner butts up against the dial_closed_port_fails_fast
+      # canary's <2s budget, and this is being tracked as its own piece
+      # of work rather than left as permanent CI noise. Add
+      # `windows-latest` back to this list once that's addressed.
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    # Linux is required; Windows is allowed to be red for now (tracked
-    # separately — a real ~2s connect-refused latency on GitHub's Windows
-    # runner is butting up against the canary's documented <2s budget,
-    # not a logic bug). macOS is not soft-failed: its own race was a real
-    # bug and is now fixed (see the canary's dial_closed_port_fails_fast
-    # history). Revisit removing this once Windows timing is addressed.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -35,8 +34,7 @@ jobs:
 
       # Issue #40: the wire harness scaffold (the #31 e2e slots into this).
       # Mirrors the canary step so a broken #40 harness fails CI on its own,
-      # rather than only surfacing in the full suite. Runs on the full
-      # Linux/macOS/Windows matrix below.
+      # rather than only surfacing in the full suite.
       - name: Wire harness scaffold (issue #40)
         run: cargo test --test first_talk
         shell: pwsh
