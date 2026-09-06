@@ -25,9 +25,8 @@ body:
     attributes:
       label: holler-server version / commit
       description: >
-        `holler --version` isn't wired up yet (see issue #95), so give the git commit
-        or branch you built from, or the `version` field from Cargo.toml.
-      placeholder: git commit abc1234 on main, or Cargo.toml version 0.1.0
+        Output of `holler-server --version`, or the git commit/branch you built from.
+      placeholder: "holler-server 0.1.0, or git commit abc1234 on main"
     validations:
       required: true
 
@@ -55,8 +54,8 @@ body:
         Concrete, runnable steps — not "it doesn't work sometimes." Include the exact
         commands you ran.
       placeholder: |
-        1. holler serve --listen 127.0.0.1:41807
-        2. holler token mint --label test
+        1. holler-server serve --listen 127.0.0.1:41807
+        2. holler-server token mint --label test
         3. ...
     validations:
       required: true

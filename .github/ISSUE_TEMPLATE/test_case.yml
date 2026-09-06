@@ -64,8 +64,8 @@ body:
       label: Steps
       description: Concrete steps to exercise this test case (manual) or what the automated test does.
       placeholder: |
-        1. holler serve --listen 127.0.0.1:41807
-        2. holler token mint --label test
+        1. holler-server serve --listen 127.0.0.1:41807
+        2. holler-server token mint --label test
         3. ...
     validations:
       required: true

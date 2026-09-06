@@ -1,9 +1,9 @@
 //! Query dispatch (issue #37): answer `query status` / `caps` /
 //! `support` / `protocol` the same way whether asked
 //!
-//! - locally, with no live server at all (`holler status` when nothing
+//! - locally, with no live server at all (`holler-server status` when nothing
 //!   is running — zero clients, no confirmed harnesses),
-//! - locally, via the control channel, against a live `holler serve`
+//! - locally, via the control channel, against a live `holler-server serve`
 //!   process's real registry state, or
 //! - over the wire, by a live peer asking this server the same
 //!   questions it can ask a peer (`docs/protocol/v1.md` §7: "The server

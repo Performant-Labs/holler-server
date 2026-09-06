@@ -30,7 +30,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const SERVER_FEATURES: &[&str] = &["query", "ping", "token", "presence", "roster", "interrupt"];
 
 /// The full v1 protocol-feature vocabulary (spec §9) — every id `holler
-/// caps`/`holler support` knows to report on, independent of what this
+/// caps`/`holler-server support` knows to report on, independent of what this
 /// process actually implements (see [`SERVER_FEATURES`], always a
 /// subset of this list).
 pub const PROTOCOL_FEATURES: &[&str] =
@@ -95,7 +95,7 @@ pub fn server_hello(hostname: &str) -> Envelope {
 }
 
 /// A `ping` envelope the registry sends to a live connection to drive an
-/// RTT round trip for `holler token ping`.
+/// RTT round trip for `holler-server token ping`.
 pub fn new_ping_envelope(id: &str, server_hostname: &str) -> Envelope {
     Envelope {
         v: 1,
@@ -110,7 +110,7 @@ pub fn new_ping_envelope(id: &str, server_hostname: &str) -> Envelope {
 }
 
 /// A `query` envelope the server sends to a live connection to ask it
-/// something (issue #37: `holler status <id>` / `support <id> ...` /
+/// something (issue #37: `holler-server status <id>` / `support <id> ...` /
 /// `caps <id>` / `query <id> ...`) — the outbound counterpart of
 /// [`new_ping_envelope`], generalized to carry any `cmd`/`args`. The
 /// answer shapes (`status`/`caps`/`support`/`protocol` bodies) live in
@@ -128,7 +128,7 @@ pub fn new_query_envelope(id: &str, cmd: String, args: Vec<String>) -> Envelope 
 }
 
 /// A `prompt` envelope the registry sends to a live connection to route
-/// `holler say <session> <text>` (issue #33) by session name — the
+/// `holler-server say <session> <text>` (issue #33) by session name — the
 /// outbound counterpart of [`new_query_envelope`], addressed by whichever
 /// live connection the roster says currently hosts `session` (ADR 0007).
 pub fn new_prompt_envelope(id: &str, session: String, text: String, meta: Option<Value>) -> Envelope {
@@ -143,7 +143,7 @@ pub fn new_prompt_envelope(id: &str, session: String, text: String, meta: Option
 }
 
 /// An `interrupt` envelope the registry sends to a live connection to
-/// route `holler interrupt <session>` (issue #34, ADR 0005) by session
+/// route `holler-server interrupt <session>` (issue #34, ADR 0005) by session
 /// name — a **control** frame, not a `prompt`: it never touches
 /// [`super::registry::Registry`]'s `pending_prompts` map, so it reaches
 /// the connection immediately even while a `prompt` round trip for the

@@ -1,6 +1,6 @@
 //! Connection/message hygiene integration tests (issue #57,
 //! `docs/research-security-hijack-dos.md` §4 "do now" cluster): the real
-//! `holler serve` listener, driven by real `tokio-tungstenite` clients,
+//! `holler-server serve` listener, driven by real `tokio-tungstenite` clients,
 //! exercising the frame-size cap, the pre-auth read timeout, and the
 //! concurrent-unauthenticated-connection cap. `HOLLER_MAX_FRAME_BYTES` /
 //! `HOLLER_PRE_AUTH_TIMEOUT_MS` / `HOLLER_MAX_UNAUTH_CONNECTIONS` let each
@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
 
 fn holler() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_holler"))
+    Command::new(env!("CARGO_BIN_EXE_holler-server"))
 }
 
 struct Env {
@@ -43,7 +43,7 @@ impl Env {
     }
 }
 
-/// A running `holler serve` child on an OS-assigned loopback port, with
+/// A running `holler-server serve` child on an OS-assigned loopback port, with
 /// hygiene limits overridden via env, killed on drop so a failing
 /// assertion never leaks the process.
 struct ServerProcess {
@@ -60,7 +60,7 @@ impl ServerProcess {
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
-        let mut child = cmd.spawn().expect("spawn `holler serve`");
+        let mut child = cmd.spawn().expect("spawn `holler-server serve`");
         let stdout = child.stdout.take().expect("stdout was piped");
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -72,7 +72,7 @@ impl ServerProcess {
         });
         let line = rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("`holler serve` printed its listening line within 5s");
+            .expect("`holler-server serve` printed its listening line within 5s");
         let port = line
             .rsplit(':')
             .next()

@@ -1,7 +1,7 @@
 //! End-to-end integration test for issue #32 ("roster + presence
-//! TTL"): a real `holler serve` listener, driven by a real
+//! TTL"): a real `holler-server serve` listener, driven by a real
 //! `tokio-tungstenite` WebSocket client sending `presence` frames, and
-//! `holler roster` (run as a separate CLI process) reaching the live
+//! `holler-server roster` (run as a separate CLI process) reaching the live
 //! server's in-memory roster over the local control channel.
 //!
 //! Deliberately its own file with its own copies of the `Env` /
@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
 
 fn holler() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_holler"))
+    Command::new(env!("CARGO_BIN_EXE_holler-server"))
 }
 
 /// A fresh, isolated state dir + pepper + short roster TTLs per test.
@@ -43,7 +43,7 @@ impl Env {
             // 180s production window: 500ms to `reconnecting`, 3s
             // total (from last presence) to `gone`. Generous enough
             // above CLI subprocess-spawn overhead and CI scheduler
-            // jitter (`holler roster` runs as its own process per
+            // jitter (`holler-server roster` runs as its own process per
             // check) that polling this roster doesn't race the
             // transition it's trying to observe — the in-process unit
             // tests in `src/wire/roster.rs` hit exactly this kind of
@@ -87,7 +87,7 @@ impl ServerProcess {
         cmd.args(["serve", "--listen", "127.0.0.1:0"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd.spawn().expect("spawn `holler serve`");
+        let mut child = cmd.spawn().expect("spawn `holler-server serve`");
         let stdout = child.stdout.take().expect("stdout was piped");
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -100,7 +100,7 @@ impl ServerProcess {
         });
         let line = rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("`holler serve` printed its listening line within 5s");
+            .expect("`holler-server serve` printed its listening line within 5s");
         let port = line
             .rsplit(':')
             .next()
@@ -162,7 +162,7 @@ fn redeem(env: &Env, token_id: &str, secret: &str, machine: &str) -> (String, St
     (client_id, credential)
 }
 
-/// `holler token delete <token_id>` (issue #78): revokes on disk, then
+/// `holler-server token delete <token_id>` (issue #78): revokes on disk, then
 /// (if a live server is reachable, which it is here) force-closes the
 /// live connection over the control channel.
 fn revoke(env: &Env, token_id: &str) {
@@ -225,7 +225,7 @@ fn find_row<'a>(rows: &'a Value, name: &str) -> Option<&'a Value> {
         .find(|r| r["name"] == name)
 }
 
-/// Polls `holler roster --json` until `pred` matches the named row (or
+/// Polls `holler-server roster --json` until `pred` matches the named row (or
 /// the row is absent and `pred` accepts `None`), or the budget expires.
 fn wait_for_roster_row(env: &Env, name: &str, pred: impl Fn(Option<&Value>) -> bool) -> Value {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -369,9 +369,9 @@ fn holler_roster_shows_gone_after_ttl_elapses() {
     });
 }
 
-/// Issue #81: `holler status --json`'s `sessions` field used to be
+/// Issue #81: `holler-server status --json`'s `sessions` field used to be
 /// hardcoded to `0` even with real sessions advertised and showing
-/// correctly in `holler roster`. Two sibling sessions on one connection
+/// correctly in `holler-server roster`. Two sibling sessions on one connection
 /// (mirroring the issue's own `alpha`/`beta` repro) must show up in
 /// `status`'s live count.
 #[test]
@@ -534,7 +534,7 @@ fn holler_roster_shows_gone_immediately_after_explicit_close() {
     });
 }
 
-/// Issue #80/#78: a server-initiated revoke (`holler token delete` /
+/// Issue #80/#78: a server-initiated revoke (`holler-server token delete` /
 /// `client detach`) force-closes the live connection with the same
 /// certainty as an explicit client close — the roster must reflect
 /// `gone` immediately here too, not via the TTL.
@@ -565,7 +565,7 @@ fn holler_roster_shows_gone_immediately_after_revoke() {
         assert_eq!(row["state"], "connected");
 
         // Revoke while the connection is still open, from a separate
-        // `holler token delete` process — mirrors the real CLI flow.
+        // `holler-server token delete` process — mirrors the real CLI flow.
         revoke(&env, &token_id);
 
         wait_for_roster_state_soon(&env, "revoked", "gone");

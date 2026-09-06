@@ -19,7 +19,7 @@ export HOLLER_SERVER_PEPPER
 HOLLER_SERVER_PEPPER="$(cat "$HOLLER_STATE_DIR/.pepper")"
 
 echo "--- roster ---"
-./target/release/holler roster
+./target/release/holler-server roster
 echo
 echo "--- status ---"
-./target/release/holler status
+./target/release/holler-server status

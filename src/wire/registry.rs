@@ -1,5 +1,5 @@
 //! Live-connection registry (issue #31): tracks which bound `token_id`s
-//! currently have an open WebSocket, so `holler token ping` can report a
+//! currently have an open WebSocket, so `holler-server token ping` can report a
 //! real hostname + RTT instead of always [`ConnectionStatus::Disconnected`].
 //!
 //! One [`Registry`] is shared (via `Arc`) by every connection task in a
@@ -9,7 +9,7 @@
 //! channel and resolves once the matching `pong` arrives (or times out).
 //!
 //! [`Registry::query`] (issue #37) generalizes that same request/response
-//! pattern to an arbitrary outbound `query`/`args`, for `holler status
+//! pattern to an arbitrary outbound `query`/`args`, for `holler-server status
 //! <id>` / `support <id> <feature>` / `caps <id>` / `query <id> <cmd>
 //! [args...]` — sending a `query` to one already-connected client and
 //! relaying back whatever `query_ok` (or `error`, or nothing within
@@ -30,7 +30,7 @@ use super::query::HarnessConfirmation;
 
 /// How long [`Registry::ping`] waits for the matching `pong` before
 /// reporting the connection disconnected. Generous for a loopback round
-/// trip, short enough that `holler token ping` does not hang.
+/// trip, short enough that `holler-server token ping` does not hang.
 pub const PING_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long [`Registry::query`] waits for the matching `query_ok`/`error`
@@ -61,7 +61,7 @@ pub const PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
 /// ::reconnect_after`) — issue #54 requires these stay two separate
 /// clocks, never conflated into one error. Must also stay comfortably
 /// under `super::control::CLIENT_TIMEOUT` (5s), which bounds the whole
-/// control-channel round trip a `holler interrupt` CLI process waits on,
+/// control-channel round trip a `holler-server interrupt` CLI process waits on,
 /// or the CLI would report "no live server" before this timeout ever gets
 /// to fire. The exact number is a judgment call (message-integrity memo:
 /// "pick a clip 2–3x normal RTT and revisit after real usage") — 3s here,
@@ -93,7 +93,7 @@ enum PendingQueryReply {
 /// "no such connection", "the outbound channel is closed", and "no
 /// `reply` arrived within [`PROMPT_TIMEOUT`]" uniformly, same as
 /// [`QueryOutcome::Disconnected`] — or `Cancelled` (issue #82): a
-/// **different** CLI invocation's `holler interrupt` for this exact
+/// **different** CLI invocation's `holler-server interrupt` for this exact
 /// session landed (and was acked) while this prompt was still waiting.
 /// Kept apart from `Disconnected` on purpose — the connection (and the
 /// server) are both still very much alive; only this one turn was cut
@@ -257,7 +257,7 @@ impl Registry {
     }
 
     /// Remove a connection — socket closed/errored, or a live force-close
-    /// requested over the control channel (`holler token delete` / `client
+    /// requested over the control channel (`holler-server token delete` / `client
     /// detach`, issue #78). Returns whether an entry was actually present.
     /// Dropping the removed [`Entry`] here drops its `out_tx`, which is
     /// what actually closes a still-live socket: `handle_connection`'s
@@ -294,7 +294,7 @@ impl Registry {
     /// Drive a real `ping` round trip against `token_id`'s live
     /// connection. `Disconnected` covers every failure mode uniformly
     /// (no such connection, the outbound channel is closed, or no
-    /// `pong` arrived within [`PING_TIMEOUT`]) — `holler token ping`
+    /// `pong` arrived within [`PING_TIMEOUT`]) — `holler-server token ping`
     /// does not need to distinguish them.
     pub async fn ping(
         &self,
@@ -365,7 +365,7 @@ impl Registry {
     }
 
     /// Snapshot of `(token_id, hostname, client_id)` for every live
-    /// connection, for `holler status`'s client listing.
+    /// connection, for `holler-server status`'s client listing.
     pub fn snapshot(&self) -> Vec<(String, String, String)> {
         let entries = self.entries.lock().expect("registry mutex poisoned");
         entries
@@ -374,7 +374,7 @@ impl Registry {
             .collect()
     }
 
-    /// Resolve a `holler status/support/caps/query <id>` target to the
+    /// Resolve a `holler-server status/support/caps/query <id>` target to the
     /// live `token_id` it names (spec §8: "token id, client id,
     /// hostname, or session → hosting client" — sessions are not wired
     /// up by any story yet, so only the first three are checked here).
@@ -537,7 +537,7 @@ impl Registry {
     /// Called from a connection task when an `error` arrives: resolves
     /// the matching pending outbound `query` (if any) — this is how a
     /// remote client's own `unknown_cmd` (or any other fail-closed
-    /// answer) reaches `holler support/status/caps/query <id>`.
+    /// answer) reaches `holler-server support/status/caps/query <id>`.
     pub fn resolve_query_err(&self, token_id: &str, reply_to: &str, body: ErrorBody) {
         let entries = self.entries.lock().expect("registry mutex poisoned");
         if let Some(entry) = entries.get(token_id) {
@@ -552,7 +552,7 @@ impl Registry {
     }
 
     /// Drive a `prompt` -> `reply`* round trip against `token_id`'s live
-    /// connection (issue #33: routing `holler say <session>` by session
+    /// connection (issue #33: routing `holler-server say <session>` by session
     /// name via the roster). Unlike [`Registry::query`], the target may
     /// answer with several `done: false` replies before the one that
     /// finishes the exchange (spec §10) — this collects `text`/`chunks`
@@ -691,7 +691,7 @@ impl Registry {
     /// to the matching pending outbound `prompt` (if any) — this is how a
     /// remote client's own `unknown_session` (a stale `presence` row: the
     /// roster thought it hosted this session, the client disagrees)
-    /// reaches `holler say`. A no-op if `reply_to` matches no outstanding
+    /// reaches `holler-server say`. A no-op if `reply_to` matches no outstanding
     /// prompt, the same way [`Registry::resolve_query_err`] is a no-op
     /// for an unmatched `query`.
     pub fn resolve_prompt_err(&self, token_id: &str, reply_to: &str, body: ErrorBody) {
@@ -767,7 +767,7 @@ impl Registry {
                     .field("outcome", "acked")
                     .emit();
                 // The client just confirmed this session's turn is
-                // cancelled (issue #82): wake any `holler say` still
+                // cancelled (issue #82): wake any `holler-server say` still
                 // waiting on this same session's `prompt` right now,
                 // rather than leaving it to idle out to `PROMPT_TIMEOUT`
                 // or a real disconnect that never actually happens.

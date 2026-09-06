@@ -1,5 +1,5 @@
-//! Persists what `holler serve` was told about its own reachable
-//! address, so a separate `holler token mint` invocation can read it
+//! Persists what `holler-server serve` was told about its own reachable
+//! address, so a separate `holler-server token mint` invocation can read it
 //! back and print a ready-to-run `holler join` command (issue #66).
 //!
 //! `mint` and `serve` are separate process invocations with no shared

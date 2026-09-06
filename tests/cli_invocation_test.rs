@@ -1,5 +1,5 @@
 //! Invocation-group test cases (hlrsvr-1000 / hlrsvr-1001 / hlrsvr-1002,
-//! holler-server#98). Exercises the built `holler` binary as a real
+//! holler-server#98). Exercises the built `holler-server` binary as a real
 //! subprocess — clap's own generated behavior, not this crate's code
 //! directly, so a real process invocation is the only thing that
 //! actually proves it.
@@ -7,13 +7,13 @@
 use std::process::Command;
 
 fn holler() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_holler"))
+    Command::new(env!("CARGO_BIN_EXE_holler-server"))
 }
 
 /// hlrsvr-1000: `--version` and `-V` report the crate's real version.
 #[test]
 fn version_flag_prints_crate_version() {
-    let expected = format!("holler {}\n", env!("CARGO_PKG_VERSION"));
+    let expected = format!("holler-server {}\n", env!("CARGO_PKG_VERSION"));
 
     for flag in ["--version", "-V"] {
         let out = holler().arg(flag).output().expect("failed to run holler");
@@ -21,7 +21,7 @@ fn version_flag_prints_crate_version() {
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
             expected,
-            "`{flag}` stdout should be exactly `holler <version>`"
+            "`{flag}` stdout should be exactly `holler-server <version>`"
         );
     }
 }
@@ -66,7 +66,7 @@ fn bare_and_unknown_subcommand_fail_closed() {
         "bare invocation must not print to stdout"
     );
     assert!(
-        String::from_utf8_lossy(&bare.stderr).contains("Usage: holler"),
+        String::from_utf8_lossy(&bare.stderr).contains("Usage: holler-server"),
         "bare invocation's stderr should show usage"
     );
 

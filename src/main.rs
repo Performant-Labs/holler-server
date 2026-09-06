@@ -21,7 +21,7 @@ use holler_server::token::{parse_ttl, PingOutcome, RedeemResult, TokenError, Tok
 use holler_server::wire;
 use holler_server::wire::control::RosterRowDoc;
 
-/// `holler token list` / `holler client list` share this table shape;
+/// `holler-server token list` / `holler-server client list` share this table shape;
 /// `client list` just pre-filters to bound records.
 fn print_table(views: &[holler_server::token::TokenView]) {
     const HEADERS: [&str; 7] = [
@@ -71,7 +71,7 @@ fn print_table(views: &[holler_server::token::TokenView]) {
 }
 
 #[derive(Parser)]
-#[command(name = "holler", version, about = "Your agents are just a holler away")]
+#[command(name = "holler-server", version, about = "Your agents are just a holler away")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -103,7 +103,7 @@ enum Commands {
     Serve(ServeArgs),
     /// This process's own status document (`role: server`), or (with an
     /// `id`) a live client's status, relayed over the wire (issue #37).
-    /// Reaches a live `holler serve` process over the local control
+    /// Reaches a live `holler-server serve` process over the local control
     /// channel if one is running on this host; otherwise reports a
     /// local-only, not-connected document.
     Status {
@@ -113,7 +113,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// `holler support [<id>] <feature>`: do you (or a connected
+    /// `holler-server support [<id>] <feature>`: do you (or a connected
     /// client) support this protocol feature or harness, right now.
     Support {
         /// `<feature>` (local) or `<id> <feature>` (relayed to that
@@ -124,14 +124,14 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// `holler caps [<id>]`: full capability document (status + a map
+    /// `holler-server caps [<id>]`: full capability document (status + a map
     /// of every known feature/harness → `{ok, kind, reason?}`).
     Caps {
         id: Option<String>,
         #[arg(long)]
         json: bool,
     },
-    /// `holler query [<id>] <cmd> [args...]`: the general query form —
+    /// `holler-server query [<id>] <cmd> [args...]`: the general query form —
     /// `status` / `caps` / `support [feature]` / `protocol [version]`,
     /// local or (with a leading `<id>`) relayed to a connected client.
     Query {
@@ -142,21 +142,21 @@ enum Commands {
     },
     /// Who can be hollered at: sessions advertised by `presence`,
     /// their harness, owning client, and connected/reconnecting/gone
-    /// state (issue #32, ADR 0006). Reaches a live `holler serve`
+    /// state (issue #32, ADR 0006). Reaches a live `holler-server serve`
     /// process over the local control channel; empty (not an error) if
     /// none is running, since the roster only exists in-memory.
     Roster {
         #[arg(long)]
         json: bool,
     },
-    /// `holler say <session> <text>`: prompt a session by name (ADR
-    /// 0007), routed by the live `holler serve` process to whichever
+    /// `holler-server say <session> <text>`: prompt a session by name (ADR
+    /// 0007), routed by the live `holler-server serve` process to whichever
     /// connection currently hosts it (via the roster, issue #32), and
     /// print back its `reply` text once `done: true` arrives. Fails with
     /// `unknown_session` if the roster does not know `<session>`, or its
     /// owning connection is gone.
     Say { session: String, text: String },
-    /// `holler interrupt <session>`: cancel a session's in-flight turn
+    /// `holler-server interrupt <session>`: cancel a session's in-flight turn
     /// (ADR 0005) — a **control** frame, not a queued `prompt`: it reaches
     /// the session's connection immediately, even mid-turn, and the
     /// session stays on the roster afterward, promptable again. Routed by
@@ -182,7 +182,7 @@ struct ServeArgs {
     listen: Vec<String>,
     /// `host[:port]` naming how others should reach this server (issue
     /// #66), e.g. `myhost.example.com:41807`. Persisted so a later
-    /// `holler token mint` can print a ready-to-run `holler join`
+    /// `holler-server token mint` can print a ready-to-run `holler join`
     /// command. If omitted, falls back to `--listen` when that is
     /// already a real, non-loopback address; otherwise `mint` warns
     /// instead of guessing.
@@ -278,7 +278,7 @@ fn main() {
     }
 }
 
-/// Resolve the addresses `holler serve` binds: `--listen` (repeatable)
+/// Resolve the addresses `holler-server serve` binds: `--listen` (repeatable)
 /// wins outright over `HOLLER_LISTEN` (comma-separated, for the same
 /// two-families case as a repeated flag); neither present defaults to
 /// `127.0.0.1:41807` (ADR 0004).
@@ -373,7 +373,7 @@ fn run_caps(id: Option<String>, json: bool) -> Result<(), Box<dyn std::error::Er
 }
 
 fn run_query(args: Vec<String>, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    // `holler query <cmd> [args...]` vs `holler query <id> <cmd> [args...]`:
+    // `holler-server query <cmd> [args...]` vs `holler-server query <id> <cmd> [args...]`:
     // a leading word that is not one of the four known `cmd`s, with a
     // second word to be the `cmd`, is a target id (spec §8's
     // disambiguation for `support`, generalized). A single unrecognized
@@ -389,10 +389,10 @@ fn run_query(args: Vec<String>, json: bool) -> Result<(), Box<dyn std::error::Er
 }
 
 /// Shared path for `status`/`support`/`caps`/`query`: reach a live
-/// `holler serve` process over the control channel (issue #37); for an
+/// `holler-server serve` process over the control channel (issue #37); for an
 /// untargeted query with no live server, fall back to this binary's own
 /// compile-time view (zero clients, no confirmed harnesses — the same
-/// "not running" answer `holler status` has always given). A targeted
+/// "not running" answer `holler-server status` has always given). A targeted
 /// query has no local fallback — resolving `<id>` requires a live
 /// registry, so no live server means the target is simply unreachable.
 fn run_query_command(
@@ -418,7 +418,7 @@ fn run_query_command(
             .into());
         }
         _ if target.is_some() => {
-            return Err("no live `holler serve` process is reachable on this host".into());
+            return Err("no live `holler-server serve` process is reachable on this host".into());
         }
         _ => {
             // Untargeted, no live server: this binary's own local view.
@@ -497,7 +497,7 @@ fn run_roster(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `holler say <session> <text>` (issue #33): reach a live `holler serve`
+/// `holler-server say <session> <text>` (issue #33): reach a live `holler-server serve`
 /// process over the control channel and route a `prompt` to whichever
 /// connection the roster says hosts `<session>`. No local fallback —
 /// there is no roster to consult without a live server.
@@ -525,17 +525,17 @@ fn run_say(session: String, text: String) -> Result<(), Box<dyn std::error::Erro
         // `NotReachable` below, which is the real "no server running" case.
         wire::control::ControlOutcome::TimedOut => Err(format!(
             "say to {session:?} timed out waiting for a reply — the session \
-             may still be working; try `holler say` again or check `holler roster`"
+             may still be working; try `holler-server say` again or check `holler-server roster`"
         )
         .into()),
         wire::control::ControlOutcome::NotReachable => {
-            Err("no live `holler serve` process is reachable on this host".into())
+            Err("no live `holler-server serve` process is reachable on this host".into())
         }
     }
 }
 
-/// `holler interrupt <session>` (issue #34, ADR 0005): reach a live
-/// `holler serve` process over the control channel and send a control-
+/// `holler-server interrupt <session>` (issue #34, ADR 0005): reach a live
+/// `holler-server serve` process over the control channel and send a control-
 /// frame `interrupt` to whichever connection the roster says hosts
 /// `<session>`. No local fallback — there is no roster to consult without
 /// a live server. `TimedOut` and `Disconnected` are reported with
@@ -569,19 +569,19 @@ fn run_interrupt(session: String) -> Result<(), Box<dyn std::error::Error>> {
         // ack never arrived within `INTERRUPT_ACK_TIMEOUT`).
         wire::control::ControlOutcome::TimedOut => Err(format!(
             "interrupt to {session:?} timed out waiting for a reply from the \
-             server — the session may still be working; try `holler status` \
+             server — the session may still be working; try `holler-server status` \
              to check whether the server is still up"
         )
         .into()),
         wire::control::ControlOutcome::NotReachable => {
-            Err("no live `holler serve` process is reachable on this host".into())
+            Err("no live `holler-server serve` process is reachable on this host".into())
         }
     }
 }
 
-/// `holler token delete` / `client detach` (issue #78): after the durable
+/// `holler-server token delete` / `client detach` (issue #78): after the durable
 /// on-disk revoke (`store.delete`, already done by the time this is
-/// called) succeeds, best-effort-notify a live `holler serve` process to
+/// called) succeeds, best-effort-notify a live `holler-server serve` process to
 /// also force-close the token's live connection, so `holler
 /// status`/`roster` stop reporting it connected. No live server reachable
 /// is not a failure — the on-disk revoke is what mattered, and the CLI
@@ -725,7 +725,7 @@ fn print_join_command(state_dir: &std::path::Path, token_id: &str, secret: &str)
         AdvertiseState::LoopbackOnly | AdvertiseState::Unknown => {
             println!(
                 "\nwarning: server is bound to loopback only (or has not been started) — no \
-                 reachable address to advertise; set --advertise on `holler serve`, or \
+                 reachable address to advertise; set --advertise on `holler-server serve`, or \
                  construct the join command manually with the correct address."
             );
         }

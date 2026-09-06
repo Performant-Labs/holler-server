@@ -305,7 +305,7 @@ pub async fn handle_connection(
 
     // 3. Session loop: service inbound client frames and outbound frames
     // the registry wants pushed at this connection (server-initiated
-    // `ping`, for `holler token ping`).
+    // `ping`, for `holler-server token ping`).
     //
     // `certain_close` distinguishes the one exit path where the server
     // *knows* this connection is over — a real `Message::Close` frame or
@@ -488,7 +488,7 @@ async fn handle_frame(
             // questions the server can ask it (spec §7: "The server
             // answers as a peer") — status/caps/support/protocol,
             // dispatched by the same `query` module the control channel
-            // uses for `holler status`/`support`/`caps`/`query` (#37).
+            // uses for `holler-server status`/`support`/`caps`/`query` (#37).
             let confirmed = ctx.registry.confirmed_harnesses_snapshot();
             let reply = match query::dispatch(
                 cmd,
@@ -520,7 +520,7 @@ async fn handle_frame(
         }
         Body::QueryOk(body) => {
             // A reply to a `query` **this server sent** the client
-            // (`holler status/support/caps/query <id>`, issue #37) —
+            // (`holler-server status/support/caps/query <id>`, issue #37) —
             // resolve the matching outbound request, if any.
             ctx.registry
                 .resolve_query_ok(token_id, &envelope.id, body.as_ref().clone());
@@ -594,8 +594,8 @@ async fn handle_frame(
         }
         Body::Reply(reply_body) => {
             // A client answering a `prompt` this server sent (issue #33:
-            // `holler say <session>` routing). Persisted unconditionally
-            // (the durable talk log a later `holler wait` reads), then
+            // `holler-server say <session>` routing). Persisted unconditionally
+            // (the durable talk log a later `holler-server wait` reads), then
             // forwarded to whichever pending `Registry::prompt` call is
             // waiting on this correlation id, if any — a reply with no
             // matching pending prompt (e.g. this process restarted

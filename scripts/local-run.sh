@@ -26,4 +26,4 @@ HOLLER_SERVER_PEPPER="$(cat "$HOLLER_STATE_DIR/.pepper")"
 
 echo "holler-server: state dir = $HOLLER_STATE_DIR"
 cargo build --release
-exec ./target/release/holler serve --listen 127.0.0.1:41807 --advertise 127.0.0.1:41807
+exec ./target/release/holler-server serve --listen 127.0.0.1:41807 --advertise 127.0.0.1:41807

@@ -1,4 +1,4 @@
-//! Integration tests for issue #89: guard against two `holler serve`
+//! Integration tests for issue #89: guard against two `holler-server serve`
 //! processes sharing the same `HOLLER_STATE_DIR`.
 //!
 //! Before this fix, `serve_control_socket` unconditionally deleted and
@@ -16,7 +16,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 fn holler() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_holler"))
+    Command::new(env!("CARGO_BIN_EXE_holler-server"))
 }
 
 /// A fresh, isolated state dir + pepper per test — mirrors
@@ -41,7 +41,7 @@ impl Env {
     }
 }
 
-/// A `holler serve` child that has actually bound successfully, on an
+/// A `holler-server serve` child that has actually bound successfully, on an
 /// OS-assigned loopback port. Killed on drop so a failing assertion
 /// never leaks the process.
 struct ServerProcess {
@@ -54,7 +54,7 @@ impl ServerProcess {
         cmd.args(["serve", "--listen", "127.0.0.1:0"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd.spawn().expect("spawn `holler serve`");
+        let mut child = cmd.spawn().expect("spawn `holler-server serve`");
         let stdout = child.stdout.take().expect("stdout was piped");
 
         // Read the "listening on: ws://127.0.0.1:PORT" line off a
@@ -68,7 +68,7 @@ impl ServerProcess {
             }
         });
         rx.recv_timeout(Duration::from_secs(5))
-            .expect("`holler serve` printed its listening line within 5s");
+            .expect("`holler-server serve` printed its listening line within 5s");
 
         ServerProcess { child }
     }
@@ -91,7 +91,7 @@ impl Drop for ServerProcess {
     }
 }
 
-/// Run a second `holler serve` against `env`'s state dir to completion
+/// Run a second `holler-server serve` against `env`'s state dir to completion
 /// and return its output — used only where the process under test is
 /// expected to exit (refused startup), so there is no "listening on"
 /// line to wait for the way [`ServerProcess::spawn`] does.
@@ -99,7 +99,7 @@ fn run_serve_to_completion(env: &Env) -> Output {
     env.cmd()
         .args(["serve", "--listen", "127.0.0.1:0"])
         .output()
-        .expect("run the second `holler serve`")
+        .expect("run the second `holler-server serve`")
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn a_second_instance_against_the_same_state_dir_refuses_to_start() {
     let second = run_serve_to_completion(&env);
     assert!(
         !second.status.success(),
-        "a second `holler serve` against the same HOLLER_STATE_DIR must refuse to start: {second:?}"
+        "a second `holler-server serve` against the same HOLLER_STATE_DIR must refuse to start: {second:?}"
     );
     let stderr = String::from_utf8(second.stderr).unwrap().to_lowercase();
     assert!(

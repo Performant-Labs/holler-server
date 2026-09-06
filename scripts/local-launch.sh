@@ -24,18 +24,18 @@ fi
 export HOLLER_SERVER_PEPPER
 HOLLER_SERVER_PEPPER="$(cat "$HOLLER_STATE_DIR/.pepper")"
 
-if pgrep -f "target/release/holler serve" > /dev/null 2>&1; then
-  echo "holler-server: already running (pgrep -f 'target/release/holler serve' to find it)" >&2
+if pgrep -f "target/release/holler-server serve" > /dev/null 2>&1; then
+  echo "holler-server: already running (pgrep -f 'target/release/holler-server serve' to find it)" >&2
   exit 1
 fi
 
 cargo build --release
-nohup ./target/release/holler serve --listen 127.0.0.1:41807 --advertise 127.0.0.1:41807 \
+nohup ./target/release/holler-server serve --listen 127.0.0.1:41807 --advertise 127.0.0.1:41807 \
   > "$HOLLER_STATE_DIR/server.log" 2>&1 &
 disown
 
 sleep 1
-if ! pgrep -f "target/release/holler serve" > /dev/null 2>&1; then
+if ! pgrep -f "target/release/holler-server serve" > /dev/null 2>&1; then
   echo "holler-server: failed to start — check $HOLLER_STATE_DIR/server.log" >&2
   exit 1
 fi
@@ -45,5 +45,5 @@ echo
 echo "Next:"
 echo "  export HOLLER_STATE_DIR=$HOLLER_STATE_DIR"
 echo "  export HOLLER_SERVER_PEPPER=\"\$(cat $HOLLER_STATE_DIR/.pepper)\""
-echo "  ./target/release/holler token mint --label <name>"
-echo "  ./target/release/holler roster"
+echo "  ./target/release/holler-server token mint --label <name>"
+echo "  ./target/release/holler-server roster"

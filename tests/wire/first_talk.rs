@@ -299,7 +299,7 @@ fn harness_budget_holds() {
 // no-op skip are both forbidden by the canary's rule, so the real end-to-end
 // wiring is a documented non-test helper: obviously scaffold, not a passing
 // test. Issue #31 turns this into a real `#[test]` that mints a token, spawns
-// the real `holler-server` + `holler-client`, drives `holler status`, and
+// the real `holler-server` + `holler-client`, drives `holler-server status`, and
 // asserts on their `--json` stdout — keeping the token out of every
 // log / panic / assert message.
 // ---------------------------------------------------------------------------
@@ -312,7 +312,7 @@ fn harness_budget_holds() {
 ///      `--listen 127.0.0.1:41807` (+ optional `[::1]:41807`), first
 ///      asserting `free_port_is_available("127.0.0.1:41807")` is Ok.
 ///   3. `spawn_bin` the real `holler-client` with the minted token.
-///   4. Drive `holler status` / `holler token ping` and assert on `--json`
+///   4. Drive `holler-server status` / `holler-server token ping` and assert on `--json`
 ///      stdout.
 ///   5. `kill_tree` the whole thing; assert gone within `BUDGET`.
 ///   6. Convert this to `#[test]` and remove this scaffolding comment.

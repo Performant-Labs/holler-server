@@ -1,5 +1,5 @@
 //! End-to-end integration test for the `join`/`join_ok` wire frames
-//! (ADR 0015, `docs/protocol/v1.md` §4.1): the real `holler serve`
+//! (ADR 0015, `docs/protocol/v1.md` §4.1): the real `holler-server serve`
 //! listener, driven by a real `tokio-tungstenite` WebSocket client
 //! through `connect -> join -> join_ok -> (server closes)`, plus the
 //! fail-closed paths (wrong secret, already-bound token) and the
@@ -7,7 +7,7 @@
 //! the same socket cannot work because the socket is already closed).
 //!
 //! Mirrors `tests/wire_first_talk_test.rs`'s process-harness pattern:
-//! a real `holler serve` child on an ephemeral loopback port, `holler
+//! a real `holler-server serve` child on an ephemeral loopback port, `holler
 //! token mint` for the fixture secret, and a real WebSocket client.
 
 use std::io::{BufRead, BufReader};
@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
 
 fn holler() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_holler"))
+    Command::new(env!("CARGO_BIN_EXE_holler-server"))
 }
 
 /// A fresh, isolated state dir + pepper per test — mirrors
@@ -44,7 +44,7 @@ impl Env {
     }
 }
 
-/// A running `holler serve` child on an OS-assigned loopback port,
+/// A running `holler-server serve` child on an OS-assigned loopback port,
 /// killed on drop so a failing assertion never leaks the process.
 struct ServerProcess {
     child: Child,
@@ -57,7 +57,7 @@ impl ServerProcess {
         cmd.args(["serve", "--listen", "127.0.0.1:0"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd.spawn().expect("spawn `holler serve`");
+        let mut child = cmd.spawn().expect("spawn `holler-server serve`");
         let stdout = child.stdout.take().expect("stdout was piped");
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -69,7 +69,7 @@ impl ServerProcess {
         });
         let line = rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("`holler serve` printed its listening line within 5s");
+            .expect("`holler-server serve` printed its listening line within 5s");
         let port = line
             .rsplit(':')
             .next()
@@ -181,7 +181,7 @@ fn join_with_correct_secret_succeeds_and_server_closes_the_connection() {
         assert_socket_closes(&mut ws).await;
     });
 
-    // The token store recorded the bind: `holler token list` should now
+    // The token store recorded the bind: `holler-server token list` should now
     // show this token as `bound`, proving `redeem` actually ran (not
     // just that the wire replied with a plausible-looking body).
     let list_out = env.cmd().args(["token", "list"]).output().unwrap();

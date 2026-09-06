@@ -25,11 +25,11 @@ cargo build --release
 
 # 2. Start the server (defaults to 127.0.0.1:41807; --advertise records the
 #    address others should use so `token mint` can print a working join command)
-holler serve --listen 0.0.0.0:41807 --advertise myhost.example.com:41807
+holler-server serve --listen 0.0.0.0:41807 --advertise myhost.example.com:41807
 
 # 3. Mint a join token — prints the token_id/secret once, plus a ready-to-paste
 #    `holler join` command
-holler token mint --label laptop
+holler-server token mint --label laptop
 #   token_id: ...
 #   secret:   ...
 #   expires:  ...
@@ -47,11 +47,11 @@ holler token mint --label laptop
 holler run --config sessions.toml
 
 # 6. Back here, see who's joined and talk to a session
-holler roster
-holler say <session> "hello"
+holler-server roster
+holler-server say <session> "hello"
 ```
 
-`holler status`, `holler caps`, and `holler token list` are the other day-to-day operator commands; run any of them with `--help` for the full flag list.
+`holler-server status`, `holler-server caps`, and `holler-server token list` are the other day-to-day operator commands; run any of them with `--help` for the full flag list.
 
 ### Dev scripts
 
@@ -63,10 +63,10 @@ Wraps steps 1–2 above per the org's `object:sub-object:verb` script-naming con
 
 | Command name | Does |
 |---|---|
-| `app:local:run` | Build, then run `holler serve` in the foreground (auto-creates `$HOLLER_STATE_DIR`/pepper if missing) |
+| `app:local:run` | Build, then run `holler-server serve` in the foreground (auto-creates `$HOLLER_STATE_DIR`/pepper if missing) |
 | `app:local:launch` | Same, but backgrounded, logging to `$HOLLER_STATE_DIR/server.log`; prints the next commands to run |
-| `app:local:stop` | Stop a `holler serve` started by `app:local:launch` |
-| `app:local:status` | `holler roster` + `holler status` |
+| `app:local:stop` | Stop a `holler-server serve` started by `app:local:launch` |
+| `app:local:status` | `holler-server roster` + `holler-server status` |
 
 Each maps to a same-named `scripts/local-*.sh` file if you'd rather call the script directly.
 
