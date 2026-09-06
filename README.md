@@ -63,6 +63,7 @@ Wraps steps 1–2 above per the org's `object:sub-object:verb` script-naming con
 
 | Command name | Does |
 |---|---|
+| `build` | `cargo build --release` — bare, per the convention's reserved lifecycle verbs (never namespaced) |
 | `app:local:run` | Build, then run `holler-server serve` in the foreground (auto-creates `$HOLLER_STATE_DIR`/pepper if missing) |
 | `app:local:launch` | Same, but backgrounded, logging to `$HOLLER_STATE_DIR/server.log`; prints the next commands to run |
 | `app:local:stop` | Stop a `holler-server serve` started by `app:local:launch` |
