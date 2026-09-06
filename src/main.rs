@@ -71,7 +71,7 @@ fn print_table(views: &[holler_server::token::TokenView]) {
 }
 
 #[derive(Parser)]
-#[command(name = "holler", about = "Talk circuit for the herd")]
+#[command(name = "holler", about = "Your agents are just a holler away")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
