@@ -32,6 +32,7 @@
 pub mod connection;
 pub mod control;
 pub mod hello;
+pub mod lockout;
 pub mod query;
 pub mod registry;
 pub mod roster;
@@ -48,6 +49,7 @@ use crate::debug::DebugLevel;
 use crate::token::TokenStore;
 
 use connection::ConnectionContext;
+use lockout::LockoutTracker;
 use registry::Registry;
 use roster::{Roster, RosterConfig};
 
@@ -149,6 +151,7 @@ pub async fn serve(config: ServeConfig) -> io::Result<ServerHandle> {
     let store = Arc::new(TokenStore::open().map_err(io::Error::other)?);
     let registry = Arc::new(Registry::new());
     let roster = Arc::new(Roster::new(RosterConfig::from_env()));
+    let lockout = Arc::new(LockoutTracker::new());
     let state_dir = store.dir().to_path_buf();
 
     let mut listeners = Vec::with_capacity(config.listen_addrs.len());
@@ -166,6 +169,7 @@ pub async fn serve(config: ServeConfig) -> io::Result<ServerHandle> {
         store: store.clone(),
         registry: registry.clone(),
         roster: roster.clone(),
+        lockout: lockout.clone(),
         server_hostname: Arc::from(hostname.as_str()),
         listening: listening_urls.clone(),
         debug: config.debug,
@@ -220,6 +224,11 @@ async fn roster_prune_loop(roster: Arc<Roster>, mut shutdown_rx: watch::Receiver
     }
 }
 
+/// `peer` (the accepted socket's remote address) is threaded through to
+/// [`connection::handle_connection`] so it can key the failed-auth lockout
+/// tracker (issue #58, [`lockout`]) by source IP. If issue #57's
+/// concurrent-connection work lands separately and also wants the peer
+/// address, this is the same capture point — avoid adding a second one.
 async fn accept_loop(
     listener: TcpListener,
     ctx: Arc<ConnectionContext>,
@@ -236,10 +245,10 @@ async fn accept_loop(
             }
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((stream, _peer)) => {
+                    Ok((stream, peer)) => {
                         let ctx = ctx.clone();
                         tokio::spawn(async move {
-                            connection::handle_connection(stream, ctx).await;
+                            connection::handle_connection(stream, ctx, peer).await;
                         });
                     }
                     Err(_) => continue,
