@@ -8,9 +8,14 @@
 //!
 //! Storage is a single JSON file (no database engine needed for a
 //! CLI-only store with no live server yet): `HOLLER_STATE_DIR`
-//! (default `./holler-server-state`) holding `tokens.json`. Concurrent
-//! CLI invocations are not made safe (no file locking) — out of scope
-//! for a local operator tool with a single caller at a time.
+//! (default `./holler-server-state`) holding `tokens.json`. Every
+//! mutating operation (`mint`/`delete`/`redeem`/`verify_credential`)
+//! holds an advisory whole-file lock (`flock`/`LockFileEx`, via `fs4`)
+//! on a sibling `tokens.json.lock` for the duration of its
+//! load-modify-save cycle (issue #89), so two processes — e.g. a `holler
+//! serve` and a concurrent one-shot CLI invocation, or two CLI
+//! invocations — racing the same `HOLLER_STATE_DIR` can't clobber each
+//! other's write.
 
 use std::error::Error;
 use std::fmt;
@@ -18,6 +23,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+use fs4::FileExt;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -29,6 +35,7 @@ type HmacSha256 = Hmac<Sha256>;
 const STATE_DIR_ENV: &str = "HOLLER_STATE_DIR";
 const DEFAULT_STATE_DIR: &str = "./holler-server-state";
 const STATE_FILE: &str = "tokens.json";
+const LOCK_FILE: &str = "tokens.json.lock";
 const PEPPER_ENV: &str = "HOLLER_SERVER_PEPPER";
 
 /// Default TTL applied to a minted secret when `--ttl` is omitted.
@@ -375,6 +382,39 @@ impl TokenStore {
         Ok(())
     }
 
+    /// The sibling lock file [`TokenStore::with_lock`] holds for the
+    /// duration of one mutating operation. Kept separate from
+    /// `tokens.json` itself (rather than locking the data file directly)
+    /// so `save`'s whole-file rewrite is never itself the thing holding
+    /// or contending for the lock.
+    fn lock_path(&self) -> PathBuf {
+        self.dir().join(LOCK_FILE)
+    }
+
+    /// Run `f` (one full load-modify-save cycle) while holding an
+    /// advisory exclusive lock on [`TokenStore::lock_path`] (issue #89):
+    /// blocks — does not poll or time out — until the lock is free, which
+    /// is fine here since every caller's critical section is small,
+    /// synchronous file I/O with no risk of a long hold. Guards against
+    /// two processes (a `holler serve` and a concurrent CLI invocation,
+    /// or two CLI invocations) racing a `mint`/`delete`/`redeem`/
+    /// `verify_credential` against the same `HOLLER_STATE_DIR` and
+    /// losing one side's update to a last-write-wins clobber.
+    fn with_lock<T>(&self, f: impl FnOnce() -> Result<T, TokenError>) -> Result<T, TokenError> {
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.lock_path())?;
+        FileExt::lock(&lock_file)?;
+        let result = f();
+        // Best-effort: an `unlock` failure here does not un-do `f`'s
+        // already-committed write, and the OS releases the lock anyway
+        // once `lock_file` drops at the end of this scope.
+        let _ = FileExt::unlock(&lock_file);
+        result
+    }
+
     /// Mint a new token: generate a `token_id` + secret, persist only
     /// the HMAC hash of the secret, and return the secret once.
     ///
@@ -420,9 +460,11 @@ impl TokenStore {
             last_seen: None,
         };
 
-        let mut records = self.load()?;
-        records.push(record);
-        self.save(&records)?;
+        self.with_lock(move || {
+            let mut records = self.load()?;
+            records.push(record);
+            self.save(&records)
+        })?;
 
         Ok(MintResult {
             token_id,
@@ -449,24 +491,26 @@ impl TokenStore {
     /// accident (the credential itself was never stored, only its
     /// hash, but a cleared hash removes even that comparison target).
     pub fn delete(&self, token_id: &str) -> Result<DisplayState, TokenError> {
-        let mut records = self.load()?;
-        let record = records
-            .iter_mut()
-            .find(|r| r.token_id == token_id)
-            .ok_or_else(|| TokenError::NotFound(token_id.to_string()))?;
+        self.with_lock(|| {
+            let mut records = self.load()?;
+            let record = records
+                .iter_mut()
+                .find(|r| r.token_id == token_id)
+                .ok_or_else(|| TokenError::NotFound(token_id.to_string()))?;
 
-        record.state = match record.state {
-            StoredState::Bound => {
-                record.credential_hash = None;
-                StoredState::Revoked
-            }
-            StoredState::Unused | StoredState::Invalidated | StoredState::Revoked => {
-                StoredState::Invalidated
-            }
-        };
-        let new_state = record.display_state(OffsetDateTime::now_utc());
-        self.save(&records)?;
-        Ok(new_state)
+            record.state = match record.state {
+                StoredState::Bound => {
+                    record.credential_hash = None;
+                    StoredState::Revoked
+                }
+                StoredState::Unused | StoredState::Invalidated | StoredState::Revoked => {
+                    StoredState::Invalidated
+                }
+            };
+            let new_state = record.display_state(OffsetDateTime::now_utc());
+            self.save(&records)?;
+            Ok(new_state)
+        })
     }
 
     /// Redeem a join token: verify the presented secret, consume it
@@ -498,42 +542,44 @@ impl TokenStore {
         secret: &str,
         machine: String,
     ) -> Result<RedeemResult, TokenError> {
-        let mut records = self.load()?;
-        let now = OffsetDateTime::now_utc();
-        let record = records
-            .iter_mut()
-            .find(|r| r.token_id == token_id)
-            .ok_or_else(|| TokenError::NotFound(token_id.to_string()))?;
+        self.with_lock(move || {
+            let mut records = self.load()?;
+            let now = OffsetDateTime::now_utc();
+            let record = records
+                .iter_mut()
+                .find(|r| r.token_id == token_id)
+                .ok_or_else(|| TokenError::NotFound(token_id.to_string()))?;
 
-        match record.display_state(now) {
-            DisplayState::Unused => {}
-            DisplayState::Bound => return Err(TokenError::AlreadyBound(token_id.to_string())),
-            DisplayState::Invalidated => {
-                return Err(TokenError::Invalidated(token_id.to_string()))
+            match record.display_state(now) {
+                DisplayState::Unused => {}
+                DisplayState::Bound => return Err(TokenError::AlreadyBound(token_id.to_string())),
+                DisplayState::Invalidated => {
+                    return Err(TokenError::Invalidated(token_id.to_string()))
+                }
+                DisplayState::Revoked => return Err(TokenError::Revoked(token_id.to_string())),
+                DisplayState::Stale => return Err(TokenError::Stale(token_id.to_string())),
             }
-            DisplayState::Revoked => return Err(TokenError::Revoked(token_id.to_string())),
-            DisplayState::Stale => return Err(TokenError::Stale(token_id.to_string())),
-        }
 
-        if !verify_secret(pepper, secret, &record.secret_hash) {
-            return Err(TokenError::WrongSecret(token_id.to_string()));
-        }
+            if !verify_secret(pepper, secret, &record.secret_hash) {
+                return Err(TokenError::WrongSecret(token_id.to_string()));
+            }
 
-        let client_id = format!("cli_{}", random_hex(16)?);
-        let credential = format!("hlr_live_{}", random_hex(32)?);
-        let credential_hash = hash_secret(pepper, &credential);
+            let client_id = format!("cli_{}", random_hex(16)?);
+            let credential = format!("hlr_live_{}", random_hex(32)?);
+            let credential_hash = hash_secret(pepper, &credential);
 
-        record.state = StoredState::Bound;
-        record.machine = Some(machine);
-        record.client_id = Some(client_id.clone());
-        record.credential_hash = Some(credential_hash);
+            record.state = StoredState::Bound;
+            record.machine = Some(machine);
+            record.client_id = Some(client_id.clone());
+            record.credential_hash = Some(credential_hash);
 
-        self.save(&records)?;
+            self.save(&records)?;
 
-        Ok(RedeemResult {
-            token_id: token_id.to_string(),
-            client_id,
-            credential,
+            Ok(RedeemResult {
+                token_id: token_id.to_string(),
+                client_id,
+                credential,
+            })
         })
     }
 
@@ -569,43 +615,46 @@ impl TokenStore {
         token_id: &str,
         credential: &str,
     ) -> Result<VerifiedClient, TokenError> {
-        let mut records = self.load()?;
-        let record = records
-            .iter_mut()
-            .find(|r| r.token_id == token_id)
-            .ok_or_else(|| TokenError::NotFound(token_id.to_string()))?;
+        self.with_lock(|| {
+            let mut records = self.load()?;
+            let record = records
+                .iter_mut()
+                .find(|r| r.token_id == token_id)
+                .ok_or_else(|| TokenError::NotFound(token_id.to_string()))?;
 
-        match record.state {
-            StoredState::Bound => {}
-            StoredState::Unused => return Err(TokenError::Unbound(token_id.to_string())),
-            StoredState::Invalidated => {
-                return Err(TokenError::Invalidated(token_id.to_string()))
+            match record.state {
+                StoredState::Bound => {}
+                StoredState::Unused => return Err(TokenError::Unbound(token_id.to_string())),
+                StoredState::Invalidated => {
+                    return Err(TokenError::Invalidated(token_id.to_string()))
+                }
+                StoredState::Revoked => return Err(TokenError::Revoked(token_id.to_string())),
             }
-            StoredState::Revoked => return Err(TokenError::Revoked(token_id.to_string())),
-        }
 
-        // A `Bound` record always carries a `credential_hash` (set at
-        // redeem, only ever cleared by a revoke — which already returned
-        // above). Treat a missing hash the same as a wrong credential
-        // rather than panicking: fail closed on any inconsistency.
-        let matches = record
-            .credential_hash
-            .as_deref()
-            .is_some_and(|hash| verify_secret(pepper, credential, hash));
-        if !matches {
-            return Err(TokenError::WrongCredential(token_id.to_string()));
-        }
+            // A `Bound` record always carries a `credential_hash` (set at
+            // redeem, only ever cleared by a revoke — which already
+            // returned above). Treat a missing hash the same as a wrong
+            // credential rather than panicking: fail closed on any
+            // inconsistency.
+            let matches = record
+                .credential_hash
+                .as_deref()
+                .is_some_and(|hash| verify_secret(pepper, credential, hash));
+            if !matches {
+                return Err(TokenError::WrongCredential(token_id.to_string()));
+            }
 
-        let now = OffsetDateTime::now_utc();
-        record.last_seen = Some(now.format(&Rfc3339)?);
-        let verified = VerifiedClient {
-            token_id: token_id.to_string(),
-            client_id: record.client_id.clone().unwrap_or_default(),
-            machine: record.machine.clone().unwrap_or_default(),
-        };
+            let now = OffsetDateTime::now_utc();
+            record.last_seen = Some(now.format(&Rfc3339)?);
+            let verified = VerifiedClient {
+                token_id: token_id.to_string(),
+                client_id: record.client_id.clone().unwrap_or_default(),
+                machine: record.machine.clone().unwrap_or_default(),
+            };
 
-        self.save(&records)?;
-        Ok(verified)
+            self.save(&records)?;
+            Ok(verified)
+        })
     }
 
     /// CLI contract for `holler token ping <id>`: unused/stale/deleted
@@ -733,6 +782,89 @@ mod tests {
 
     fn store_in(dir: &std::path::Path) -> TokenStore {
         TokenStore::at(dir.join(STATE_FILE))
+    }
+
+    // -------------------------------------------------------------
+    // Issue #89: advisory locking around the load-modify-save cycle.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn with_lock_holds_an_exclusive_lock_for_its_duration_and_releases_it_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+
+        let mut held_during_critical_section = None;
+        store
+            .with_lock(|| {
+                // A second, independent handle on the same lock file
+                // cannot take it while this closure (the critical
+                // section `with_lock` protects) is still running.
+                let probe = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(store.lock_path())
+                    .unwrap();
+                held_during_critical_section = Some(FileExt::try_lock(&probe).is_err());
+                Ok::<(), TokenError>(())
+            })
+            .unwrap();
+        assert_eq!(
+            held_during_critical_section,
+            Some(true),
+            "the lock must be held for the duration of `with_lock`'s critical section"
+        );
+
+        // Once `with_lock` has returned, a fresh attempt succeeds — the
+        // lock was actually released, not leaked past the call.
+        let probe = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(store.lock_path())
+            .unwrap();
+        assert!(
+            FileExt::try_lock(&probe).is_ok(),
+            "the lock must be released once `with_lock` returns"
+        );
+    }
+
+    #[test]
+    fn concurrent_mints_from_two_threads_do_not_lose_a_write() {
+        // Every thread appends one record via `mint_with_pepper`'s
+        // load-modify-save cycle. Without the lock, two threads racing
+        // that cycle can both load the same on-disk snapshot, each
+        // append their own record to their own in-memory copy, and then
+        // the second `save` clobbers the first — losing a mint outright.
+        // With the lock serializing the cycle, all of them must land.
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(store_in(dir.path()));
+
+        const THREADS: usize = 8;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    store
+                        .mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL)
+                        .unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let records = store.load().unwrap();
+        assert_eq!(
+            records.len(),
+            THREADS,
+            "a lost update would show up as fewer than {THREADS} records: {records:?}"
+        );
+        // Every mint actually got its own distinct token_id — not one
+        // thread's write silently overwriting another's in place.
+        let unique: std::collections::HashSet<_> = records.iter().map(|r| &r.token_id).collect();
+        assert_eq!(unique.len(), THREADS);
     }
 
     /// This is the one test that touches the real `mint()` entry point
