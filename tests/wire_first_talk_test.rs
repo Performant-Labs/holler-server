@@ -460,3 +460,271 @@ fn status_with_no_server_running_reports_not_running() {
     assert_eq!(doc["clients"], 0);
     assert_eq!(doc["listening"].as_array().unwrap().len(), 0);
 }
+
+// ---------------------------------------------------------------------
+// Capability query (issue #37): `holler status/support/caps/query <id>`
+// relayed to a live client, with a scripted responder standing in for
+// that client's own dispatcher.
+// ---------------------------------------------------------------------
+
+/// Build the `query_ok`/`error` a scripted test client answers with for
+/// one `query` envelope, mirroring the shapes `docs/protocol/v1.md` §7
+/// specifies (this is *not* the real client dispatcher — just enough to
+/// exercise the server's outbound relay end to end).
+fn scripted_query_reply(token_id: &str, request: &Value) -> Value {
+    let id = request["id"].clone();
+    let cmd = request["body"]["cmd"].as_str().unwrap_or("");
+    let args: Vec<String> = request["body"]["args"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    let body = match cmd {
+        "status" => json!({
+            "cmd": "status", "role": "client", "protocol": 1, "protocol_min": 1,
+            "protocol_max": 1, "hostname": "kiwi", "connected": true,
+            "token_id": token_id, "features": [], "harnesses": [], "sessions": [],
+        }),
+        "caps" => json!({
+            "cmd": "caps", "role": "client", "protocol": 1, "hostname": "kiwi",
+            "connected": true, "capabilities": {},
+        }),
+        "support" => {
+            let feature = args.first().cloned().unwrap_or_default();
+            let ok = feature == "opencode";
+            json!({ "cmd": "support", "args": [feature], "ok": ok, "feature": feature, "kind": "harness" })
+        }
+        "protocol" => match args.first() {
+            Some(raw) => {
+                let asked: u32 = raw.parse().unwrap_or(0);
+                json!({
+                    "cmd": "protocol", "args": [raw], "ok": asked == 1, "asked": asked,
+                    "session": 1, "min": 1, "max": 1,
+                })
+            }
+            None => json!({ "cmd": "protocol", "session": 1, "min": 1, "max": 1 }),
+        },
+        other => {
+            return json!({
+                "v": 1, "type": "error", "id": id, "ts": "2026-09-05T00:00:00Z", "from": token_id,
+                "body": { "code": "unknown_cmd", "cmd": other, "message": format!("unknown query cmd: {other}") }
+            });
+        }
+    };
+    json!({
+        "v": 1, "type": "query_ok", "id": id, "ts": "2026-09-05T00:00:00Z", "from": token_id,
+        "body": body,
+    })
+}
+
+/// Answer every `ping` (so `holler token ping` keeps working) and
+/// `query` (via [`scripted_query_reply`]) the server sends this
+/// connection, until the socket closes or is aborted.
+fn spawn_scripted_responder(
+    mut write: impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin + Send + 'static,
+    mut read: impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin + Send + 'static,
+    token_id: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(Ok(Message::Text(text))) = read.next().await {
+            let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let reply = match v["type"].as_str() {
+                Some("ping") => json!({
+                    "v": 1, "type": "pong", "id": v["id"], "ts": "2026-09-05T00:00:00Z", "from": token_id,
+                    "body": {}
+                }),
+                Some("query") => scripted_query_reply(&token_id, &v),
+                _ => continue,
+            };
+            if write
+                .send(Message::Text(reply.to_string().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
+#[test]
+fn remote_query_relay_covers_status_support_caps_protocol() {
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "kiwi");
+    let (client_id, credential) = redeem(&env, &token_id, &secret, "kiwi.local");
+    let server = ServerProcess::spawn(&env);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(server.url())
+            .await
+            .unwrap();
+        send_json(&mut ws, &auth_envelope(&token_id, &credential)).await;
+        let _server_hello = recv_json(&mut ws).await;
+        send_json(&mut ws, &client_hello_envelope(&token_id, &client_id)).await;
+        let (write, read) = ws.split();
+        let responder = spawn_scripted_responder(write, read, token_id.clone());
+
+        // `holler status <id>` relays `query status` and reports the
+        // remote client's own document, not the server's.
+        let out = env
+            .cmd()
+            .args(["status", &token_id, "--json"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(doc["role"], "client");
+        assert_eq!(doc["hostname"], "kiwi");
+
+        // `holler support <id> <feature>`: both `ok: true` and
+        // `ok: false` round trip.
+        let out = env
+            .cmd()
+            .args(["support", &token_id, "opencode", "--json"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(doc["ok"], true);
+        assert_eq!(doc["feature"], "opencode");
+
+        let out = env
+            .cmd()
+            .args(["support", &token_id, "claude", "--json"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(doc["ok"], false);
+
+        // `holler caps <id>`.
+        let out = env
+            .cmd()
+            .args(["caps", &token_id, "--json"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(doc["role"], "client");
+
+        // `holler query <id> protocol` and `holler query <id> protocol <n>`.
+        let out = env
+            .cmd()
+            .args(["query", &token_id, "protocol", "--json"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(doc["min"], 1);
+        assert_eq!(doc["max"], 1);
+        assert!(doc.get("ok").is_none());
+
+        let out = env
+            .cmd()
+            .args(["query", &token_id, "protocol", "2", "--json"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(doc["ok"], false);
+        assert_eq!(doc["asked"], 2);
+
+        responder.abort();
+        let _ = responder.await;
+    });
+}
+
+#[test]
+fn remote_query_unknown_cmd_is_relayed_as_a_failure() {
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "kiwi");
+    let (client_id, credential) = redeem(&env, &token_id, &secret, "kiwi.local");
+    let server = ServerProcess::spawn(&env);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(server.url())
+            .await
+            .unwrap();
+        send_json(&mut ws, &auth_envelope(&token_id, &credential)).await;
+        let _server_hello = recv_json(&mut ws).await;
+        send_json(&mut ws, &client_hello_envelope(&token_id, &client_id)).await;
+        let (write, read) = ws.split();
+        let responder = spawn_scripted_responder(write, read, token_id.clone());
+
+        // The remote client's own `unknown_cmd` answer must surface as
+        // a failure on the CLI side, not a silent success.
+        let out = env
+            .cmd()
+            .args(["query", &token_id, "summarize"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{out:?}");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains("unknown_cmd"), "{stderr:?}");
+
+        responder.abort();
+        let _ = responder.await;
+    });
+}
+
+#[test]
+fn local_query_unknown_cmd_is_fail_closed() {
+    let env = Env::new();
+    let _server = ServerProcess::spawn(&env);
+
+    let out = env.cmd().args(["query", "summarize"]).output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("unknown_cmd"), "{stderr:?}");
+}
+
+#[test]
+fn query_to_an_unbound_token_is_an_error() {
+    let env = Env::new();
+    let (token_id, _secret) = mint(&env, "kiwi");
+    let _server = ServerProcess::spawn(&env);
+
+    let out = env
+        .cmd()
+        .args(["status", &token_id, "--json"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("no live connection"), "{stderr:?}");
+}
+
+#[test]
+fn query_to_a_disconnected_client_is_an_error() {
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "kiwi");
+    let (client_id, credential) = redeem(&env, &token_id, &secret, "kiwi.local");
+    let server = ServerProcess::spawn(&env);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(server.url())
+            .await
+            .unwrap();
+        send_json(&mut ws, &auth_envelope(&token_id, &credential)).await;
+        let _server_hello = recv_json(&mut ws).await;
+        send_json(&mut ws, &client_hello_envelope(&token_id, &client_id)).await;
+        // Actually close the socket rather than just going quiet, so
+        // the server's registry has really dropped this connection.
+        ws.close(None).await.unwrap();
+    });
+    std::thread::sleep(Duration::from_millis(200));
+
+    let out = env
+        .cmd()
+        .args(["status", &token_id, "--json"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("no live connection"), "{stderr:?}");
+}

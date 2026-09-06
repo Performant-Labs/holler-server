@@ -25,9 +25,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+use crate::proto::{ErrorBody, QueryOkBody};
 use crate::token::{ConnectionProbe, ConnectionStatus};
 use super::roster::Roster;
+
+use super::query;
+use super::registry::QueryOutcome;
 
 const CONTROL_SOCKET_NAME: &str = "control.sock";
 
@@ -48,8 +53,24 @@ pub fn control_socket_path(state_dir: &Path) -> PathBuf {
 #[serde(tag = "cmd", rename_all = "snake_case")]
 enum Request {
     Status,
-    Ping { token_id: String },
+    Ping {
+        token_id: String,
+    },
     Roster,
+    /// `holler status/support/caps/query [<id>] ...` (issue #37):
+    /// `target: None` asks this live process itself; `Some(id)` asks
+    /// the server to relay a `query` to the connection `id` names
+    /// (token id, client id, or hostname — see
+    /// `Registry::resolve_target`). The inner protocol `cmd`/`args` are
+    /// named `query_cmd`/`args` (not `cmd`) so they do not collide with
+    /// this enum's own `#[serde(tag = "cmd")]` discriminator key.
+    Query {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+        query_cmd: String,
+        #[serde(default)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -59,6 +80,19 @@ struct PingReply {
     hostname: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rtt_ms: Option<u64>,
+}
+
+/// Answer to a [`Request::Query`], from the CLI's point of view:
+/// either the target's `query_ok` body, its `error` body (e.g. the
+/// remote client's own `unknown_cmd`), or `NotConnected` when `target`
+/// names no live connection at all, or a `Some(id)` target's round trip
+/// otherwise fails ([`QueryOutcome::Disconnected`]).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum QueryReply {
+    Ok { query_ok: QueryOkBody },
+    Err { error: ErrorBody },
+    NotConnected,
 }
 
 /// The live server's self-report, as answered over the control channel.
@@ -215,6 +249,62 @@ async fn handle_control_conn(
                     .collect();
                 serde_json::to_string(&rows).expect("roster rows always serialize")
             }
+            Request::Query {
+                target,
+                query_cmd,
+                args,
+            } => {
+                let reply = match target {
+                    None => {
+                        let confirmed = registry.confirmed_harnesses_snapshot();
+                        match query::dispatch(
+                            &query_cmd,
+                            &args,
+                            &server_hostname,
+                            &listening,
+                            registry.len(),
+                            &confirmed,
+                        ) {
+                            Ok(body) => QueryReply::Ok { query_ok: body },
+                            Err(body) => QueryReply::Err { error: body },
+                        }
+                    }
+                    Some(id) => match registry.resolve_target(&id) {
+                        None => QueryReply::NotConnected,
+                        Some(token_id) => {
+                            let target_hostname = registry.hostname_of(&token_id);
+                            let query_id = super::hello::new_id();
+                            match registry
+                                .query(&token_id, query_cmd.clone(), args.clone(), query_id)
+                                .await
+                            {
+                                QueryOutcome::Ok(body) => {
+                                    // ADR 0001: record a harness
+                                    // confirmation the moment a live
+                                    // `support` round trip answers
+                                    // `ok: true` — never from `hello`.
+                                    if query_cmd == "support" {
+                                        if let (Some(feature), Some(host)) =
+                                            (args.first(), target_hostname.as_deref())
+                                        {
+                                            if body.rest.get("ok").and_then(Value::as_bool)
+                                                == Some(true)
+                                            {
+                                                registry
+                                                    .record_harness_confirmed(feature, host);
+                                            }
+                                        }
+                                    }
+                                    QueryReply::Ok { query_ok: body }
+                                }
+                                QueryOutcome::Err(body) => QueryReply::Err { error: body },
+                                QueryOutcome::Disconnected => QueryReply::NotConnected,
+                            }
+                        }
+                    },
+                };
+                serde_json::to_string(&reply).expect("QueryReply always serializes")
+            }
         };
         write_half.write_all(response.as_bytes()).await?;
         write_half.write_all(b"\n").await?;
@@ -285,6 +375,28 @@ pub fn query_roster(state_dir: &Path) -> Vec<RosterRowDoc> {
         return Vec::new();
     };
     serde_json::from_str(&line).unwrap_or_default()
+}
+
+/// `holler status/support/caps/query [<id>] <cmd> [args...]` (issue
+/// #37): ask a live server (if any) to answer `query_cmd`/`args`,
+/// either about itself (`target: None`) or by relaying to the
+/// connection `target` names. `None` means no live server is reachable
+/// at all — callers (see `main.rs`) fall back to a local-only answer
+/// for an untargeted query, or report an error for a targeted one
+/// (there is nothing local to say about a specific remote client).
+pub fn run_query(
+    state_dir: &Path,
+    target: Option<String>,
+    cmd: &str,
+    args: Vec<String>,
+) -> Option<QueryReply> {
+    let req = Request::Query {
+        target,
+        query_cmd: cmd.to_string(),
+        args,
+    };
+    let line = run_client_query(state_dir, &req)?;
+    serde_json::from_str(&line).ok()
 }
 
 /// [`ConnectionProbe`] backed by the control channel: the "real"
@@ -382,5 +494,142 @@ mod tests {
             probe.probe("tok_x"),
             ConnectionStatus::Disconnected
         ));
+    }
+
+    /// Spawn `serve_control_socket` over a fresh registry/state dir and
+    /// wait for its socket to exist, for the `Request::Query` tests
+    /// below. Returns the shutdown sender too — dropping it would flip
+    /// `shutdown_rx.changed()` to `Err`, which the accept loop treats as
+    /// "shut down", so the caller must hold it for the test's duration.
+    async fn spawn_control_server(
+        dir: &std::path::Path,
+        registry: Arc<Registry>,
+    ) -> (tokio::task::JoinHandle<()>, watch::Sender<bool>) {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listening = Arc::new(vec!["ws://127.0.0.1:41807".to_string()]);
+        let roster = Arc::new(Roster::new(RosterConfig::default()));
+        let server = tokio::spawn(serve_control_socket(
+            dir.to_path_buf(),
+            registry,
+            roster,
+            Arc::from("uranus"),
+            listening,
+            shutdown_rx,
+        ));
+        for _ in 0..50 {
+            if control_socket_path(dir).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (server, shutdown_tx)
+    }
+
+    #[tokio::test]
+    async fn local_query_status_round_trips_with_no_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Registry::new());
+        let (server, _shutdown_tx) = spawn_control_server(dir.path(), registry).await;
+
+        let reply = tokio::task::spawn_blocking({
+            let dir = dir.path().to_path_buf();
+            move || run_query(&dir, None, "status", vec![])
+        })
+        .await
+        .unwrap()
+        .expect("a live server must answer a local `status` query");
+        match reply {
+            QueryReply::Ok { query_ok } => {
+                assert_eq!(query_ok.cmd, "status");
+                assert_eq!(query_ok.rest["role"], "server");
+            }
+            other => panic!("expected QueryReply::Ok, got {other:?}"),
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_query_to_an_unknown_target_is_not_connected() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Registry::new());
+        let (server, _shutdown_tx) = spawn_control_server(dir.path(), registry).await;
+
+        let reply = tokio::task::spawn_blocking({
+            let dir = dir.path().to_path_buf();
+            move || run_query(&dir, Some("nope".to_string()), "status", vec![])
+        })
+        .await
+        .unwrap()
+        .expect("the control socket answers even for an unknown target");
+        assert!(matches!(reply, QueryReply::NotConnected));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_support_round_trip_records_a_harness_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Registry::new());
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+        let (server, _shutdown_tx) = spawn_control_server(dir.path(), registry.clone()).await;
+
+        let responder = tokio::spawn(async move {
+            let envelope = out_rx.recv().await.expect("query envelope sent");
+            registry.resolve_query_ok(
+                "tok_1",
+                &envelope.id,
+                QueryOkBody {
+                    cmd: "support".to_string(),
+                    rest: serde_json::json!({ "ok": true, "feature": "opencode" }),
+                },
+            );
+        });
+
+        let reply = tokio::task::spawn_blocking({
+            let dir = dir.path().to_path_buf();
+            move || {
+                run_query(
+                    &dir,
+                    Some("tok_1".to_string()),
+                    "support",
+                    vec!["opencode".to_string()],
+                )
+            }
+        })
+        .await
+        .unwrap()
+        .expect("a live server relays the remote reply");
+        match reply {
+            QueryReply::Ok { query_ok } => assert_eq!(query_ok.rest["ok"], true),
+            other => panic!("expected QueryReply::Ok, got {other:?}"),
+        }
+        responder.await.unwrap();
+
+        // The confirmation this round trip recorded now shows up in a
+        // fresh local `status` query, without another `support` ask.
+        let status = tokio::task::spawn_blocking({
+            let dir = dir.path().to_path_buf();
+            move || run_query(&dir, None, "status", vec![])
+        })
+        .await
+        .unwrap()
+        .expect("status still answers after the support round trip");
+        match status {
+            QueryReply::Ok { query_ok } => {
+                assert_eq!(query_ok.rest["harnesses_confirmed"][0]["id"], "opencode");
+                assert_eq!(query_ok.rest["harnesses_confirmed"][0]["clients"][0], "kiwi");
+            }
+            other => panic!("expected QueryReply::Ok, got {other:?}"),
+        }
+
+        server.abort();
+    }
+
+    #[test]
+    fn run_query_with_no_server_running_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(run_query(dir.path(), None, "status", vec![]).is_none());
     }
 }

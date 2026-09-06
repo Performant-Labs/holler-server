@@ -1,18 +1,19 @@
 //! Envelope builders shared by the connection handler and the registry:
-//! this process's `hello`/`status` self-description, and the `ping`
-//! envelope the registry sends to drive an RTT round trip.
+//! this process's `hello`/`status` self-description, the `ping`
+//! envelope the registry sends to drive an RTT round trip, and the
+//! generalized outbound `query` envelope (issue #37).
 //!
-//! Advertise only what is actually implemented (`docs/protocol/v1.md`
-//! §6: "Advertise only what is real"): `query` (only `status` today —
-//! the full dispatcher is #37), `ping`, and, as of issue #32,
-//! `presence`/`roster`. Not `interrupt`, which no story has wired yet.
+//! Advertise only what this process actually implements
+//! (`docs/protocol/v1.md` §6: "Advertise only what is real"): `query`
+//! (the full dispatcher, issue #37), `ping`, `token`, and, as of issue
+//! #32, `presence`/`roster`. Not `interrupt`/`wait`, which no story has
+//! wired yet — see [`PROTOCOL_FEATURES`] for the full vocabulary those
+//! unimplemented ids come from.
 
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use serde_json::json;
-
-use crate::proto::{Body, Envelope, HelloBody, MessageType, PingBody, PongBody, QueryOkBody, Role};
+use crate::proto::{Body, Envelope, HelloBody, MessageType, PingBody, PongBody, QueryBody, Role};
 
 /// This binary's protocol version (spec §2): every process today has
 /// `min = 1`, `max = 1`.
@@ -23,6 +24,13 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// #32). `token` describes the CLI's own token-management surface,
 /// which is real regardless of the wire.
 pub const SERVER_FEATURES: &[&str] = &["query", "ping", "token", "presence", "roster"];
+
+/// The full v1 protocol-feature vocabulary (spec §9) — every id `holler
+/// caps`/`holler support` knows to report on, independent of what this
+/// process actually implements (see [`SERVER_FEATURES`], always a
+/// subset of this list).
+pub const PROTOCOL_FEATURES: &[&str] =
+    &["interrupt", "presence", "ping", "query", "roster", "token", "wait"];
 
 /// The v1 harness-id vocabulary (spec §9). `holler-server` never runs a
 /// harness itself — this is the set of ids it *knows about*, not ids it
@@ -97,28 +105,21 @@ pub fn new_ping_envelope(id: &str, server_hostname: &str) -> Envelope {
     }
 }
 
-/// Body of a `query_ok` answer to `query status` (spec §7 "status
-/// document") — same shape whether asked over the wire by a client or
-/// printed locally by `holler status`. `listening` is the list of
-/// addresses this process actually bound; empty when this is a
-/// `holler status` invocation with no live server on this host (see
-/// `wire::control`).
-pub fn status_query_ok_body(hostname: &str, listening: &[String], clients: usize) -> QueryOkBody {
-    QueryOkBody {
-        cmd: "status".to_string(),
-        rest: json!({
-            "role": "server",
-            "protocol": PROTOCOL_VERSION,
-            "protocol_min": PROTOCOL_VERSION,
-            "protocol_max": PROTOCOL_VERSION,
-            "hostname": hostname,
-            "listening": listening,
-            "features": SERVER_FEATURES,
-            "harnesses_known": HARNESSES_KNOWN,
-            "harnesses_confirmed": [],
-            "clients": clients,
-            "sessions": 0,
-        }),
+/// A `query` envelope the server sends to a live connection to ask it
+/// something (issue #37: `holler status <id>` / `support <id> ...` /
+/// `caps <id>` / `query <id> ...`) — the outbound counterpart of
+/// [`new_ping_envelope`], generalized to carry any `cmd`/`args`. The
+/// answer shapes (`status`/`caps`/`support`/`protocol` bodies) live in
+/// [`super::query`], which builds the same documents whether asked over
+/// the wire or by a local CLI invocation with no live connection at all.
+pub fn new_query_envelope(id: &str, cmd: String, args: Vec<String>) -> Envelope {
+    Envelope {
+        v: 1,
+        msg_type: MessageType::Query,
+        id: id.to_string(),
+        ts: now_ts(),
+        from: "server".to_string(),
+        body: Body::Query(QueryBody { cmd, args }),
     }
 }
 

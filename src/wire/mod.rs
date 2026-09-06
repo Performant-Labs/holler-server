@@ -32,6 +32,7 @@
 pub mod connection;
 pub mod control;
 pub mod hello;
+pub mod query;
 pub mod registry;
 pub mod roster;
 

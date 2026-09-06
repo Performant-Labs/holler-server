@@ -18,7 +18,8 @@ use crate::proto::{
 };
 use crate::token::TokenStore;
 
-use super::hello::{new_pong_envelope, server_hello, status_query_ok_body};
+use super::hello::{new_pong_envelope, server_hello};
+use super::query;
 use super::registry::Registry;
 use super::roster::Roster;
 
@@ -251,26 +252,46 @@ async fn handle_frame(
             ctx.registry.set_hostname(token_id, hello.hostname.clone());
             trace(ctx, &format!("client hello: hostname={}", hello.hostname));
         }
-        Body::Query(QueryBody { cmd, .. }) if cmd == "status" => {
-            let listening = ctx.listening.as_slice();
-            let clients = ctx.registry.len();
-            let body = status_query_ok_body(&ctx.server_hostname, listening, clients);
-            let reply = Envelope {
-                v: 1,
-                msg_type: MessageType::QueryOk,
-                id: envelope.id.clone(),
-                ts: envelope.ts.clone(),
-                from: "server".to_string(),
-                body: Body::QueryOk(Box::new(body)),
+        Body::Query(QueryBody { cmd, args }) => {
+            // A connected client asking the server the same peer
+            // questions the server can ask it (spec §7: "The server
+            // answers as a peer") — status/caps/support/protocol,
+            // dispatched by the same `query` module the control channel
+            // uses for `holler status`/`support`/`caps`/`query` (#37).
+            let confirmed = ctx.registry.confirmed_harnesses_snapshot();
+            let reply = match query::dispatch(
+                cmd,
+                args,
+                &ctx.server_hostname,
+                ctx.listening.as_slice(),
+                ctx.registry.len(),
+                &confirmed,
+            ) {
+                Ok(body) => Envelope {
+                    v: 1,
+                    msg_type: MessageType::QueryOk,
+                    id: envelope.id.clone(),
+                    ts: envelope.ts.clone(),
+                    from: "server".to_string(),
+                    body: Body::QueryOk(Box::new(body)),
+                },
+                Err(err_body) => Envelope {
+                    v: 1,
+                    msg_type: MessageType::Error,
+                    id: envelope.id.clone(),
+                    ts: envelope.ts.clone(),
+                    from: "server".to_string(),
+                    body: Body::Error(err_body),
+                },
             };
             let _ = write.send(Message::Text(encode(&reply).into())).await;
         }
-        Body::Query(QueryBody { cmd, .. }) => {
-            let _ = write
-                .send(Message::Text(
-                    encode(&proto::error_for_unknown_cmd(cmd, &envelope.id, "server")).into(),
-                ))
-                .await;
+        Body::QueryOk(body) => {
+            // A reply to a `query` **this server sent** the client
+            // (`holler status/support/caps/query <id>`, issue #37) —
+            // resolve the matching outbound request, if any.
+            ctx.registry
+                .resolve_query_ok(token_id, &envelope.id, body.as_ref().clone());
         }
         Body::Ping(ping) => {
             let hostname = ping.hostname.clone().unwrap_or_default();
@@ -283,6 +304,15 @@ async fn handle_frame(
         }
         Body::Pong(_) => {
             ctx.registry.resolve_pong(token_id, &envelope.id);
+        }
+        Body::Error(err_body) => {
+            // Either a reply to a `query` this server sent (issue #37 —
+            // e.g. the remote client's own `unknown_cmd`) or an
+            // unsolicited `error` this story has no other use for;
+            // `resolve_query_err` is a no-op if `envelope.id` matches no
+            // outstanding request.
+            ctx.registry
+                .resolve_query_err(token_id, &envelope.id, err_body.clone());
         }
         Body::Auth(_) => {
             // A second `auth` mid-session is not part of this story's
@@ -313,12 +343,7 @@ async fn handle_frame(
                 }
             }
         }
-        Body::Prompt(_)
-        | Body::Reply(_)
-        | Body::Interrupt(_)
-        | Body::Ack(_)
-        | Body::Error(_)
-        | Body::QueryOk(_) => {
+        Body::Prompt(_) | Body::Reply(_) | Body::Interrupt(_) | Body::Ack(_) => {
             // Not wired up by issue #31 (talk/roster land in later
             // stories); accept the frame without erroring so a client
             // speaking ahead of this server's capabilities does not get
