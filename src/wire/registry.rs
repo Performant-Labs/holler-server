@@ -587,12 +587,18 @@ impl Registry {
             pending.insert(prompt_id.clone(), (session.clone(), tx));
         }
 
+        // Captured before `text` moves into the envelope below: the
+        // prompt's content is the reason this frame exists, not
+        // incidental metadata, so it belongs at `quiet`, not locked
+        // behind `noisy`'s full frame dump.
+        let text_preview = text.clone();
         let envelope =
             crate::wire::hello::new_prompt_envelope(&prompt_id, session.clone(), text, meta);
         debug::outgoing(self.debug, "prompt")
             .id(&prompt_id)
             .peer(token_id)
             .field("session", session.as_str())
+            .field("text", text_preview)
             .frame_of(|| &envelope)
             .emit();
         if out_tx.send(envelope).is_err() {
@@ -604,13 +610,25 @@ impl Registry {
         loop {
             match tokio::time::timeout(PROMPT_TIMEOUT, rx.recv()).await {
                 Ok(Some(PromptEvent::Reply(reply))) => {
-                    debug::incoming(self.debug, "reply")
+                    // Same reasoning as the outgoing prompt above: this
+                    // frame's actual text, not just its shape, belongs at
+                    // `quiet`. Built from `text`/`chunks` before either is
+                    // consumed into `pieces` below.
+                    let text_preview: String = reply
+                        .text
+                        .iter()
+                        .cloned()
+                        .chain(reply.chunks.iter().cloned())
+                        .collect();
+                    let mut event = debug::incoming(self.debug, "reply")
                         .id(&prompt_id)
                         .peer(token_id)
                         .field("session", session.as_str())
-                        .field("done", reply.done.to_string())
-                        .frame_of(|| &reply)
-                        .emit();
+                        .field("done", reply.done.to_string());
+                    if !text_preview.is_empty() {
+                        event = event.field("text", text_preview);
+                    }
+                    event.frame_of(|| &reply).emit();
                     if let Some(t) = reply.text {
                         pieces.push(t);
                     }

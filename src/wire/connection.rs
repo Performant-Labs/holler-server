@@ -602,13 +602,26 @@ async fn handle_frame(
             // mid-exchange) is logged but otherwise a no-op, same
             // fail-open tolerance `resolve_query_err` already has for an
             // unmatched `query` reply.
-            debug::incoming(ctx.debug, "reply")
+            // Same reasoning as registry.rs's own reply trace: the text
+            // is the point of the frame, so it belongs at `quiet`. This
+            // is a *different* log line from that one — this fires on
+            // socket receipt, before routing to whichever `Registry::prompt`
+            // call (if any) is waiting on the correlation id.
+            let text_preview: String = reply_body
+                .text
+                .iter()
+                .cloned()
+                .chain(reply_body.chunks.iter().cloned())
+                .collect();
+            let mut event = debug::incoming(ctx.debug, "reply")
                 .id(&envelope.id)
                 .peer(client_id)
                 .field("session", reply_body.session.as_str())
-                .field("done", reply_body.done.to_string())
-                .frame_of(|| reply_body)
-                .emit();
+                .field("done", reply_body.done.to_string());
+            if !text_preview.is_empty() {
+                event = event.field("text", text_preview);
+            }
+            event.frame_of(|| reply_body).emit();
             ctx.talklog
                 .record_reply(&envelope.id, &reply_body.session, reply_body);
             ctx.registry
