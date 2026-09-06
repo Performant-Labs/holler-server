@@ -184,6 +184,12 @@ fn roster_json(env: &Env) -> Value {
     serde_json::from_slice(&out.stdout).unwrap()
 }
 
+fn status_json(env: &Env) -> Value {
+    let out = env.cmd().args(["status", "--json"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
 fn find_row<'a>(rows: &'a Value, name: &str) -> Option<&'a Value> {
     rows.as_array()
         .unwrap()
@@ -311,6 +317,59 @@ fn holler_roster_shows_gone_after_ttl_elapses() {
             r.is_some_and(|r| r["state"] == "gone")
         });
         assert_eq!(row["state"], "gone");
+    });
+}
+
+/// Issue #81: `holler status --json`'s `sessions` field used to be
+/// hardcoded to `0` even with real sessions advertised and showing
+/// correctly in `holler roster`. Two sibling sessions on one connection
+/// (mirroring the issue's own `alpha`/`beta` repro) must show up in
+/// `status`'s live count.
+#[test]
+fn holler_status_reports_the_real_session_count() {
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "kiwi");
+    let (_client_id, credential) = redeem(&env, &token_id, &secret, "kiwi.local");
+    let server = ServerProcess::spawn(&env);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(server.url())
+            .await
+            .unwrap();
+        send_json(&mut ws, &auth_envelope(&token_id, &credential)).await;
+        let _server_hello = recv_json(&mut ws).await;
+
+        send_json(
+            &mut ws,
+            &presence_envelope(
+                &token_id,
+                json!([
+                    {"name": "alpha", "harness": "opencode"},
+                    {"name": "beta", "harness": "opencode"}
+                ]),
+            ),
+        )
+        .await;
+
+        // Confirm the roster sees both first (this path is already
+        // known-correct), then check `status --json` reports the same
+        // live count instead of the old hardcoded `0`.
+        wait_for_roster_row(&env, "alpha", |r| r.is_some());
+        wait_for_roster_row(&env, "beta", |r| r.is_some());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = status_json(&env);
+            if status["sessions"] == 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for status.sessions == 2; last status: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     });
 }
 
