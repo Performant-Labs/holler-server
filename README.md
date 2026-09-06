@@ -40,7 +40,13 @@ holler token mint --label laptop
 # 4. On the joining machine, run that printed `holler join` command — the `join`
 #    subcommand ships in holler-client, not this repo
 
-# 5. Back here, see who's joined and talk to a session
+# 5. Still on the joining machine: `holler run` has no default sessions — every
+#    session is explicit, in a `--config` TOML file (see holler-client's README
+#    for the exact format). Without one, `run` connects but drives nothing, and
+#    every `say`/`interrupt` from here will fail `unknown_session`.
+holler run --config sessions.toml
+
+# 6. Back here, see who's joined and talk to a session
 holler roster
 holler say <session> "hello"
 ```
@@ -111,7 +117,9 @@ See [how server and client talk](docs/protocol/talk.md) for the interrupt and pr
 
 ## Status and license
 
-Early-stage and under active development, not yet at v1. Of the 13 builder-order stories in the [v1 epic](https://github.com/Performant-Labs/holler-server/issues/27), 8 are closed — wire protocol v1, join tokens, redeem/bind, debug levels, the WebSocket listener, capability query, roster/presence, and prompt/reply-by-session-name. The fail-fast harness canary, the interrupt control path, the remaining meta-O CLI wiring, and the end-to-end acceptance gate (issues [#41](https://github.com/Performant-Labs/holler-server/issues/41), [#40](https://github.com/Performant-Labs/holler-server/issues/40), [#34](https://github.com/Performant-Labs/holler-server/issues/34), [#35](https://github.com/Performant-Labs/holler-server/issues/35), [#36](https://github.com/Performant-Labs/holler-server/issues/36)) are still open.
+The [v1 epic](https://github.com/Performant-Labs/holler-server/issues/27) is complete: all 13 builder-order stories are closed, and the shared acceptance gate — mint, join, roster, independent prompts to two live sessions, cooperative interrupt with sibling-session isolation, and clean detach — has passed end-to-end against real OpenCode sessions, not just a fixture.
+
+A handful of small, non-blocking follow-ups from that gate run remain open: roster staleness on an explicit disconnect, an unwired `sessions` count in the status document, and an error-message wording issue on an interrupted `say`. None of them affect correctness of routing, interrupt, or isolation.
 
 License is `Proprietary` (see `Cargo.toml`) — this isn't an open-contribution project at this stage.
 
