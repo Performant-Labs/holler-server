@@ -541,6 +541,10 @@ async fn handle_control_conn(
 #[derive(Debug)]
 enum ClientQueryOutcome {
     /// A full response line was read back before `read_timeout` elapsed.
+    /// Never actually constructed by the non-Unix stub below (there is
+    /// no socket to read from), hence the targeted `allow` there — same
+    /// reason `TimedOut` below has one.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Reached(String),
     /// The connect step itself failed or timed out (`CLIENT_TIMEOUT`),
     /// or the server closed the connection without a response — no live
