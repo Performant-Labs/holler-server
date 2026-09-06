@@ -19,6 +19,7 @@
 //! cross-platform channel (named pipes on Windows) is a reasonable
 //! follow-on if a Windows operator needs a live `ping`/`status`.
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(unix)]
@@ -49,6 +50,27 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn control_socket_path(state_dir: &Path) -> PathBuf {
     state_dir.join(CONTROL_SOCKET_NAME)
 }
+
+/// Issue #89: a second `holler serve` process found a live instance
+/// already bound to this state dir's control socket and refused to
+/// start, rather than silently stealing it (see [`bind_control_socket`]).
+#[derive(Debug)]
+pub struct AlreadyRunning {
+    path: PathBuf,
+}
+
+impl std::fmt::Display for AlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "another holler serve process is already running against this \
+             state dir (a live process answered at {:?}); stop it first, or \
+             point HOLLER_STATE_DIR at a different directory",
+            self.path
+        )
+    }
+}
+impl std::error::Error for AlreadyRunning {}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -194,12 +216,65 @@ pub struct RosterRowDoc {
 // Server side
 // ---------------------------------------------------------------------
 
-/// Run the control-socket accept loop until `shutdown_rx` fires. Removes
-/// any stale socket file left by a prior crash before binding, and sets
-/// the socket to mode `0600` (owner-only) once bound.
+/// Whether a live process is actually listening at `path` (issue #89):
+/// attempt a real connection rather than assuming the file's mere
+/// existence means a live owner — mirrors the "detect staleness by
+/// probing, don't assume" pattern [`super::registry::Registry::insert`]
+/// already uses for reconnect-supersede (issue #56). A Unix-domain
+/// `connect` to a path nothing is listening on fails immediately
+/// (`ECONNREFUSED`, or `ENOENT` if the path vanished under us) — no
+/// timeout is needed the way a TCP probe across a network might.
+#[cfg(unix)]
+fn control_socket_is_live(path: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+/// Probe and bind the control socket (issue #89): if a live process
+/// already answers at this state dir's control socket, refuse outright
+/// ([`AlreadyRunning`]) rather than deleting and stealing it out from
+/// under it. Only a *stale* socket file — nothing answers, left behind by
+/// an unclean shutdown or a crash — is removed before binding fresh. Also
+/// restricts the socket to mode `0600` (owner-only) once bound.
+///
+/// Split out from the accept loop ([`serve_control_socket`]) so
+/// [`super::serve`] gets a synchronous `Result` it can fail closed on,
+/// instead of a spawned background task silently giving up.
+#[cfg(unix)]
+pub fn bind_control_socket(state_dir: &Path) -> io::Result<tokio::net::UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::net::UnixListener;
+
+    let path = control_socket_path(state_dir);
+    if path.exists() {
+        if control_socket_is_live(&path) {
+            return Err(io::Error::other(AlreadyRunning { path }));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    let listener = UnixListener::bind(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
+
+#[cfg(not(unix))]
+pub fn bind_control_socket(_state_dir: &Path) -> io::Result<()> {
+    // No Unix domain sockets on this platform (see module scope note) —
+    // nothing to bind, and so nothing that could ever collide.
+    Ok(())
+}
+
+/// Run the control-socket accept loop, over an already-[`bind_control_socket`]ed
+/// listener, until `shutdown_rx` fires.
+// `#[allow]`: `listener`/`path` (issue #89) pushed this past clippy's
+// default 7-argument threshold; the caller (`wire::serve`) already builds
+// every one of these individually, and bundling them into a one-off
+// struct just for this call site would be more ceremony than the eighth
+// argument is worth.
+#[allow(clippy::too_many_arguments)]
 #[cfg(unix)]
 pub async fn serve_control_socket(
-    state_dir: PathBuf,
+    listener: tokio::net::UnixListener,
+    path: PathBuf,
     registry: Arc<super::registry::Registry>,
     roster: Arc<Roster>,
     talklog: Arc<TalkLog>,
@@ -207,22 +282,6 @@ pub async fn serve_control_socket(
     listening: Arc<Vec<String>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    use std::os::unix::fs::PermissionsExt;
-    use tokio::net::UnixListener;
-
-    let path = control_socket_path(&state_dir);
-    let _ = std::fs::remove_file(&path);
-    let listener = match UnixListener::bind(&path) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("holler-server: could not bind control socket at {path:?}: {e}");
-            return;
-        }
-    };
-    if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
-        eprintln!("holler-server: could not restrict control socket permissions: {e}");
-    }
-
     loop {
         tokio::select! {
             changed = shutdown_rx.changed() => {
@@ -248,9 +307,11 @@ pub async fn serve_control_socket(
     let _ = std::fs::remove_file(&path);
 }
 
+#[allow(clippy::too_many_arguments)]
 #[cfg(not(unix))]
 pub async fn serve_control_socket(
-    _state_dir: PathBuf,
+    _listener: (),
+    _path: PathBuf,
     _registry: Arc<super::registry::Registry>,
     _roster: Arc<Roster>,
     _talklog: Arc<TalkLog>,
@@ -625,8 +686,10 @@ mod tests {
         let listening = Arc::new(vec!["ws://127.0.0.1:41807".to_string()]);
         let roster = Arc::new(Roster::new(RosterConfig::default()));
         let talklog = Arc::new(TalkLog::new(dir.path().to_path_buf()));
+        let control_listener = bind_control_socket(dir.path()).expect("bind the control socket");
         let server = tokio::spawn(serve_control_socket(
-            dir.path().to_path_buf(),
+            control_listener,
+            control_socket_path(dir.path()),
             registry,
             roster,
             talklog,
@@ -655,6 +718,43 @@ mod tests {
         assert_eq!(doc.listening, vec!["ws://127.0.0.1:41807".to_string()]);
 
         server.abort();
+    }
+
+    // -------------------------------------------------------------
+    // Issue #89: probe-and-bind the control socket.
+    // -------------------------------------------------------------
+
+    // `bind_control_socket` calls `tokio::net::UnixListener::bind`, which
+    // registers with the Tokio reactor and so must run inside a runtime
+    // — hence `#[tokio::test]` even though the function itself is sync.
+    #[tokio::test]
+    async fn bind_control_socket_refuses_while_a_live_listener_owns_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let _first = bind_control_socket(dir.path()).expect("first bind succeeds");
+
+        let err = bind_control_socket(dir.path())
+            .expect_err("a second bind while the first is still live must be refused");
+        assert!(err.to_string().contains("already running"), "{err}");
+        // The first listener's socket file must be untouched by the
+        // refused second attempt.
+        assert!(control_socket_path(dir.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn bind_control_socket_recovers_a_stale_socket_left_by_an_unclean_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = bind_control_socket(dir.path()).expect("first bind succeeds");
+        // Simulate an unclean shutdown: the listener is dropped (so
+        // nothing answers a connect any more) without removing the
+        // socket file, exactly what a `kill -9` leaves behind.
+        drop(first);
+
+        let second = bind_control_socket(dir.path());
+        assert!(
+            second.is_ok(),
+            "a stale socket file (no live listener behind it) must not block a fresh bind: {:?}",
+            second.err()
+        );
     }
 
     #[test]
@@ -699,8 +799,10 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let listening = Arc::new(vec!["ws://127.0.0.1:41807".to_string()]);
         let talklog = Arc::new(TalkLog::new(dir.to_path_buf()));
+        let control_listener = bind_control_socket(dir).expect("bind the control socket");
         let server = tokio::spawn(serve_control_socket(
-            dir.to_path_buf(),
+            control_listener,
+            control_socket_path(dir),
             registry,
             roster,
             talklog.clone(),

@@ -70,6 +70,11 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "mac
 tokio-tungstenite = "0.30.0"
 futures-util = { version = "0.3.34", features = ["sink"] }
 hostname = "0.4.2"
+# Issue #89: advisory whole-file lock (`flock`/`LockFileEx`) around the
+# token store's load-modify-save cycle, so two `holler serve`/CLI
+# processes racing a `mint`/`delete`/`redeem` against the same
+# `HOLLER_STATE_DIR` can't lose an update to a last-write-wins clobber.
+fs4 = { version = "1.1.0", features = ["sync"] }
 
 # Test-only dependencies. `libc` is used by the first_talk harness to kill
 # a child's whole process group on Unix (`setpgid` at spawn, `killpg` +

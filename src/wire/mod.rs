@@ -157,6 +157,13 @@ pub async fn serve(config: ServeConfig) -> io::Result<ServerHandle> {
     let state_dir = store.dir().to_path_buf();
     let talklog = Arc::new(TalkLog::new(state_dir.clone()));
 
+    // Issue #89: probe-and-bind the control socket before doing anything
+    // else observable (binding a TCP port, writing the advertise file) so
+    // a second `holler serve` against the same `HOLLER_STATE_DIR` fails
+    // fast and cleanly if a live instance already owns it, rather than
+    // silently stealing the control socket out from under it.
+    let control_listener = control::bind_control_socket(&state_dir)?;
+
     let mut listeners = Vec::with_capacity(config.listen_addrs.len());
     for addr in &config.listen_addrs {
         listeners.push(TcpListener::bind(addr).await?);
@@ -195,7 +202,8 @@ pub async fn serve(config: ServeConfig) -> io::Result<ServerHandle> {
     }
 
     tasks.push(tokio::spawn(control::serve_control_socket(
-        state_dir,
+        control_listener,
+        control::control_socket_path(&state_dir),
         registry,
         roster.clone(),
         talklog,
