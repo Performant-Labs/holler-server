@@ -27,12 +27,13 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::proto::{ErrorBody, QueryOkBody};
+use crate::proto::{ErrorBody, QueryOkBody, CODE_UNKNOWN_SESSION};
 use crate::token::{ConnectionProbe, ConnectionStatus};
 use super::roster::Roster;
+use super::talklog::TalkLog;
 
 use super::query;
-use super::registry::QueryOutcome;
+use super::registry::{PromptOutcome, QueryOutcome};
 
 const CONTROL_SOCKET_NAME: &str = "control.sock";
 
@@ -71,6 +72,10 @@ enum Request {
         #[serde(default)]
         args: Vec<String>,
     },
+    /// `holler say <session> <text>` (issue #33): prompt a session by
+    /// name, resolved via the roster (ADR 0007) to whichever live
+    /// connection currently hosts it.
+    Say { session: String, text: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -93,6 +98,23 @@ pub enum QueryReply {
     Ok { query_ok: QueryOkBody },
     Err { error: ErrorBody },
     NotConnected,
+}
+
+/// Answer to a [`Request::Say`]: the concatenated `reply` text once
+/// `done: true` arrives, or an `error` — the target's own (e.g. a stale
+/// `presence` row) or this server's `unknown_session` when the roster
+/// names no live connection for the session at all.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum SayReply {
+    Ok {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit: Option<i64>,
+    },
+    Err {
+        error: ErrorBody,
+    },
 }
 
 /// The live server's self-report, as answered over the control channel.
@@ -132,6 +154,7 @@ pub async fn serve_control_socket(
     state_dir: PathBuf,
     registry: Arc<super::registry::Registry>,
     roster: Arc<Roster>,
+    talklog: Arc<TalkLog>,
     server_hostname: Arc<str>,
     listening: Arc<Vec<String>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -165,10 +188,11 @@ pub async fn serve_control_socket(
                 let Ok((stream, _)) = accepted else { continue };
                 let registry = registry.clone();
                 let roster = roster.clone();
+                let talklog = talklog.clone();
                 let server_hostname = server_hostname.clone();
                 let listening = listening.clone();
                 tokio::spawn(async move {
-                    let _ = handle_control_conn(stream, registry, roster, server_hostname, listening).await;
+                    let _ = handle_control_conn(stream, registry, roster, talklog, server_hostname, listening).await;
                 });
             }
         }
@@ -181,6 +205,7 @@ pub async fn serve_control_socket(
     _state_dir: PathBuf,
     _registry: Arc<super::registry::Registry>,
     _roster: Arc<Roster>,
+    _talklog: Arc<TalkLog>,
     _server_hostname: Arc<str>,
     _listening: Arc<Vec<String>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -196,6 +221,7 @@ async fn handle_control_conn(
     stream: tokio::net::UnixStream,
     registry: Arc<super::registry::Registry>,
     roster: Arc<Roster>,
+    talklog: Arc<TalkLog>,
     server_hostname: Arc<str>,
     listening: Arc<Vec<String>>,
 ) -> std::io::Result<()> {
@@ -305,6 +331,38 @@ async fn handle_control_conn(
                 };
                 serde_json::to_string(&reply).expect("QueryReply always serializes")
             }
+            Request::Say { session, text } => {
+                let reply = match roster.resolve_session(&session) {
+                    None => SayReply::Err {
+                        error: ErrorBody {
+                            code: CODE_UNKNOWN_SESSION.to_string(),
+                            cmd: None,
+                            message: Some(format!("unknown session: {session}")),
+                        },
+                    },
+                    Some(token_id) => {
+                        let prompt_id = super::hello::new_id();
+                        talklog.record_prompt(&prompt_id, &session, &text);
+                        match registry
+                            .prompt(&token_id, prompt_id, session.clone(), text.clone(), None)
+                            .await
+                        {
+                            PromptOutcome::Done { text, exit } => SayReply::Ok { text, exit },
+                            PromptOutcome::Err(body) => SayReply::Err { error: body },
+                            PromptOutcome::Disconnected => SayReply::Err {
+                                error: ErrorBody {
+                                    code: CODE_UNKNOWN_SESSION.to_string(),
+                                    cmd: None,
+                                    message: Some(format!(
+                                        "session {session:?}'s connection is gone"
+                                    )),
+                                },
+                            },
+                        }
+                    }
+                };
+                serde_json::to_string(&reply).expect("SayReply always serializes")
+            }
         };
         write_half.write_all(response.as_bytes()).await?;
         write_half.write_all(b"\n").await?;
@@ -399,6 +457,17 @@ pub fn run_query(
     serde_json::from_str(&line).ok()
 }
 
+/// `holler say <session> <text>` (issue #33): ask a live server (if any)
+/// to route a `prompt` to whichever connection currently hosts `session`
+/// and wait for its `reply` to finish. `None` means no live server is
+/// reachable at all — `holler say` has no local fallback (there is
+/// nothing to route to without a live roster).
+pub fn run_say(state_dir: &Path, session: String, text: String) -> Option<SayReply> {
+    let req = Request::Say { session, text };
+    let line = run_client_query(state_dir, &req)?;
+    serde_json::from_str(&line).ok()
+}
+
 /// [`ConnectionProbe`] backed by the control channel: the "real"
 /// liveness check that replaces [`crate::token::AlwaysDisconnected`] as
 /// `holler token ping`'s default (issue #31).
@@ -449,10 +518,12 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let listening = Arc::new(vec!["ws://127.0.0.1:41807".to_string()]);
         let roster = Arc::new(Roster::new(RosterConfig::default()));
+        let talklog = Arc::new(TalkLog::new(dir.path().to_path_buf()));
         let server = tokio::spawn(serve_control_socket(
             dir.path().to_path_buf(),
             registry,
             roster,
+            talklog,
             Arc::from("uranus"),
             listening,
             shutdown_rx,
@@ -505,13 +576,28 @@ mod tests {
         dir: &std::path::Path,
         registry: Arc<Registry>,
     ) -> (tokio::task::JoinHandle<()>, watch::Sender<bool>) {
+        let (handle, shutdown_tx, _talklog) =
+            spawn_control_server_with_roster(dir, registry, Arc::new(Roster::new(RosterConfig::default()))).await;
+        (handle, shutdown_tx)
+    }
+
+    /// Like [`spawn_control_server`], but the caller supplies the roster
+    /// (so a `Request::Say` test can `advertise` a session onto it before
+    /// or after spawning) and gets back the [`TalkLog`] the server writes
+    /// to, so a test can read back what `Request::Say` persisted.
+    async fn spawn_control_server_with_roster(
+        dir: &std::path::Path,
+        registry: Arc<Registry>,
+        roster: Arc<Roster>,
+    ) -> (tokio::task::JoinHandle<()>, watch::Sender<bool>, Arc<TalkLog>) {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let listening = Arc::new(vec!["ws://127.0.0.1:41807".to_string()]);
-        let roster = Arc::new(Roster::new(RosterConfig::default()));
+        let talklog = Arc::new(TalkLog::new(dir.to_path_buf()));
         let server = tokio::spawn(serve_control_socket(
             dir.to_path_buf(),
             registry,
             roster,
+            talklog.clone(),
             Arc::from("uranus"),
             listening,
             shutdown_rx,
@@ -522,7 +608,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        (server, shutdown_tx)
+        (server, shutdown_tx, talklog)
     }
 
     #[tokio::test]
@@ -631,5 +717,94 @@ mod tests {
     fn run_query_with_no_server_running_is_none() {
         let dir = tempfile::tempdir().unwrap();
         assert!(run_query(dir.path(), None, "status", vec![]).is_none());
+    }
+
+    #[tokio::test]
+    async fn say_to_an_unrostered_session_is_unknown_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Registry::new());
+        let roster = Arc::new(Roster::new(RosterConfig::default()));
+        let (server, _shutdown_tx, _talklog) =
+            spawn_control_server_with_roster(dir.path(), registry, roster).await;
+
+        let reply = tokio::task::spawn_blocking({
+            let dir = dir.path().to_path_buf();
+            move || run_say(&dir, "alpha".to_string(), "hello".to_string())
+        })
+        .await
+        .unwrap()
+        .expect("the control socket answers even for an unrostered session");
+        match reply {
+            SayReply::Err { error } => assert_eq!(error.code, "unknown_session"),
+            other => panic!("expected SayReply::Err(unknown_session), got {other:?}"),
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn say_round_trip_returns_the_concatenated_reply_and_persists_the_exchange() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Registry::new());
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+        let roster = Arc::new(Roster::new(RosterConfig::default()));
+        roster
+            .advertise("alpha".to_string(), "opencode".to_string(), "tok_1", "cli_1")
+            .unwrap();
+        let (server, _shutdown_tx, talklog) =
+            spawn_control_server_with_roster(dir.path(), registry.clone(), roster).await;
+
+        let responder_talklog = talklog.clone();
+        let responder = tokio::spawn(async move {
+            let envelope = out_rx.recv().await.expect("prompt envelope sent");
+            let crate::proto::Body::Prompt(crate::proto::PromptBody { session, text, .. }) =
+                envelope.body
+            else {
+                panic!("expected a Prompt body");
+            };
+            assert_eq!(session, "alpha");
+            assert_eq!(text, "hello");
+            let reply_body = crate::proto::ReplyBody {
+                session: session.clone(),
+                text: Some("hi there".to_string()),
+                chunks: vec![],
+                done: true,
+                exit: Some(0),
+            };
+            // Mirrors what `connection::handle_frame`'s `Body::Reply` arm
+            // does for a real inbound frame: persist, then resolve the
+            // pending prompt. This test drives the registry directly
+            // (there is no real socket here), so it does both by hand.
+            responder_talklog.record_reply(&envelope.id, &session, &reply_body);
+            registry.resolve_reply("tok_1", &envelope.id, reply_body);
+        });
+
+        let reply = tokio::task::spawn_blocking({
+            let dir = dir.path().to_path_buf();
+            move || run_say(&dir, "alpha".to_string(), "hello".to_string())
+        })
+        .await
+        .unwrap()
+        .expect("a live server relays the routed reply");
+        match reply {
+            SayReply::Ok { text, exit } => {
+                assert_eq!(text, "hi there");
+                assert_eq!(exit, Some(0));
+            }
+            other => panic!("expected SayReply::Ok, got {other:?}"),
+        }
+        responder.await.unwrap();
+
+        // The talk log actually recorded the exchange — read it back
+        // directly rather than trusting the write happened.
+        let entries = talklog.read("alpha");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].prompt_text, "hello");
+        assert_eq!(entries[0].replies.len(), 1);
+        assert_eq!(entries[0].replies[0].text.as_deref(), Some("hi there"));
+        assert!(entries[0].replies[0].done);
+
+        server.abort();
     }
 }

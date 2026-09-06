@@ -261,6 +261,24 @@ impl Roster {
         Ok(())
     }
 
+    /// Resolve a session name to the `token_id` of the live connection
+    /// currently hosting it (ADR 0007: "address sessions, not hosts") —
+    /// for `holler say`/`prompt` routing (issue #33). `None` if no row
+    /// exists at all, or the row has aged past [`RosterState::Gone`]: a
+    /// stale route is refused the same as no route (the caller surfaces
+    /// `unknown_session`, not a prompt into the void).
+    pub fn resolve_session(&self, name: &str) -> Option<String> {
+        let now = Instant::now();
+        let entries = self.entries.lock().expect("roster mutex poisoned");
+        entries.get(name).and_then(|e| {
+            if e.state_at(now, &self.config) == RosterState::Gone {
+                None
+            } else {
+                Some(e.token_id.clone())
+            }
+        })
+    }
+
     /// Snapshot of every row, with state derived as of now (for `holler
     /// roster` / the control channel).
     pub fn snapshot(&self) -> Vec<RosterRow> {
@@ -418,6 +436,28 @@ mod tests {
         let rows = roster.snapshot();
         assert_eq!(rows[0].client_id, "cli_2");
         assert_eq!(rows[0].state, RosterState::Connected);
+    }
+
+    #[test]
+    fn resolve_session_finds_the_hosting_token_id() {
+        let roster = Roster::new(tiny_config());
+        roster
+            .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
+            .unwrap();
+        assert_eq!(roster.resolve_session("alpha"), Some("tok_1".to_string()));
+        assert_eq!(roster.resolve_session("nope"), None);
+    }
+
+    #[test]
+    fn resolve_session_is_none_once_the_row_is_gone() {
+        let roster = Roster::new(tiny_config());
+        roster
+            .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(2700));
+        assert_eq!(roster.snapshot()[0].state, RosterState::Gone);
+        assert_eq!(roster.resolve_session("alpha"), None);
     }
 
     #[test]

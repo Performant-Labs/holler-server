@@ -1,6 +1,10 @@
 //! Per-connection handling (issue #31): one task per accepted WebSocket,
 //! implementing `connect -> auth -> hello (both ways) -> query / ping`
 //! (`docs/protocol/v1.md` §4) and the fail-closed error paths of ADR 0009.
+//! `reply` is routed by [`super::registry::Registry`] (issue #33: `holler
+//! say <session>`, resolved by [`super::roster::Roster`]); `prompt` /
+//! `interrupt` / `ack` inbound (this server never sends the former two,
+//! and defines no use for the latter) remain accepted-but-ignored.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -26,6 +30,7 @@ use super::lockout::LockoutTracker;
 use super::query;
 use super::registry::Registry;
 use super::roster::Roster;
+use super::talklog::TalkLog;
 
 /// Connection/message hygiene limits (issue #57, `docs/research-security-hijack-dos.md`
 /// §4 "do now" cluster): confirmed-absent gaps in the accept/auth path that #31
@@ -94,6 +99,7 @@ pub struct ConnectionContext {
     pub registry: Arc<Registry>,
     pub roster: Arc<Roster>,
     pub lockout: Arc<LockoutTracker>,
+    pub talklog: Arc<TalkLog>,
     pub server_hostname: Arc<str>,
     pub listening: Arc<Vec<String>>,
     pub debug: DebugLevel,
@@ -521,12 +527,18 @@ async fn handle_frame(
         }
         Body::Error(err_body) => {
             // Either a reply to a `query` this server sent (issue #37 —
-            // e.g. the remote client's own `unknown_cmd`) or an
-            // unsolicited `error` this story has no other use for;
-            // `resolve_query_err` is a no-op if `envelope.id` matches no
-            // outstanding request.
+            // e.g. the remote client's own `unknown_cmd`), a reply to a
+            // `prompt` this server sent (issue #33 — e.g. a stale
+            // `presence` row: the client no longer hosts the session the
+            // roster said it did), or an unsolicited `error` this story
+            // has no other use for. Both `resolve_*_err` calls are
+            // no-ops if `envelope.id` matches no outstanding request of
+            // that kind — a given id is only ever pending in one of the
+            // two maps, so exactly one call (if either) actually fires.
             ctx.registry
                 .resolve_query_err(token_id, &envelope.id, err_body.clone());
+            ctx.registry
+                .resolve_prompt_err(token_id, &envelope.id, err_body.clone());
         }
         Body::Auth(_) => {
             // A second `auth` mid-session is not part of this story's
@@ -568,7 +580,22 @@ async fn handle_frame(
                 }
             }
         }
-        Body::Prompt(_) | Body::Reply(_) | Body::Interrupt(_) | Body::Ack(_) => {
+        Body::Reply(reply_body) => {
+            // A client answering a `prompt` this server sent (issue #33:
+            // `holler say <session>` routing). Persisted unconditionally
+            // (the durable talk log a later `holler wait` reads), then
+            // forwarded to whichever pending `Registry::prompt` call is
+            // waiting on this correlation id, if any — a reply with no
+            // matching pending prompt (e.g. this process restarted
+            // mid-exchange) is logged but otherwise a no-op, same
+            // fail-open tolerance `resolve_query_err` already has for an
+            // unmatched `query` reply.
+            ctx.talklog
+                .record_reply(&envelope.id, &reply_body.session, reply_body);
+            ctx.registry
+                .resolve_reply(token_id, &envelope.id, reply_body.clone());
+        }
+        Body::Prompt(_) | Body::Interrupt(_) | Body::Ack(_) => {
             // Not wired up by issue #31 (talk/roster land in later
             // stories); accept the frame without erroring so a client
             // speaking ahead of this server's capabilities does not get
