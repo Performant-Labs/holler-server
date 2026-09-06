@@ -22,7 +22,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(unix)]
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -40,12 +39,25 @@ const CONTROL_SOCKET_NAME: &str = "control.sock";
 
 /// How long the CLI side waits for a control-channel round trip before
 /// reporting "no live server" — generous for a loopback UDS hop, short
-/// enough `holler token ping` / `holler status` never hang. Only the
-/// Unix `run_client_query` uses this (see the module scope note for the
-/// non-Unix fallback), so it is cfg-gated to avoid a dead-code warning
-/// on other platforms.
-#[cfg(unix)]
+/// enough `holler token ping` / `holler status` never hang. Used for the
+/// *connect* step of every request, and for the whole round trip of the
+/// fast ops (`status`/`roster`/`ping`/`query`/`revoke`). Not cfg-gated:
+/// [`run_say`]/[`run_interrupt`] reference [`REPLY_TIMEOUT`] (this
+/// constant's `say`/`interrupt` counterpart) from code compiled on every
+/// platform, even though only the Unix [`run_client_query_with_timeout`]
+/// ever actually dials a socket with it (see the module scope note for
+/// the non-Unix fallback).
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the CLI waits for a `say`/`interrupt` reply once the
+/// control-socket connection itself is established. Far more generous
+/// than `CLIENT_TIMEOUT`: the server-side wait for `say` is bounded by a
+/// real model turn on the target session (`registry.prompt(...)`'s
+/// round trip through `handle_control_conn`'s `Request::Say` arm), not a
+/// local loopback round trip — a cold-starting or slow-replying harness
+/// can legitimately take far longer than `CLIENT_TIMEOUT` without the
+/// server itself being unreachable (issue #206).
+const REPLY_TIMEOUT: Duration = Duration::from_secs(600);
 
 pub fn control_socket_path(state_dir: &Path) -> PathBuf {
     state_dir.join(CONTROL_SOCKET_NAME)
@@ -520,43 +532,103 @@ async fn handle_control_conn(
 // binary to be async).
 // ---------------------------------------------------------------------
 
+/// The three shapes a control-channel round trip can end in, from the
+/// CLI's point of view (issue #206): distinct from a plain `Option` so a
+/// caller (specifically `run_say`/`run_interrupt`) can tell "no live
+/// server at all" apart from "a live server took longer to reply than
+/// the caller was willing to wait" — those are different operator-facing
+/// facts, and today's `run_client_query` collapsed both into `None`.
+#[derive(Debug)]
+enum ClientQueryOutcome {
+    /// A full response line was read back before `read_timeout` elapsed.
+    Reached(String),
+    /// The connect step itself failed or timed out (`CLIENT_TIMEOUT`),
+    /// or the server closed the connection without a response — no live
+    /// server is reachable at all. Matches today's `None` behavior.
+    NotReachable,
+    /// The connection was established fine, but no response arrived
+    /// before `read_timeout` elapsed — the server (and whatever it is
+    /// waiting on) may still be alive and working. Never actually
+    /// constructed by the non-Unix stub below (there is no socket to
+    /// time out on), hence the targeted `allow` there.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    TimedOut,
+}
+
+/// Ask a live server (if any) for a response to `req`, over a fresh
+/// connection to `state_dir`'s control socket. The *connect* step always
+/// uses [`CLIENT_TIMEOUT`] — a local loopback UDS dial has no reason to
+/// ever legitimately take longer than that, live server or not. The
+/// *read* step (waiting for the response line) uses the caller-supplied
+/// `read_timeout`, so a slow op (`say`/`interrupt`, issue #206) can wait
+/// far longer than a fast one (`status`/`roster`/`ping`/`query`/`revoke`)
+/// without a single blanket timeout forcing a false "unreachable."
 #[cfg(unix)]
-fn run_client_query(state_dir: &Path, req: &Request) -> Option<String> {
+fn run_client_query_with_timeout(
+    state_dir: &Path,
+    req: &Request,
+    read_timeout: Duration,
+) -> ClientQueryOutcome {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
     let path = control_socket_path(state_dir);
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .ok()?;
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+        return ClientQueryOutcome::NotReachable;
+    };
     rt.block_on(async {
-        let stream = tokio::time::timeout(CLIENT_TIMEOUT, UnixStream::connect(&path))
-            .await
-            .ok()?
-            .ok()?;
+        let Ok(connected) = tokio::time::timeout(CLIENT_TIMEOUT, UnixStream::connect(&path)).await
+        else {
+            return ClientQueryOutcome::NotReachable;
+        };
+        let Ok(stream) = connected else {
+            return ClientQueryOutcome::NotReachable;
+        };
         let (read_half, mut write_half) = stream.into_split();
-        let line = serde_json::to_string(req).ok()?;
-        write_half.write_all(line.as_bytes()).await.ok()?;
-        write_half.write_all(b"\n").await.ok()?;
+        let Ok(line) = serde_json::to_string(req) else {
+            return ClientQueryOutcome::NotReachable;
+        };
+        if write_half.write_all(line.as_bytes()).await.is_err() {
+            return ClientQueryOutcome::NotReachable;
+        }
+        if write_half.write_all(b"\n").await.is_err() {
+            return ClientQueryOutcome::NotReachable;
+        }
 
         let mut reader = BufReader::new(read_half);
         let mut response = String::new();
-        let read = tokio::time::timeout(CLIENT_TIMEOUT, reader.read_line(&mut response))
-            .await
-            .ok()?
-            .ok()?;
-        if read == 0 || response.trim().is_empty() {
-            None
-        } else {
-            Some(response)
+        let Ok(read_result) =
+            tokio::time::timeout(read_timeout, reader.read_line(&mut response)).await
+        else {
+            return ClientQueryOutcome::TimedOut;
+        };
+        match read_result {
+            Ok(0) => ClientQueryOutcome::NotReachable,
+            Ok(_) if response.trim().is_empty() => ClientQueryOutcome::NotReachable,
+            Ok(_) => ClientQueryOutcome::Reached(response),
+            Err(_) => ClientQueryOutcome::NotReachable,
         }
     })
 }
 
 #[cfg(not(unix))]
-fn run_client_query(_state_dir: &Path, _req: &Request) -> Option<String> {
-    None
+fn run_client_query_with_timeout(
+    _state_dir: &Path,
+    _req: &Request,
+    _read_timeout: Duration,
+) -> ClientQueryOutcome {
+    // No Unix domain sockets on this platform (see module scope note).
+    ClientQueryOutcome::NotReachable
+}
+
+/// The short-timeout wrapper every op except `say`/`interrupt` keeps
+/// using unchanged: a control-channel round trip that either finishes
+/// well inside [`CLIENT_TIMEOUT`] or is treated as "no live server."
+fn run_client_query(state_dir: &Path, req: &Request) -> Option<String> {
+    match run_client_query_with_timeout(state_dir, req, CLIENT_TIMEOUT) {
+        ClientQueryOutcome::Reached(s) => Some(s),
+        ClientQueryOutcome::NotReachable | ClientQueryOutcome::TimedOut => None,
+    }
 }
 
 /// Ask a live server (if any) for its status doc. `None` means
@@ -601,26 +673,69 @@ pub fn run_query(
     serde_json::from_str(&line).ok()
 }
 
+/// Outcome of a control-channel round trip for an op that can legitimately
+/// take a long time to answer (`say`/`interrupt`, issue #206): unlike the
+/// fast ops (`status`/`roster`/`ping`/`query`/`revoke`, which stay
+/// `Option`-shaped via [`run_client_query`]), a caller here needs to tell
+/// "no live server at all" (`NotReachable`) apart from "a live server is
+/// still working on this, it just hasn't answered yet" (`TimedOut`) —
+/// `main.rs`'s `run_say`/`run_interrupt` report those as different,
+/// accurate messages instead of collapsing both into the same "no live
+/// `holler serve` process is reachable" text.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ControlOutcome<T> {
+    Reached(T),
+    NotReachable,
+    TimedOut,
+}
+
 /// `holler say <session> <text>` (issue #33): ask a live server (if any)
 /// to route a `prompt` to whichever connection currently hosts `session`
-/// and wait for its `reply` to finish. `None` means no live server is
-/// reachable at all — `holler say` has no local fallback (there is
-/// nothing to route to without a live roster).
-pub fn run_say(state_dir: &Path, session: String, text: String) -> Option<SayReply> {
+/// and wait for its `reply` to finish. Uses [`REPLY_TIMEOUT`], not
+/// [`CLIENT_TIMEOUT`], for the read step — the server's own wait for
+/// `say` is a real round trip to the target session
+/// (`registry.prompt(...)`), which can legitimately outlast a short
+/// local-loopback budget (issue #206). `NotReachable` means no live
+/// server is reachable at all — `holler say` has no local fallback
+/// (there is nothing to route to without a live roster). `TimedOut`
+/// means the connection to a live server was established fine, but no
+/// reply arrived within `REPLY_TIMEOUT` — the target session may still
+/// be working.
+pub fn run_say(state_dir: &Path, session: String, text: String) -> ControlOutcome<SayReply> {
     let req = Request::Say { session, text };
-    let line = run_client_query(state_dir, &req)?;
-    serde_json::from_str(&line).ok()
+    match run_client_query_with_timeout(state_dir, &req, REPLY_TIMEOUT) {
+        ClientQueryOutcome::Reached(line) => match serde_json::from_str(&line) {
+            Ok(reply) => ControlOutcome::Reached(reply),
+            // Matches today's `.ok()?` behavior on unparseable JSON: an
+            // answer that doesn't parse is treated the same as no live
+            // server at all, not as a distinct error shape.
+            Err(_) => ControlOutcome::NotReachable,
+        },
+        ClientQueryOutcome::NotReachable => ControlOutcome::NotReachable,
+        ClientQueryOutcome::TimedOut => ControlOutcome::TimedOut,
+    }
 }
 
 /// `holler interrupt <session>` (issue #34, ADR 0005): ask a live server
 /// (if any) to send a control-frame `interrupt` to whichever connection
-/// currently hosts `session` and wait for its outcome. `None` means no
-/// live server is reachable at all — `holler interrupt` has no local
-/// fallback, the same as `holler say`.
-pub fn run_interrupt(state_dir: &Path, session: String) -> Option<InterruptReply> {
+/// currently hosts `session` and wait for its outcome. Uses
+/// [`REPLY_TIMEOUT`] for the same reason [`run_say`] does (issue #206):
+/// even though the server's own `INTERRUPT_ACK_TIMEOUT` is much shorter
+/// than a `say` turn, sharing the generous read timeout here means a
+/// slow control-socket hop never gets misreported as "no live server."
+/// `NotReachable` means no live server is reachable at all — `holler
+/// interrupt` has no local fallback, the same as `holler say`.
+/// `TimedOut` means a live server never answered within `REPLY_TIMEOUT`.
+pub fn run_interrupt(state_dir: &Path, session: String) -> ControlOutcome<InterruptReply> {
     let req = Request::Interrupt { session };
-    let line = run_client_query(state_dir, &req)?;
-    serde_json::from_str(&line).ok()
+    match run_client_query_with_timeout(state_dir, &req, REPLY_TIMEOUT) {
+        ClientQueryOutcome::Reached(line) => match serde_json::from_str(&line) {
+            Ok(reply) => ControlOutcome::Reached(reply),
+            Err(_) => ControlOutcome::NotReachable,
+        },
+        ClientQueryOutcome::NotReachable => ControlOutcome::NotReachable,
+        ClientQueryOutcome::TimedOut => ControlOutcome::TimedOut,
+    }
 }
 
 /// `holler token delete` / `client detach` (issue #78): ask a live server
@@ -940,10 +1055,11 @@ mod tests {
             move || run_say(&dir, "alpha".to_string(), "hello".to_string())
         })
         .await
-        .unwrap()
-        .expect("the control socket answers even for an unrostered session");
+        .unwrap();
         match reply {
-            SayReply::Err { error } => assert_eq!(error.code, "unknown_session"),
+            ControlOutcome::Reached(SayReply::Err { error }) => {
+                assert_eq!(error.code, "unknown_session")
+            }
             other => panic!("expected SayReply::Err(unknown_session), got {other:?}"),
         }
 
@@ -998,10 +1114,9 @@ mod tests {
             move || run_say(&dir, "alpha".to_string(), "hello".to_string())
         })
         .await
-        .unwrap()
-        .expect("a live server relays the routed reply");
+        .unwrap();
         match reply {
-            SayReply::Ok { text, exit } => {
+            ControlOutcome::Reached(SayReply::Ok { text, exit }) => {
                 assert_eq!(text, "hi there");
                 assert_eq!(exit, Some(0));
             }
@@ -1034,10 +1149,11 @@ mod tests {
             move || run_interrupt(&dir, "alpha".to_string())
         })
         .await
-        .unwrap()
-        .expect("the control socket answers even for an unrostered session");
+        .unwrap();
         match reply {
-            InterruptReply::Err { error } => assert_eq!(error.code, "unknown_session"),
+            ControlOutcome::Reached(InterruptReply::Err { error }) => {
+                assert_eq!(error.code, "unknown_session")
+            }
             other => panic!("expected InterruptReply::Err(unknown_session), got {other:?}"),
         }
 
@@ -1078,9 +1194,11 @@ mod tests {
             move || run_interrupt(&dir, "alpha".to_string())
         })
         .await
-        .unwrap()
-        .expect("a live server relays the interrupt and its ack");
-        assert!(matches!(reply, InterruptReply::Ok));
+        .unwrap();
+        assert!(matches!(
+            reply,
+            ControlOutcome::Reached(InterruptReply::Ok)
+        ));
         responder.await.unwrap();
 
         server.abort();
@@ -1110,9 +1228,11 @@ mod tests {
             move || run_interrupt(&dir, "alpha".to_string())
         })
         .await
-        .unwrap()
-        .expect("the control socket answers even for a dead-connection session");
-        assert!(matches!(reply, InterruptReply::Disconnected));
+        .unwrap();
+        assert!(matches!(
+            reply,
+            ControlOutcome::Reached(InterruptReply::Disconnected)
+        ));
 
         server.abort();
     }
@@ -1166,5 +1286,69 @@ mod tests {
     fn run_revoke_with_no_server_running_is_none() {
         let dir = tempfile::tempdir().unwrap();
         assert!(run_revoke(dir.path(), "tok_1".to_string()).is_none());
+    }
+
+    // -------------------------------------------------------------
+    // Issue #206: the read step's timeout is now a parameter, distinct
+    // from "no live server reachable at all" — these two tests exercise
+    // `run_client_query_with_timeout` directly with a short custom
+    // timeout, never the real `REPLY_TIMEOUT` constant.
+    // -------------------------------------------------------------
+
+    #[tokio::test]
+    async fn run_client_query_with_timeout_reports_timed_out_when_the_server_is_slow() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = control_socket_path(dir.path());
+        let listener = UnixListener::bind(&path).expect("bind a fake control socket");
+
+        // A bare-bones handler that connects fine (so this is NOT the
+        // `NotReachable` case) but deliberately waits well past the
+        // caller's short read timeout before ever writing a response —
+        // mirrors a `say` still waiting on a slow/cold-starting harness
+        // (issue #206), without depending on the real server or the
+        // real `REPLY_TIMEOUT` constant.
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line).await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let _ = write_half.write_all(b"{}\n").await;
+            }
+        });
+
+        let outcome = tokio::task::spawn_blocking({
+            let dir = dir.path().to_path_buf();
+            move || run_client_query_with_timeout(&dir, &Request::Status, Duration::from_millis(50))
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, ClientQueryOutcome::TimedOut),
+            "expected TimedOut, got {outcome:?}"
+        );
+
+        server.abort();
+    }
+
+    #[test]
+    fn run_client_query_with_timeout_with_no_server_running_is_not_reachable() {
+        // No socket at all — distinct from the slow-server case above,
+        // which connects fine and only misses the read deadline. Both
+        // must be tellable apart by the caller (`run_say`/`run_interrupt`
+        // via `ControlOutcome`), so this asserts they land on different
+        // `ClientQueryOutcome` variants even with the identical short
+        // timeout.
+        let dir = tempfile::tempdir().unwrap();
+        let outcome =
+            run_client_query_with_timeout(dir.path(), &Request::Status, Duration::from_millis(50));
+        assert!(
+            matches!(outcome, ClientQueryOutcome::NotReachable),
+            "expected NotReachable, got {outcome:?}"
+        );
     }
 }
