@@ -428,6 +428,11 @@ async fn handle_control_conn(
             }
             Request::Revoke { token_id } => {
                 let closed = registry.remove(&token_id);
+                // A revoke is just as certain a "gone" as an explicit WS
+                // close (issue #80) — the roster must not make an operator
+                // wait out the TTL decay for a connection the server just
+                // force-closed itself.
+                roster.mark_gone(&token_id);
                 let reply = RevokeReply { closed };
                 serde_json::to_string(&reply).expect("RevokeReply always serializes")
             }

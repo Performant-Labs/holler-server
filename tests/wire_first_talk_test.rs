@@ -1142,7 +1142,13 @@ fn interrupt_reports_disconnected_when_the_connection_is_already_gone() {
     std::thread::sleep(Duration::from_millis(200));
 
     // This must fail quickly (well under `INTERRUPT_ACK_TIMEOUT`) and
-    // with a message distinct from the timeout case above.
+    // with a message distinct from the timeout case above. Since issue
+    // #80, the explicit close above marks the roster row `gone`
+    // immediately, so this now fails at the roster lookup itself
+    // (`unknown_session`) rather than reaching the registry and finding
+    // no live connection there (`InterruptOutcome::Disconnected`) — both
+    // are "the session is definitely gone," just surfaced a step
+    // earlier now that the roster knows it with certainty too.
     let started = std::time::Instant::now();
     let out = env.cmd().args(["interrupt", "alpha"]).output().unwrap();
     assert!(
@@ -1151,7 +1157,10 @@ fn interrupt_reports_disconnected_when_the_connection_is_already_gone() {
     );
     assert!(!out.status.success());
     let stderr = String::from_utf8(out.stderr).unwrap().to_lowercase();
-    assert!(stderr.contains("gone"), "{stderr:?}");
+    assert!(
+        stderr.contains("unknown session") || stderr.contains("gone"),
+        "{stderr:?}"
+    );
 }
 
 // ---------------------------------------------------------------------
