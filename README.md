@@ -55,14 +55,20 @@ holler say <session> "hello"
 
 ### Dev scripts
 
-Wraps steps 1–2 above per the org's `object:sub-object:verb` script-naming convention ([`Performant-Labs/playbook`](https://github.com/Performant-Labs/playbook/blob/main/frameworks/node/npm-scripts.md)), adapted for a Rust crate with no `package.json` — command names map to plain shell scripts:
+Wraps steps 1–2 above per the org's `object:sub-object:verb` script-naming convention ([`Performant-Labs/playbook`](https://github.com/Performant-Labs/playbook/blob/main/frameworks/node/npm-scripts.md)). This crate has no `package.json`, so `./scripts/run <name>` is the `npm run <name>` equivalent — the actual command you type, not just a documented mapping:
 
-| Command name | Script | Does |
-|---|---|---|
-| `app:local:run` | `scripts/local-run.sh` | Build, then run `holler serve` in the foreground (auto-creates `$HOLLER_STATE_DIR`/pepper if missing) |
-| `app:local:launch` | `scripts/local-launch.sh` | Same, but backgrounded, logging to `$HOLLER_STATE_DIR/server.log`; prints the next commands to run |
-| `app:local:stop` | `scripts/local-stop.sh` | Stop a `holler serve` started by `app:local:launch` |
-| `app:local:status` | `scripts/local-status.sh` | `holler roster` + `holler status` |
+```
+./scripts/run app:local:launch
+```
+
+| Command name | Does |
+|---|---|
+| `app:local:run` | Build, then run `holler serve` in the foreground (auto-creates `$HOLLER_STATE_DIR`/pepper if missing) |
+| `app:local:launch` | Same, but backgrounded, logging to `$HOLLER_STATE_DIR/server.log`; prints the next commands to run |
+| `app:local:stop` | Stop a `holler serve` started by `app:local:launch` |
+| `app:local:status` | `holler roster` + `holler status` |
+
+Each maps to a same-named `scripts/local-*.sh` file if you'd rather call the script directly.
 
 `HOLLER_STATE_DIR` defaults to `~/holler-state` if not exported.
 
