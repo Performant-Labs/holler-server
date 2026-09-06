@@ -26,6 +26,10 @@
 # placeholders are skipped). Each such issue's header table supplies:
 #   Test ID     -- e.g. TC-001, or hlrsvr-1000/hlrclnt-1000 once remapped
 #   Applies to  -- server / client / both
+#   Group       -- invocation / lifecycle / logging / io / platform /
+#                 concurrency / network / diagnostics / crypto (matches the
+#                 test-grp-* label; nil on the pre-existing TC-NNN cases
+#                 that predate this field, harmless -- nothing reads it yet)
 #   Automation  -- free-text pointer(s) to the automated assertion(s), or a
 #                 string starting with "manual" for manual-only cases
 #
@@ -80,6 +84,7 @@ def discover(gh)
       labels: issue.labels.map(&:name),
       id: field(body, 'Test ID'),
       applies: field(body, 'Applies to'),
+      group: field(body, 'Group'),
       automation: field(body, 'Automation')
     }
   end
