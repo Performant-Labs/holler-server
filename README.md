@@ -20,6 +20,23 @@ Nobody has shipped this exact cut. Several projects overlap a piece of it — Ho
 | **[Buzz](https://github.com/block/buzz)** | Relay as home; ACP body; presence and `!shutdown` are messages. | Same *layer*. Not a clone (no Nostr/nsec). Apache-2.0. |
 | **[Herdr](https://herdr.dev)** | PTY runtime; local socket; multi-remote ([#515](https://github.com/herdrdev/herdr/discussions/515)) is one TUI over many Herdr servers. | Closest *sibling*. Hub body, not the bus. Far box need not run it. Apache-2.0. |
 
+### Closest commercial near-miss: Warp
+
+A later survey (competitors to OpenAI/Anthropic — Google, Cursor, Windsurf, Devin, Replit, GitHub/VS Code, Amazon, Zed, Continue.dev, Amp, and an open-source-project cluster) found the same pattern everywhere: every serious vendor reinvented the same-account, single-identity remote control shown above. One is closer than the rest:
+
+**Warp is heterogeneous but cloud-routed and link-based; Holler is heterogeneous and self-hosted with real token identity and a persistent roster, not a one-off share link.**
+
+| | Warp | Holler |
+| --- | --- | --- |
+| Heterogeneous? | Yes — publishes Claude Code, Codex, OpenCode sessions | Yes — any harness that speaks ACP |
+| Hosting | Warp's cloud; you publish, Warp routes | Self-hosted; you run holler-server yourself |
+| Join mechanism | A shareable link; steering granted per-link, publisher revokes | Minted, revocable token: `mint`/`list`/`delete`/`ping`, hashed at rest |
+| What you're joining | A single published session via its link | A roster of named sessions across joined machines, with presence/TTL |
+| Trust model | Warp is in the middle of every session | Nothing in the middle — a direct WebSocket you control end to end |
+| Interrupt | Send input / approve / redirect via Warp's UI | A first-class control frame (ACP `session/cancel` + HTTP fallback); the session survives |
+
+Full competitive survey: [`docs/research-competitive-landscape.md`](https://github.com/Performant-Labs/holler-server/blob/research/grok-competitive-landscape/docs/research-competitive-landscape.md) (research memo, unmerged branch — discussion material, not yet folded into an ADR).
+
 Gap that remains — why Holler still exists: a **small server that mints a join token**, a **client on a box with no Herdr**, **OpenCode (then Claude) as adapters**, **interrupt as ACP cancel with the session still alive**, and **meta-O talking over CLI without SSH**.
 
 Full survey, including the same-machine tools, an X sampling, and the recommendations behind this decision: [ADR 0001](docs/adr/ADR-0001.md).
