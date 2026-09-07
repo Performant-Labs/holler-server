@@ -334,7 +334,7 @@ fn run_serve(
     // `holler serve`. When it does fire it goes through the logger, so it
     // is valid JSON in `json` mode rather than a stray prose line.
     if debug.is_on() {
-        holler_server::debug::info(debug, "logging_started")
+        holler_server::debug::info(debug, "cli", "logging_started")
             .field("format", debug.format.to_string())
             .field("note", "frames to stderr, secrets redacted")
             .emit();

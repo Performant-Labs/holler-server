@@ -287,6 +287,12 @@ impl Direction {
 /// gap before the first `k=v` pair.
 const TYPE_COLUMN_WIDTH: usize = 10;
 
+/// Width the `component` column is padded to in [`LogFormat::Text`]. The
+/// longest component name in use across this crate and holler-client's
+/// mirrored set is `session_manager` (15 chars); one space of slack
+/// keeps a gap before the `type` column.
+const COMPONENT_COLUMN_WIDTH: usize = 16;
+
 /// How many leading characters of an id/peer survive into a `text` line.
 /// Enough to stay distinctive past a `cli_`/`tok_` prefix while keeping
 /// the column narrow; `json` always carries the untruncated value.
@@ -323,6 +329,7 @@ struct JsonLine<'a> {
     ts: String,
     level: &'static str,
     verbosity: &'static str,
+    component: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     dir: Option<&'static str>,
     #[serde(rename = "type")]
@@ -348,6 +355,7 @@ pub struct Event<'a> {
     cfg: DebugConfig,
     severity: Severity,
     dir: Direction,
+    component: &'static str,
     kind: &'a str,
     id: Option<&'a str>,
     peer: Option<&'a str>,
@@ -356,33 +364,33 @@ pub struct Event<'a> {
 }
 
 /// A frame this process is sending.
-pub fn outgoing(cfg: DebugConfig, kind: &str) -> Event<'_> {
-    Event::new(cfg, Severity::Debug, Direction::Out, kind)
+pub fn outgoing<'k>(cfg: DebugConfig, component: &'static str, kind: &'k str) -> Event<'k> {
+    Event::new(cfg, Severity::Debug, Direction::Out, component, kind)
 }
 
 /// A frame this process just received.
-pub fn incoming(cfg: DebugConfig, kind: &str) -> Event<'_> {
-    Event::new(cfg, Severity::Debug, Direction::In, kind)
+pub fn incoming<'k>(cfg: DebugConfig, component: &'static str, kind: &'k str) -> Event<'k> {
+    Event::new(cfg, Severity::Debug, Direction::In, component, kind)
 }
 
 /// A local lifecycle event, not a frame — connect, disconnect,
 /// authenticated. Carries an `event` field instead of a direction, so
 /// every line in the stream still shares one grammar (issue #230).
-pub fn local(cfg: DebugConfig, kind: &str) -> Event<'_> {
-    Event::new(cfg, Severity::Debug, Direction::Local, kind)
+pub fn local<'k>(cfg: DebugConfig, component: &'static str, kind: &'k str) -> Event<'k> {
+    Event::new(cfg, Severity::Debug, Direction::Local, component, kind)
 }
 
 /// An operational fact worth recording whether or not debug logging is
 /// on — always emitted, in whichever [`LogFormat`] is configured.
-pub fn info(cfg: DebugConfig, kind: &str) -> Event<'_> {
-    Event::new(cfg, Severity::Info, Direction::Local, kind)
+pub fn info<'k>(cfg: DebugConfig, component: &'static str, kind: &'k str) -> Event<'k> {
+    Event::new(cfg, Severity::Info, Direction::Local, component, kind)
 }
 
 /// Something went wrong that an operator would alert on — always emitted,
 /// in whichever [`LogFormat`] is configured. These are the lines that used
 /// to be bare `eprintln!` text and so were invisible to a log analyzer.
-pub fn warn(cfg: DebugConfig, kind: &str) -> Event<'_> {
-    Event::new(cfg, Severity::Warn, Direction::Local, kind)
+pub fn warn<'k>(cfg: DebugConfig, component: &'static str, kind: &'k str) -> Event<'k> {
+    Event::new(cfg, Severity::Warn, Direction::Local, component, kind)
 }
 
 impl<'a> Event<'a> {
@@ -397,11 +405,18 @@ impl<'a> Event<'a> {
         }
     }
 
-    fn new(cfg: DebugConfig, severity: Severity, dir: Direction, kind: &'a str) -> Self {
+    fn new(
+        cfg: DebugConfig,
+        severity: Severity,
+        dir: Direction,
+        component: &'static str,
+        kind: &'a str,
+    ) -> Self {
         Event {
             cfg,
             severity,
             dir,
+            component,
             kind,
             id: None,
             peer: None,
@@ -478,11 +493,13 @@ impl<'a> Event<'a> {
 
     fn render_text(&self) -> String {
         let mut line = format!(
-            "{} {} {} {:<width$}",
+            "{} {} {} {:<cwidth$} {:<width$}",
             emission_ts(),
             self.severity.as_text(),
             self.dir.as_text(),
+            self.component,
             self.kind,
+            cwidth = COMPONENT_COLUMN_WIDTH,
             width = TYPE_COLUMN_WIDTH,
         );
         if let Some(id) = self.id {
@@ -513,6 +530,7 @@ impl<'a> Event<'a> {
             ts: emission_ts(),
             level: self.severity.as_str(),
             verbosity: self.cfg.level.as_str(),
+            component: self.component,
             dir: self.dir.as_json(),
             kind: self.kind,
             id: self.id,
@@ -831,14 +849,21 @@ mod tests {
 
     #[test]
     fn text_line_starts_with_timestamp_then_fixed_columns() {
-        let line = outgoing(noisy_text(), "prompt").id("abc123").render_text();
+        let line = outgoing(noisy_text(), "wire", "prompt").id("abc123").render_text();
         assert_eq!(&line[26..27], "Z", "ts should occupy the first column");
-        assert!(line.contains(" DEBUG -> prompt     "), "line was {line:?}");
+        let expected = format!(
+            " DEBUG -> {:<cwidth$} {:<width$}",
+            "wire",
+            "prompt",
+            cwidth = COMPONENT_COLUMN_WIDTH,
+            width = TYPE_COLUMN_WIDTH,
+        );
+        assert!(line.contains(&expected), "line was {line:?}");
     }
 
     #[test]
     fn json_line_is_a_single_parseable_object_with_ts_first() {
-        let line = incoming(noisy_json(), "reply")
+        let line = incoming(noisy_json(), "wire", "reply")
             .id("id-1")
             .peer("cli_e105a5cd")
             .render_json();
@@ -852,7 +877,7 @@ mod tests {
 
     #[test]
     fn json_nests_the_frame_as_an_object_not_a_string() {
-        let line = outgoing(noisy_json(), "prompt")
+        let line = outgoing(noisy_json(), "wire", "prompt")
             .frame(|| r#"{"v":1,"type":"prompt"}"#.to_string())
             .render_json();
         let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -867,7 +892,7 @@ mod tests {
             session: &'static str,
             done: bool,
         }
-        let line = incoming(noisy_json(), "reply")
+        let line = incoming(noisy_json(), "wire", "reply")
             .frame_of(|| Body {
                 session: "m1",
                 done: true,
@@ -884,7 +909,7 @@ mod tests {
         struct Body {
             credential: &'static str,
         }
-        let line = outgoing(noisy_json(), "join_ok")
+        let line = outgoing(noisy_json(), "wire", "join_ok")
             .frame_of(|| Body {
                 credential: "hlr_live_abc123",
             })
@@ -897,7 +922,7 @@ mod tests {
     #[test]
     fn json_carries_the_full_untruncated_id() {
         let long_id = "c14fb1a960b3d14d690e652e53b8b33a";
-        let line = outgoing(noisy_json(), "ping").id(long_id).render_json();
+        let line = outgoing(noisy_json(), "wire", "ping").id(long_id).render_json();
         let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(parsed["id"], long_id);
     }
@@ -905,7 +930,7 @@ mod tests {
     #[test]
     fn text_truncates_long_ids_for_scannability() {
         let long_id = "c14fb1a960b3d14d690e652e53b8b33a";
-        let line = outgoing(noisy_text(), "ping").id(long_id).render_text();
+        let line = outgoing(noisy_text(), "wire", "ping").id(long_id).render_text();
         assert!(line.contains("id=c14fb1a960b3"), "line was {line:?}");
         assert!(!line.contains(long_id));
     }
@@ -914,7 +939,7 @@ mod tests {
     fn quiet_never_materializes_the_frame() {
         let cfg = DebugConfig::new(DebugLevel::Quiet, LogFormat::Json);
         let mut called = false;
-        let line = outgoing(cfg, "prompt")
+        let line = outgoing(cfg, "wire", "prompt")
             .frame(|| {
                 called = true;
                 "{}".to_string()
@@ -930,7 +955,7 @@ mod tests {
     fn none_level_never_materializes_the_frame_either() {
         let cfg = DebugConfig::new(DebugLevel::None, LogFormat::Text);
         let mut called = false;
-        outgoing(cfg, "prompt")
+        outgoing(cfg, "wire", "prompt")
             .frame(|| {
                 called = true;
                 "{}".to_string()
@@ -942,7 +967,7 @@ mod tests {
 
     #[test]
     fn local_events_carry_an_event_field_and_no_direction() {
-        let line = local(noisy_json(), "conn")
+        let line = local(noisy_json(), "wire", "conn")
             .field("event", "authenticated")
             .field("addr", "127.0.0.1:42258")
             .render_json();
@@ -959,7 +984,7 @@ mod tests {
     #[test]
     fn warn_is_emitted_even_at_debug_level_none() {
         let cfg = DebugConfig::new(DebugLevel::None, LogFormat::Json);
-        let event = warn(cfg, "talklog").field("event", "persist_failed");
+        let event = warn(cfg, "wire", "talklog").field("event", "persist_failed");
         assert!(
             event.will_emit(),
             "a warn must survive DebugLevel::None — these lines used to be \
@@ -970,15 +995,15 @@ mod tests {
     #[test]
     fn info_is_emitted_even_at_debug_level_none() {
         let cfg = DebugConfig::new(DebugLevel::None, LogFormat::Text);
-        assert!(info(cfg, "logging_started").will_emit());
+        assert!(info(cfg, "wire", "logging_started").will_emit());
     }
 
     #[test]
     fn debug_severity_is_still_gated_by_debug_level() {
         let none = DebugConfig::new(DebugLevel::None, LogFormat::Json);
-        assert!(!outgoing(none, "prompt").will_emit());
+        assert!(!outgoing(none, "wire", "prompt").will_emit());
         let quiet = DebugConfig::new(DebugLevel::Quiet, LogFormat::Json);
-        assert!(outgoing(quiet, "prompt").will_emit());
+        assert!(outgoing(quiet, "wire", "prompt").will_emit());
     }
 
     #[test]
@@ -987,7 +1012,7 @@ mod tests {
         // does, so a warn below `DebugLevel::None` must not silently drop
         // the reason an operator needs.
         let cfg = DebugConfig::new(DebugLevel::None, LogFormat::Json);
-        let line = warn(cfg, "talklog")
+        let line = warn(cfg, "wire", "talklog")
             .field("event", "persist_failed")
             .field("session", "m1")
             .field("reason", "No space left on device")
@@ -1004,11 +1029,11 @@ mod tests {
     fn json_level_reflects_severity_not_a_constant() {
         let cfg = noisy_json();
         let d: serde_json::Value =
-            serde_json::from_str(&outgoing(cfg, "prompt").render_json()).unwrap();
+            serde_json::from_str(&outgoing(cfg, "wire", "prompt").render_json()).unwrap();
         let i: serde_json::Value =
-            serde_json::from_str(&info(cfg, "logging_started").render_json()).unwrap();
+            serde_json::from_str(&info(cfg, "wire", "logging_started").render_json()).unwrap();
         let w: serde_json::Value =
-            serde_json::from_str(&warn(cfg, "talklog").render_json()).unwrap();
+            serde_json::from_str(&warn(cfg, "wire", "talklog").render_json()).unwrap();
         assert_eq!(d["level"], "debug");
         assert_eq!(i["level"], "info");
         assert_eq!(w["level"], "warn");
@@ -1020,9 +1045,9 @@ mod tests {
         // columns after them still line up.
         let cfg = noisy_text();
         for line in [
-            outgoing(cfg, "prompt").render_text(),
-            info(cfg, "logging_started").render_text(),
-            warn(cfg, "talklog").render_text(),
+            outgoing(cfg, "wire", "prompt").render_text(),
+            info(cfg, "wire", "logging_started").render_text(),
+            warn(cfg, "wire", "talklog").render_text(),
         ] {
             assert_eq!(&line[27..28], " ", "line was {line:?}");
             assert_eq!(&line[33..34], " ", "severity column width, line {line:?}");
@@ -1036,10 +1061,10 @@ mod tests {
         // envelope keys, so a field named `verbosity`/`ts`/`level`/`type`
         // would emit a duplicate JSON key. Callers must not reuse these
         // names; this pins the envelope key set that is off limits.
-        let line = info(noisy_json(), "logging_started")
+        let line = info(noisy_json(), "wire", "logging_started")
             .field("format", "json")
             .render_json();
-        for key in ["ts", "level", "verbosity", "type"] {
+        for key in ["ts", "level", "verbosity", "component", "type"] {
             let occurrences = line.matches(&format!("\"{key}\":")).count();
             assert_eq!(occurrences, 1, "duplicate {key:?} key in {line:?}");
         }
@@ -1050,10 +1075,36 @@ mod tests {
 
     #[test]
     fn extra_fields_are_flattened_not_nested() {
-        let line = outgoing(noisy_json(), "query")
+        let line = outgoing(noisy_json(), "wire", "query")
             .field("cmd", "status")
             .render_json();
         let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(parsed["cmd"], "status", "line was {line:?}");
+    }
+
+    // --- component column (holler-server#290) ---
+
+    #[test]
+    fn text_line_has_a_padded_component_column_before_kind() {
+        let line = outgoing(noisy_text(), "registry", "prompt").render_text();
+        let expected_component = format!("{:<width$}", "registry", width = COMPONENT_COLUMN_WIDTH);
+        let expected_kind = format!("{:<width$}", "prompt", width = TYPE_COLUMN_WIDTH);
+        let component_pos = line
+            .find(&expected_component)
+            .expect("padded component column must appear in the line");
+        let kind_pos = line
+            .find(&expected_kind)
+            .expect("padded kind column must appear in the line");
+        assert!(
+            component_pos < kind_pos,
+            "component column must come before kind column, line was {line:?}"
+        );
+    }
+
+    #[test]
+    fn json_line_carries_component_as_a_top_level_field() {
+        let line = outgoing(noisy_json(), "registry", "prompt").render_json();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["component"], "registry", "line was {line:?}");
     }
 }

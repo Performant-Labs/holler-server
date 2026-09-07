@@ -163,7 +163,7 @@ impl TalkLog {
     /// is a `warn`: emitted at every debug level, but through the logger
     /// so it is valid JSON in `json` mode.
     fn warn_persist_failed(&self, session: &str, e: &std::io::Error) {
-        debug::warn(self.debug, "talklog")
+        debug::warn(self.debug, "talklog", "talklog")
             .field("event", "persist_failed")
             .field("session", session)
             .field("reason", e.to_string())

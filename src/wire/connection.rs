@@ -164,7 +164,7 @@ pub async fn handle_connection(
 ) {
     let peer_ip = peer.ip();
     if ctx.lockout.is_locked_out(peer_ip) {
-        debug::local(ctx.debug, "conn")
+        debug::local(ctx.debug, "wire", "conn")
             .field("event", "refused")
             .field("reason", "locked_out")
             .field("addr", peer.to_string())
@@ -265,7 +265,7 @@ pub async fn handle_connection(
             // just a credential mismatch. See `lockout`'s module doc for why
             // that's the deliberate choice, not an oversight.
             ctx.lockout.record_failure(peer_ip);
-            debug::local(ctx.debug, "conn")
+            debug::local(ctx.debug, "wire", "conn")
                 .field("event", "auth_rejected")
                 .peer(&redact("token_id", &token_id))
                 .field("addr", peer.to_string())
@@ -298,7 +298,7 @@ pub async fn handle_connection(
         verified.machine.clone(),
         out_tx,
     );
-    debug::local(ctx.debug, "conn")
+    debug::local(ctx.debug, "wire", "conn")
         .field("event", "authenticated")
         .peer(&redact("token_id", &verified.token_id))
         .field("addr", peer.to_string())
@@ -392,7 +392,7 @@ pub async fn handle_connection(
     if certain_close {
         ctx.roster.mark_gone(&verified.token_id);
     }
-    debug::local(ctx.debug, "conn")
+    debug::local(ctx.debug, "wire", "conn")
         .field("event", "disconnected")
         .peer(&redact("token_id", &verified.token_id))
         .field("addr", peer.to_string())
@@ -419,7 +419,7 @@ async fn handle_join(
     let token_id = envelope.from.clone();
     match ctx.store.redeem(&token_id, secret, hostname.to_string()) {
         Ok(result) => {
-            debug::local(ctx.debug, "conn")
+            debug::local(ctx.debug, "wire", "conn")
                 .field("event", "join_ok")
                 .peer(&redact("token_id", &token_id))
                 .field("addr", peer.to_string())
@@ -442,7 +442,7 @@ async fn handle_join(
             // bad join secret is exactly the kind of connection noise this
             // control targets.
             ctx.lockout.record_failure(peer_ip);
-            debug::local(ctx.debug, "conn")
+            debug::local(ctx.debug, "wire", "conn")
                 .field("event", "join_rejected")
                 .peer(&redact("token_id", &token_id))
                 .field("addr", peer.to_string())
@@ -632,7 +632,7 @@ async fn handle_frame(
                 .cloned()
                 .chain(reply_body.chunks.iter().cloned())
                 .collect();
-            let mut event = debug::incoming(ctx.debug, "reply")
+            let mut event = debug::incoming(ctx.debug, "wire", "reply")
                 .id(&envelope.id)
                 .peer(client_id)
                 .field("session", reply_body.session.as_str())
@@ -715,5 +715,5 @@ fn encode(envelope: &Envelope) -> String {
 /// an `event` field. Issue #230: every line in the stream shares one
 /// grammar, so a parser never has to special-case these.
 pub(crate) fn trace(ctx: &ConnectionContext, msg: &str) {
-    debug::local(ctx.debug, "conn").field("event", msg).emit();
+    debug::local(ctx.debug, "wire", "conn").field("event", msg).emit();
 }
