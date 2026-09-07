@@ -1355,4 +1355,24 @@ mod tests {
             "expected NotReachable, got {outcome:?}"
         );
     }
+
+    /// hlrsvr-1802 (security/crypto group): the control socket must be
+    /// owner-only (`0600`), not whatever the process umask would default
+    /// a new file to -- it's a local admin channel (`roster`/`say`/
+    /// `interrupt`/`status`) with no auth of its own beyond filesystem
+    /// permissions, unlike the wire protocol's token-based auth.
+    // `bind_control_socket` calls `tokio::net::UnixListener::bind`, which
+    // needs a runtime context even though the function itself is sync —
+    // hence `#[tokio::test]`, same as `bind_control_socket_refuses_while_a_live_listener_owns_the_path` above.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn control_socket_is_restricted_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _listener = bind_control_socket(dir.path()).expect("bind control socket");
+        let path = control_socket_path(dir.path());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "control socket should be owner-only, got {mode:o}");
+    }
 }
