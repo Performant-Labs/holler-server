@@ -29,7 +29,11 @@ client-only cases (see [holler-server#98](https://github.com/Performant-Labs/hol
 the master catalog, for the full contract). Each carries a `Test ID` (`hlrsvr-NNNN` /
 `hlrclnt-NNNN`), a `Group`, and — for automated cases — an `Automation` field pointing at
 the real committed test instead of a prose description (git is the source of truth for
-what an automated case actually does).
+what an automated case actually does). Cases also carry three script-selectable label
+axes — `test-grp-*` (which group), `test-cat-*` (why/when you'd run it), and `test-tag-*`
+(open-ended cross-cutting properties such as `alters-db` — see [issue #98](https://github.com/Performant-Labs/holler-server/issues/98)'s
+"Label axes" section, and issue [#304](https://github.com/Performant-Labs/holler-server/issues/304)
+for the `--tag`/`--tag-invert` selection syntax, currently being implemented).
 
 ### Running one ticket's test — the easy way
 
