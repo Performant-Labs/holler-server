@@ -161,6 +161,7 @@ ruled out).
     build passing step 9 is not evidence the uploaded artifact works; only downloading and
     running the real thing is.
 
-For the actual checklist to run through each time (not just the narrative above), see this
-repo's pinned release-checklist issue — [#301](https://github.com/Performant-Labs/holler-server/issues/301)
-for the first release; a fresh one gets filed per release going forward.
+For the actual checklist to run through each time (not just the narrative above), copy
+[#301](https://github.com/Performant-Labs/holler-server/issues/301) — the reusable, versionless
+template — into a new issue titled `Release checklist: vX.Y.Z`, and fill in that copy. Don't
+check boxes on #301 itself.
