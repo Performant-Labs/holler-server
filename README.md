@@ -17,7 +17,7 @@ Holler is the missing talk circuit between coding-agent sessions on different ma
 
 ## Quickstart
 
-This repo is the server half of the circuit. A full round-trip also needs [holler-client](https://github.com/Performant-Labs/holler-client) running on the machine you're joining — this repo alone gets you through minting a token, not a live prompt/reply exchange.
+This repo is the server half of the circuit. A full round-trip also needs [holler-client](https://github.com/Performant-Labs/holler-client) ([latest release](https://github.com/Performant-Labs/holler-client/releases/latest)) running on the machine you're joining — this repo alone gets you through minting a token, not a live prompt/reply exchange.
 
 ```
 # 1. Build
@@ -150,4 +150,4 @@ License is `AGPL-3.0-or-later` (see [`LICENSE`](LICENSE) and [ADR-0016](https://
 
 ## Companion repo
 
-[holler-client](https://github.com/Performant-Labs/holler-client) — the client half of the circuit: joins with a server-minted token and drives the ACP subprocess on the far machine.
+[holler-client](https://github.com/Performant-Labs/holler-client) — the client half of the circuit: joins with a server-minted token and drives the ACP subprocess on the far machine. [Latest release](https://github.com/Performant-Labs/holler-client/releases/latest) (always the newest tag — this link never goes stale).
