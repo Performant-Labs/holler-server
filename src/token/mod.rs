@@ -1175,6 +1175,65 @@ mod tests {
         assert_eq!(records[0].machine.as_deref(), Some("first.local"));
     }
 
+    /// hlrsvr-1504 (Concurrency & Rapid Requests): two real OS threads
+    /// racing `redeem_with_pepper` against the SAME one-time token at
+    /// (as close as the OS scheduler allows to) the same instant --
+    /// `with_lock`'s exclusive file lock is what's actually supposed to
+    /// serialize this (same lock `concurrent_mints_from_two_threads_do_not_lose_a_write`
+    /// above proves for `mint`), so this is the redeem-side half of that
+    /// same guarantee: exactly one of N simultaneous redeem attempts on
+    /// one token must win, the rest must fail closed with
+    /// `AlreadyBound`, and the stored record must reflect exactly one
+    /// bind -- never two, never a corrupted/partial write.
+    #[test]
+    fn concurrent_redeems_of_the_same_token_exactly_one_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(store_in(dir.path()));
+        let minted = store
+            .mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL)
+            .unwrap();
+
+        const THREADS: usize = 8;
+        let token_id = minted.token_id.clone();
+        let secret = minted.secret.clone();
+        let handles: Vec<_> = (0..THREADS)
+            .map(|i| {
+                let store = store.clone();
+                let token_id = token_id.clone();
+                let secret = secret.clone();
+                std::thread::spawn(move || {
+                    store.redeem_with_pepper(TEST_PEPPER, &token_id, &secret, format!("racer-{i}.local"))
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let wins = results.iter().filter(|r| r.is_ok()).count();
+        let already_bound_losses = results
+            .iter()
+            .filter(|r| matches!(r, Err(TokenError::AlreadyBound(_))))
+            .count();
+        assert_eq!(wins, 1, "exactly one racer must win the redeem, got {wins}: {results:?}");
+        assert_eq!(
+            already_bound_losses,
+            THREADS - 1,
+            "every loser must fail closed with AlreadyBound specifically, not some other \
+             error (a lost/corrupted update could show up as a different failure or a \
+             silent extra success): {results:?}"
+        );
+
+        // Exactly one bound record exists, with exactly one racer's
+        // machine name -- not a torn/duplicated write from two threads
+        // both thinking they held the lock.
+        let records = store.load().unwrap();
+        assert_eq!(records.len(), 1, "redeem must not create extra records: {records:?}");
+        let bound_machine = records[0].machine.as_deref().unwrap();
+        assert!(
+            bound_machine.starts_with("racer-") && bound_machine.ends_with(".local"),
+            "unexpected machine value, suggests a torn write: {bound_machine}"
+        );
+    }
+
     #[test]
     fn redeem_invalidated_token_fails_with_invalidated() {
         let dir = tempfile::tempdir().unwrap();
