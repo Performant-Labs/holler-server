@@ -9,6 +9,12 @@ backfilled with pre-decision history.
 
 ## [Unreleased]
 
+### Enhancements
+
+- `holler-server answer <session> <choice>` control path (issue #382) — answer a
+  question/permission currently blocking a session's turn, the same shape as `interrupt`
+  (a new `answer` wire message type, mirrored in `holler-client`).
+
 ## [0.1.0] - 2026-09-07
 
 First tagged release. Covers everything since [ADR 0014](docs/adr/ADR-0014.md)'s versioning

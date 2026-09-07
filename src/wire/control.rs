@@ -33,7 +33,7 @@ use super::roster::Roster;
 use super::talklog::TalkLog;
 
 use super::query;
-use super::registry::{InterruptOutcome, PromptOutcome, QueryOutcome};
+use super::registry::{AnswerOutcome, InterruptOutcome, PromptOutcome, QueryOutcome};
 
 const CONTROL_SOCKET_NAME: &str = "control.sock";
 
@@ -114,6 +114,11 @@ enum Request {
     /// session's in-flight turn — a **control** frame, resolved via the
     /// roster the same way `Say` is, but never queued behind a `prompt`.
     Interrupt { session: String },
+    /// `holler-server answer <session> <choice>` (issue #382): answer a
+    /// question/permission currently blocking a session's turn — a
+    /// **control** frame, resolved via the roster the same way `Say`/
+    /// `Interrupt` are, but never queued behind a `prompt`.
+    Answer { session: String, choice: String },
     /// `holler-server token delete` / `client detach` (issue #78): after the
     /// on-disk revoke (`TokenStore::delete`) succeeds, ask a live `holler
     /// serve` process to force-close `token_id`'s live connection too, so
@@ -183,6 +188,23 @@ pub enum SayReply {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum InterruptReply {
+    Ok,
+    TimedOut,
+    Disconnected,
+    Err { error: ErrorBody },
+}
+
+/// Answer to a [`Request::Answer`] (issue #382): the client `ack`ed the
+/// reply (`Ok`), the client answered with its own `error` instead (e.g.
+/// no question/permission pending, or an unresolvable `choice` —
+/// `Err`), the connection is alive but no reply arrived within
+/// [`super::registry::ANSWER_ACK_TIMEOUT`] (`TimedOut`), the connection
+/// is gone (`Disconnected`), or this server's own `unknown_session` when
+/// the roster names no live connection for the session at all (`Err`,
+/// same shape).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum AnswerReply {
     Ok,
     TimedOut,
     Disconnected,
@@ -520,6 +542,30 @@ async fn handle_control_conn(
                 };
                 serde_json::to_string(&reply).expect("InterruptReply always serializes")
             }
+            Request::Answer { session, choice } => {
+                let reply = match roster.resolve_session(&session) {
+                    None => AnswerReply::Err {
+                        error: ErrorBody {
+                            code: CODE_UNKNOWN_SESSION.to_string(),
+                            cmd: None,
+                            message: Some(format!("unknown session: {session}")),
+                        },
+                    },
+                    Some(token_id) => {
+                        let answer_id = super::hello::new_id();
+                        match registry
+                            .answer(&token_id, answer_id, session.clone(), choice.clone())
+                            .await
+                        {
+                            AnswerOutcome::Acked => AnswerReply::Ok,
+                            AnswerOutcome::Err(body) => AnswerReply::Err { error: body },
+                            AnswerOutcome::TimedOut => AnswerReply::TimedOut,
+                            AnswerOutcome::Disconnected => AnswerReply::Disconnected,
+                        }
+                    }
+                };
+                serde_json::to_string(&reply).expect("AnswerReply always serializes")
+            }
             Request::Revoke { token_id } => {
                 let closed = registry.remove(&token_id);
                 // A revoke is just as certain a "gone" as an explicit WS
@@ -743,6 +789,27 @@ pub fn run_say(state_dir: &Path, session: String, text: String) -> ControlOutcom
 /// `TimedOut` means a live server never answered within `REPLY_TIMEOUT`.
 pub fn run_interrupt(state_dir: &Path, session: String) -> ControlOutcome<InterruptReply> {
     let req = Request::Interrupt { session };
+    match run_client_query_with_timeout(state_dir, &req, REPLY_TIMEOUT) {
+        ClientQueryOutcome::Reached(line) => match serde_json::from_str(&line) {
+            Ok(reply) => ControlOutcome::Reached(reply),
+            Err(_) => ControlOutcome::NotReachable,
+        },
+        ClientQueryOutcome::NotReachable => ControlOutcome::NotReachable,
+        ClientQueryOutcome::TimedOut => ControlOutcome::TimedOut,
+    }
+}
+
+/// `holler-server answer <session> <choice>` (issue #382): ask a live
+/// server (if any) to send a control-frame `answer` to whichever
+/// connection currently hosts `session` and wait for its outcome. Uses
+/// [`REPLY_TIMEOUT`] for the same reason [`run_say`]/[`run_interrupt`]
+/// do (issue #206): even though the server's own `ANSWER_ACK_TIMEOUT` is
+/// much shorter, sharing the generous read timeout here means a slow
+/// control-socket hop never gets misreported as "no live server."
+/// `NotReachable` means no live server is reachable at all. `TimedOut`
+/// means a live server never answered within `REPLY_TIMEOUT`.
+pub fn run_answer(state_dir: &Path, session: String, choice: String) -> ControlOutcome<AnswerReply> {
+    let req = Request::Answer { session, choice };
     match run_client_query_with_timeout(state_dir, &req, REPLY_TIMEOUT) {
         ClientQueryOutcome::Reached(line) => match serde_json::from_str(&line) {
             Ok(reply) => ControlOutcome::Reached(reply),

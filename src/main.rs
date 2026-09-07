@@ -166,6 +166,19 @@ enum Commands {
     /// cancel within the interrupt's own short timeout — "may not have
     /// landed," distinct from "not connected" (issue #54).
     Interrupt { session: String },
+    /// `holler-server answer <session> <choice>`: answer a
+    /// question/permission currently blocking a session's turn (issue
+    /// #382) — a **control** frame, the same as `interrupt`: it reaches
+    /// the session's connection immediately, routed by the roster the
+    /// same way `say`/`interrupt` are. `<choice>` is opaque to this
+    /// server — the attached driver resolves it against whichever
+    /// question/permission is actually pending (an option index or
+    /// exact label for a question; `once`/`always`/`reject` for a
+    /// permission). Reports `unknown_session` if the roster does not
+    /// know `<session>`; reports the client's own error if nothing is
+    /// actually pending, or `<choice>` does not resolve to a real
+    /// option.
+    Answer { session: String, choice: String },
 }
 
 /// The four `query` `cmd`s the protocol defines (spec §7). `holler
@@ -271,6 +284,7 @@ fn main() {
         Commands::Roster { json } => run_roster(json),
         Commands::Say { session, text } => run_say(session, text),
         Commands::Interrupt { session } => run_interrupt(session),
+        Commands::Answer { session, choice } => run_answer(session, choice),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -596,6 +610,47 @@ fn run_interrupt(session: String) -> Result<(), Box<dyn std::error::Error>> {
         // ack never arrived within `INTERRUPT_ACK_TIMEOUT`).
         wire::control::ControlOutcome::TimedOut => Err(format!(
             "interrupt to {session:?} timed out waiting for a reply from the \
+             server — the session may still be working; try `holler-server status` \
+             to check whether the server is still up"
+        )
+        .into()),
+        wire::control::ControlOutcome::NotReachable => {
+            Err("no live `holler-server serve` process is reachable on this host".into())
+        }
+    }
+}
+
+/// `holler-server answer <session> <choice>` (issue #382): reach a live
+/// `holler-server serve` process over the control channel and send a
+/// control-frame `answer` to whichever connection the roster says hosts
+/// `<session>`. No local fallback — there is no roster to consult
+/// without a live server. `<choice>` is opaque to this CLI: the attached
+/// driver resolves it against whichever question/permission is actually
+/// pending, so a rejected choice comes back as the client's own error,
+/// not a local validation failure here.
+fn run_answer(session: String, choice: String) -> Result<(), Box<dyn std::error::Error>> {
+    let store = TokenStore::open()?;
+    let state_dir = store.dir().to_path_buf();
+    match wire::control::run_answer(&state_dir, session.clone(), choice) {
+        wire::control::ControlOutcome::Reached(wire::control::AnswerReply::Ok) => {
+            println!("answered {session}");
+            Ok(())
+        }
+        wire::control::ControlOutcome::Reached(wire::control::AnswerReply::TimedOut) => {
+            Err(format!(
+                "answer sent to {session:?}, but no ack arrived in time — \
+                 the connection is alive but the reply may not have landed"
+            )
+            .into())
+        }
+        wire::control::ControlOutcome::Reached(wire::control::AnswerReply::Disconnected) => {
+            Err(format!("session {session:?}'s connection is gone").into())
+        }
+        wire::control::ControlOutcome::Reached(wire::control::AnswerReply::Err { error }) => {
+            Err(format!("{}: {}", error.code, error.message.unwrap_or_default()).into())
+        }
+        wire::control::ControlOutcome::TimedOut => Err(format!(
+            "answer to {session:?} timed out waiting for a reply from the \
              server — the session may still be working; try `holler-server status` \
              to check whether the server is still up"
         )

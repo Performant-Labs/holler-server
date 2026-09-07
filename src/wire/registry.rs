@@ -69,6 +69,16 @@ pub const PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
 /// loopback hop; revisit once real interrupt latency is observed.
 pub const INTERRUPT_ACK_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long [`Registry::answer`] waits for the matching `ack` before
+/// reporting [`AnswerOutcome::TimedOut`] (holler-server issue #382).
+/// Deliberately the same budget as [`INTERRUPT_ACK_TIMEOUT`] rather than
+/// a fresh magic number: an `answer`'s client-side work (POST the reply
+/// to the attached agent's real HTTP endpoint) is the same order of
+/// magnitude as `interrupt`'s HTTP fallback POST — a single local-ish
+/// round trip, not a real model turn — so the same "generous for one
+/// loopback-adjacent hop" reasoning applies unchanged.
+pub const ANSWER_ACK_TIMEOUT: Duration = INTERRUPT_ACK_TIMEOUT;
+
 /// The outcome of [`Registry::query`]. `Disconnected` covers every
 /// failure mode uniformly (no such connection, the outbound channel is
 /// closed, or no reply arrived within [`QUERY_TIMEOUT`]) — mirrors
@@ -139,6 +149,36 @@ pub enum InterruptOutcome {
     Disconnected,
 }
 
+/// The outcome of [`Registry::answer`] (holler-server issue #382). Unlike
+/// [`InterruptOutcome`], a well-formed `Err` is expected often enough to
+/// deserve its own case (an invalid choice, or no question/permission
+/// actually pending for the session right now) — mirrors
+/// [`PromptOutcome::Err`]/[`QueryOutcome::Err`]'s "the client answered
+/// with its own typed failure" shape rather than collapsing that into a
+/// confusing `TimedOut`.
+pub enum AnswerOutcome {
+    /// The client sent `ack` (`of` matching this answer's id) within
+    /// [`ANSWER_ACK_TIMEOUT`] — the reply was applied.
+    Acked,
+    /// The client answered with its own `error` frame instead of an
+    /// `ack` — e.g. no question/permission is pending for this session
+    /// right now, or `choice` did not resolve to a real option.
+    Err(ErrorBody),
+    /// [`ANSWER_ACK_TIMEOUT`] elapsed with no matching `ack`/`error`, but
+    /// the connection is (as of the check right after) still registered.
+    TimedOut,
+    /// No such connection at all, or it closed (registry entry removed)
+    /// before or while this answer was outstanding.
+    Disconnected,
+}
+
+/// One reply this process's pending [`Registry::answer`] is waiting on:
+/// either the matching `ack` or the client's own `error` in its place.
+enum PendingAnswerReply {
+    Acked,
+    Err(ErrorBody),
+}
+
 /// One live connection's outward-facing handle: enough for the registry
 /// to push frames at it (`ping`, `query`) and to answer `holler
 /// status`'s client count / hostnames.
@@ -169,6 +209,14 @@ struct Entry {
     /// not a queued prompt, and must resolve/expire independently of any
     /// `prompt` in flight on the same connection.
     pending_interrupts: Mutex<HashMap<String, oneshot::Sender<()>>>,
+    /// Outstanding outbound `answer`s this connection has not yet
+    /// resolved, keyed by the answer envelope's `id` (which the `ack`
+    /// body's `of` must echo back, or which a same-id `error` frame
+    /// answers instead). Its own map, never `pending_interrupts` —
+    /// holler-server issue #382's `answer` is a distinct control frame
+    /// with its own outcome shape ([`AnswerOutcome`] carries a real
+    /// `Err`, unlike [`InterruptOutcome`]).
+    pending_answers: Mutex<HashMap<String, oneshot::Sender<PendingAnswerReply>>>,
 }
 
 /// Shared, process-wide table of live connections, keyed by `token_id`,
@@ -232,6 +280,7 @@ impl Registry {
                     pending_queries: Mutex::new(HashMap::new()),
                     pending_prompts: Mutex::new(HashMap::new()),
                     pending_interrupts: Mutex::new(HashMap::new()),
+                    pending_answers: Mutex::new(HashMap::new()),
                 },
             )
         };
@@ -888,6 +937,157 @@ impl Registry {
             }
         }
     }
+
+    /// Send `answer` for `session` to `token_id`'s live connection and
+    /// wait for the matching `ack` or `error` (holler-server issue #382).
+    /// A **control** frame, the same as [`Registry::interrupt`]: never
+    /// touches `pending_prompts`, so it reaches the connection
+    /// immediately even while a `prompt`/`interrupt` for this (or a
+    /// sibling) session is still in flight on the same connection.
+    pub async fn answer(
+        &self,
+        token_id: &str,
+        answer_id: String,
+        session: String,
+        choice: String,
+    ) -> AnswerOutcome {
+        let out_tx = {
+            let entries = self.entries.lock().expect("registry mutex poisoned");
+            match entries.get(token_id) {
+                Some(entry) => entry.out_tx.clone(),
+                None => return AnswerOutcome::Disconnected,
+            }
+        };
+
+        let (tx, rx) = oneshot::channel();
+        {
+            let entries = self.entries.lock().expect("registry mutex poisoned");
+            let Some(entry) = entries.get(token_id) else {
+                return AnswerOutcome::Disconnected;
+            };
+            let mut pending = entry
+                .pending_answers
+                .lock()
+                .expect("pending-answer mutex poisoned");
+            pending.insert(answer_id.clone(), tx);
+        }
+
+        let envelope =
+            crate::wire::hello::new_answer_envelope(&answer_id, session.clone(), choice.clone());
+        debug::outgoing(self.debug, "registry", "answer")
+            .id(&answer_id)
+            .peer(token_id)
+            .field("session", session.as_str())
+            .field("choice", choice.as_str())
+            .frame_of(|| &envelope)
+            .emit();
+        if out_tx.send(envelope).is_err() {
+            self.forget_pending_answer(token_id, &answer_id);
+            return AnswerOutcome::Disconnected;
+        }
+
+        match tokio::time::timeout(ANSWER_ACK_TIMEOUT, rx).await {
+            Ok(Ok(PendingAnswerReply::Acked)) => {
+                debug::incoming(self.debug, "registry", "ack")
+                    .id(&answer_id)
+                    .peer(token_id)
+                    .field("session", session.as_str())
+                    .field("outcome", "acked")
+                    .emit();
+                AnswerOutcome::Acked
+            }
+            Ok(Ok(PendingAnswerReply::Err(body))) => {
+                debug::incoming(self.debug, "registry", "error")
+                    .id(&answer_id)
+                    .peer(token_id)
+                    .field("session", session.as_str())
+                    .field("outcome", "err")
+                    .frame_of(|| &body)
+                    .emit();
+                AnswerOutcome::Err(body)
+            }
+            // The `oneshot::Sender` was dropped without sending — only
+            // happens when `Registry::remove` drops this connection's
+            // whole `Entry` out from under an in-flight `answer`.
+            Ok(Err(_)) => {
+                debug::incoming(self.debug, "registry", "ack")
+                    .id(&answer_id)
+                    .peer(token_id)
+                    .field("session", session.as_str())
+                    .field("outcome", "disconnected")
+                    .emit();
+                AnswerOutcome::Disconnected
+            }
+            Err(_) => {
+                self.forget_pending_answer(token_id, &answer_id);
+                let entries = self.entries.lock().expect("registry mutex poisoned");
+                if entries.contains_key(token_id) {
+                    debug::incoming(self.debug, "registry", "ack")
+                        .id(&answer_id)
+                        .peer(token_id)
+                        .field("session", session.as_str())
+                        .field("outcome", "timeout")
+                        .emit();
+                    AnswerOutcome::TimedOut
+                } else {
+                    debug::incoming(self.debug, "registry", "ack")
+                        .id(&answer_id)
+                        .peer(token_id)
+                        .field("session", session.as_str())
+                        .field("outcome", "disconnected")
+                        .emit();
+                    AnswerOutcome::Disconnected
+                }
+            }
+        }
+    }
+
+    fn forget_pending_answer(&self, token_id: &str, answer_id: &str) {
+        let entries = self.entries.lock().expect("registry mutex poisoned");
+        if let Some(entry) = entries.get(token_id) {
+            let mut pending = entry
+                .pending_answers
+                .lock()
+                .expect("pending-answer mutex poisoned");
+            pending.remove(answer_id);
+        }
+    }
+
+    /// Called from a connection task when an `ack` arrives: resolves the
+    /// matching pending outbound `answer`, if any. `of_id` is the `ack`
+    /// body's `of` field — an `ack` with no `of`, or one that matches no
+    /// outstanding answer, is a no-op (fail-closed, same as
+    /// [`Registry::resolve_interrupt_ack`]).
+    pub fn resolve_answer_ack(&self, token_id: &str, of_id: &str) {
+        let entries = self.entries.lock().expect("registry mutex poisoned");
+        if let Some(entry) = entries.get(token_id) {
+            let mut pending = entry
+                .pending_answers
+                .lock()
+                .expect("pending-answer mutex poisoned");
+            if let Some(tx) = pending.remove(of_id) {
+                let _ = tx.send(PendingAnswerReply::Acked);
+            }
+        }
+    }
+
+    /// Called from a connection task when an `error` arrives: resolves
+    /// the matching pending outbound `answer` with the client's own
+    /// failure (e.g. no question/permission pending, or an unresolvable
+    /// `choice`), if any. A no-op if `reply_to` matches no outstanding
+    /// answer, the same way [`Registry::resolve_prompt_err`] is.
+    pub fn resolve_answer_err(&self, token_id: &str, reply_to: &str, body: ErrorBody) {
+        let entries = self.entries.lock().expect("registry mutex poisoned");
+        if let Some(entry) = entries.get(token_id) {
+            let mut pending = entry
+                .pending_answers
+                .lock()
+                .expect("pending-answer mutex poisoned");
+            if let Some(tx) = pending.remove(reply_to) {
+                let _ = tx.send(PendingAnswerReply::Err(body));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1508,5 +1708,187 @@ mod tests {
             )
             .await;
         assert!(matches!(outcome, PromptOutcome::Disconnected));
+    }
+
+    #[tokio::test]
+    async fn answer_against_unknown_token_is_disconnected() {
+        let registry = Registry::new();
+        let outcome = registry
+            .answer(
+                "tok_nope",
+                "id-1".to_string(),
+                "alpha".to_string(),
+                "once".to_string(),
+            )
+            .await;
+        assert!(matches!(outcome, AnswerOutcome::Disconnected));
+    }
+
+    #[tokio::test]
+    async fn answer_round_trip_resolves_once_ack_arrives() {
+        let registry = Registry::new();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+
+        let registry = std::sync::Arc::new(registry);
+        let registry2 = registry.clone();
+        let responder = tokio::spawn(async move {
+            let envelope = out_rx.recv().await.expect("answer envelope sent");
+            let crate::proto::Body::Answer(crate::proto::AnswerBody { session, choice }) =
+                envelope.body
+            else {
+                panic!("expected an Answer body");
+            };
+            assert_eq!(session, "alpha");
+            assert_eq!(choice, "once");
+            registry2.resolve_answer_ack("tok_1", &envelope.id);
+        });
+
+        let outcome = registry
+            .answer(
+                "tok_1",
+                "a-1".to_string(),
+                "alpha".to_string(),
+                "once".to_string(),
+            )
+            .await;
+        responder.await.unwrap();
+        assert!(matches!(outcome, AnswerOutcome::Acked));
+    }
+
+    #[tokio::test]
+    async fn answer_resolves_with_the_client_error_when_the_choice_is_rejected() {
+        // The client answered with its own typed failure (e.g. no
+        // question/permission pending for this session, or `choice`
+        // didn't resolve) instead of an `ack` — this must come back as
+        // `AnswerOutcome::Err`, not a confusing `TimedOut`.
+        let registry = Registry::new();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+
+        let registry = std::sync::Arc::new(registry);
+        let registry2 = registry.clone();
+        let responder = tokio::spawn(async move {
+            let envelope = out_rx.recv().await.expect("answer envelope sent");
+            registry2.resolve_answer_err(
+                "tok_1",
+                &envelope.id,
+                ErrorBody {
+                    code: "no_pending_answer".to_string(),
+                    cmd: None,
+                    message: Some("nothing is pending for session alpha".to_string()),
+                },
+            );
+        });
+
+        let outcome = registry
+            .answer(
+                "tok_1",
+                "a-1".to_string(),
+                "alpha".to_string(),
+                "bogus".to_string(),
+            )
+            .await;
+        responder.await.unwrap();
+        match outcome {
+            AnswerOutcome::Err(body) => assert_eq!(body.code, "no_pending_answer"),
+            _ => panic!("expected AnswerOutcome::Err, got a different outcome"),
+        }
+    }
+
+    #[tokio::test]
+    async fn answer_is_not_acked_by_an_unrelated_ack() {
+        let registry = Registry::new();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+
+        let registry = std::sync::Arc::new(registry);
+        let registry2 = registry.clone();
+        let responder = tokio::spawn(async move {
+            let _envelope = out_rx.recv().await.expect("answer envelope sent");
+            registry2.resolve_answer_ack("tok_1", "not-the-right-id");
+        });
+
+        let outcome = registry
+            .answer(
+                "tok_1",
+                "a-1".to_string(),
+                "alpha".to_string(),
+                "once".to_string(),
+            )
+            .await;
+        responder.await.unwrap();
+        assert!(matches!(outcome, AnswerOutcome::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn answer_times_out_but_reports_timed_out_when_still_connected() {
+        let registry = Registry::new();
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        // Keep `_out_rx` alive (so the send succeeds) but never reply.
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+
+        let outcome = tokio::time::timeout(
+            ANSWER_ACK_TIMEOUT + Duration::from_secs(1),
+            registry.answer(
+                "tok_1",
+                "a-1".to_string(),
+                "alpha".to_string(),
+                "once".to_string(),
+            ),
+        )
+        .await
+        .expect("answer itself must resolve within its own timeout budget");
+        assert!(matches!(outcome, AnswerOutcome::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn answer_reports_disconnected_immediately_when_the_connection_closes_mid_flight() {
+        let registry = Registry::new();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+
+        let registry = std::sync::Arc::new(registry);
+        let registry2 = registry.clone();
+        let closer = tokio::spawn(async move {
+            let _envelope = out_rx.recv().await.expect("answer envelope sent");
+            registry2.remove("tok_1");
+        });
+
+        let outcome = tokio::time::timeout(
+            ANSWER_ACK_TIMEOUT,
+            registry.answer(
+                "tok_1",
+                "a-1".to_string(),
+                "alpha".to_string(),
+                "once".to_string(),
+            ),
+        )
+        .await
+        .expect(
+            "a mid-flight disconnect must resolve well before the ack timeout, \
+             not time out itself",
+        );
+        closer.await.unwrap();
+        assert!(matches!(outcome, AnswerOutcome::Disconnected));
+    }
+
+    #[tokio::test]
+    async fn answer_after_disconnect_is_disconnected() {
+        let registry = Registry::new();
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+        drop(out_rx);
+        registry.remove("tok_1");
+
+        let outcome = registry
+            .answer(
+                "tok_1",
+                "a-1".to_string(),
+                "alpha".to_string(),
+                "once".to_string(),
+            )
+            .await;
+        assert!(matches!(outcome, AnswerOutcome::Disconnected));
     }
 }

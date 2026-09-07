@@ -3,9 +3,9 @@
 //! (`docs/protocol/v1.md` §4) and the fail-closed error paths of ADR 0009.
 //! `reply` is routed by [`super::registry::Registry`] (issue #33: `holler
 //! say <session>`, resolved by [`super::roster::Roster`]); `ack` resolves
-//! a pending outbound `interrupt` (issue #34, ADR 0005). Inbound `prompt`
-//! / `interrupt` (this server only ever sends the latter, never receives
-//! it) remain accepted-but-ignored.
+//! a pending outbound `interrupt` (issue #34, ADR 0005) or `answer`
+//! (issue #382). Inbound `prompt` / `interrupt` / `answer` (this server
+//! only ever sends these, never receives them) remain accepted-but-ignored.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -559,15 +559,23 @@ async fn handle_frame(
             // e.g. the remote client's own `unknown_cmd`), a reply to a
             // `prompt` this server sent (issue #33 — e.g. a stale
             // `presence` row: the client no longer hosts the session the
-            // roster said it did), or an unsolicited `error` this story
-            // has no other use for. Both `resolve_*_err` calls are
-            // no-ops if `envelope.id` matches no outstanding request of
+            // roster said it did), a reply to an `answer` this server
+            // sent (issue #382), or an unsolicited `error` this story has
+            // no other use for. Every `resolve_*_err` call below is a
+            // no-op if `envelope.id` matches no outstanding request of
             // that kind — a given id is only ever pending in one of the
-            // two maps, so exactly one call (if either) actually fires.
+            // three maps, so exactly one call (if any) actually fires.
             ctx.registry
                 .resolve_query_err(token_id, &envelope.id, err_body.clone());
             ctx.registry
                 .resolve_prompt_err(token_id, &envelope.id, err_body.clone());
+            // The client answering an `answer` this server sent with its
+            // own typed failure instead of an `ack` (issue #382 — e.g.
+            // no question/permission actually pending for the session
+            // right now). Same no-op-if-unmatched tolerance as the two
+            // calls above.
+            ctx.registry
+                .resolve_answer_err(token_id, &envelope.id, err_body.clone());
         }
         Body::Auth(_) => {
             // A second `auth` mid-session is not part of this story's
@@ -647,21 +655,27 @@ async fn handle_frame(
                 .resolve_reply(token_id, &envelope.id, reply_body.clone());
         }
         Body::Ack(ack) => {
-            // The client acknowledging an `interrupt` this server sent
-            // (issue #34): `of` must name the acknowledged frame's id
-            // (spec note, issue #59(b)) — an `ack` with no `of`, or one
-            // that matches no outstanding interrupt, resolves nothing
-            // (fail-closed: never a spurious `Acked`).
+            // The client acknowledging an `interrupt` or `answer` this
+            // server sent (issue #34, issue #382): `of` must name the
+            // acknowledged frame's id (spec note, issue #59(b)) — an
+            // `ack` with no `of` resolves nothing (fail-closed: never a
+            // spurious `Acked`). `of` is only ever pending in one of
+            // `resolve_interrupt_ack`/`resolve_answer_ack`'s two maps, so
+            // exactly one of these two calls (if either) actually fires.
             match &ack.of {
-                Some(of) => ctx.registry.resolve_interrupt_ack(token_id, of),
+                Some(of) => {
+                    ctx.registry.resolve_interrupt_ack(token_id, of);
+                    ctx.registry.resolve_answer_ack(token_id, of);
+                }
                 None => trace(ctx, "ignoring `ack` with no `of`"),
             }
         }
-        Body::Prompt(_) | Body::Interrupt(_) => {
+        Body::Prompt(_) | Body::Interrupt(_) | Body::Answer(_) => {
             // Server → client only, in this story's scope (issue #31/
-            // #34): this server never expects either inbound. Accept the
-            // frame without erroring so a client speaking ahead of this
-            // server's capabilities does not get disconnected over it.
+            // #34/#382): this server never expects any of these inbound.
+            // Accept the frame without erroring so a client speaking
+            // ahead of this server's capabilities does not get
+            // disconnected over it.
             trace(
                 ctx,
                 &format!("ignoring unimplemented frame type {:?}", envelope.msg_type),
