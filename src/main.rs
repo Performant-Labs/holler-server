@@ -445,21 +445,48 @@ fn run_query_command(
 }
 
 fn print_roster_table(rows: &[RosterRowDoc]) {
-    const HEADERS: [&str; 5] = ["SESSION", "HARNESS", "CLIENT_ID", "STATE", "LAST_SEEN"];
+    // Issue #256 (ADR 0017): MODE/HARNESS_ID are new, always-shown columns
+    // -- "spawn" / "-" for every session until a client actually
+    // advertises attach, so the table's shape doesn't silently change
+    // depending on what's connected. "name + mode + harness id is enough"
+    // per the issue; this does not add a new addressing scheme, SESSION
+    // (the Holler session name) is still the only thing `say`/`interrupt`
+    // route by.
+    const HEADERS: [&str; 7] = [
+        "SESSION",
+        "HARNESS",
+        "CLIENT_ID",
+        "STATE",
+        "LAST_SEEN",
+        "MODE",
+        "HARNESS_ID",
+    ];
     let last_seen_cells: Vec<String> = rows
         .iter()
         .map(|r| format!("{}s ago", r.last_seen_ms / 1000))
         .collect();
-    let rows_cells: Vec<[&str; 5]> = rows
+    let mode_cells: Vec<&str> = rows
+        .iter()
+        .map(|r| r.mode.as_deref().unwrap_or("spawn"))
+        .collect();
+    let harness_id_cells: Vec<&str> = rows
+        .iter()
+        .map(|r| r.harness_session_id.as_deref().unwrap_or("-"))
+        .collect();
+    let rows_cells: Vec<[&str; 7]> = rows
         .iter()
         .zip(last_seen_cells.iter())
-        .map(|(r, last_seen)| {
+        .zip(mode_cells.iter())
+        .zip(harness_id_cells.iter())
+        .map(|(((r, last_seen), mode), harness_id)| {
             [
                 r.name.as_str(),
                 r.harness.as_str(),
                 r.client_id.as_str(),
                 r.state.as_str(),
                 last_seen.as_str(),
+                mode,
+                harness_id,
             ]
         })
         .collect();
@@ -471,7 +498,7 @@ fn print_roster_table(rows: &[RosterRowDoc]) {
         }
     }
 
-    let print_row = |cells: &[&str; 5]| {
+    let print_row = |cells: &[&str; 7]| {
         let line: Vec<String> = cells
             .iter()
             .enumerate()

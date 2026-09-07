@@ -222,6 +222,15 @@ pub struct RosterRowDoc {
     pub client_id: String,
     pub state: String,
     pub last_seen_ms: u128,
+    /// Issue #256 (ADR 0017): omitted (not `null`) for a spawn session,
+    /// matching the same convention `holler-client`'s presence payload
+    /// uses for the same reason -- an old decoder that predates attach
+    /// mode sees exactly the roster shape it always has for every session
+    /// it already understands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harness_session_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------
@@ -392,6 +401,8 @@ async fn handle_control_conn(
                         client_id: r.client_id,
                         state: r.state.to_string(),
                         last_seen_ms: r.last_seen_ms_ago,
+                        mode: r.mode,
+                        harness_session_id: r.harness_session_id,
                     })
                     .collect();
                 serde_json::to_string(&rows).expect("roster rows always serialize")
@@ -1037,6 +1048,100 @@ mod tests {
             other => panic!("expected QueryReply::Ok, got {other:?}"),
         }
 
+        server.abort();
+    }
+
+    /// Issue #256, requirement 4: `holler-server support <client> attach`
+    /// and `... opencode-http` must be `ok: true` only when that specific
+    /// client actually confirmed them, and this is not hardcoded on the
+    /// server side at all -- `remote_support_round_trip_records_a_harness_confirmation`
+    /// above already proves the relay is fully generic over the feature
+    /// name; this test just exercises it with the two literal names #256
+    /// names, both directions (confirmed true, and a feature the client
+    /// answers false for), so the requirement is traceable to a concrete
+    /// test rather than inferred from a differently-named case.
+    #[tokio::test]
+    async fn remote_support_relays_attach_and_opencode_http_feature_names_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Registry::new());
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        registry.insert("tok_1", "cli_1".to_string(), "kiwi".to_string(), out_tx);
+        let (server, _shutdown_tx) = spawn_control_server(dir.path(), registry.clone()).await;
+
+        // Simulates a real holler-client that implements attach (#100)
+        // but whose one configured attach endpoint is currently dead
+        // (#102: opencode-http is a live per-call HTTP probe, not a
+        // static flag) -- exactly the two different `ok` values #256
+        // requires `support` to relay verbatim, not invent.
+        let responder = tokio::spawn(async move {
+            let attach_query = out_rx.recv().await.expect("attach query envelope sent");
+            let crate::proto::Body::Query(crate::proto::QueryBody { cmd, args }) =
+                attach_query.body
+            else {
+                panic!("expected a Query body");
+            };
+            assert_eq!(cmd, "support");
+            assert_eq!(args, vec!["attach".to_string()]);
+            registry.resolve_query_ok(
+                "tok_1",
+                &attach_query.id,
+                QueryOkBody {
+                    cmd: "support".to_string(),
+                    rest: serde_json::json!({ "ok": true, "feature": "attach" }),
+                },
+            );
+
+            let http_query = out_rx.recv().await.expect("opencode-http query envelope sent");
+            let crate::proto::Body::Query(crate::proto::QueryBody { cmd, args }) =
+                http_query.body
+            else {
+                panic!("expected a Query body");
+            };
+            assert_eq!(cmd, "support");
+            assert_eq!(args, vec!["opencode-http".to_string()]);
+            registry.resolve_query_ok(
+                "tok_1",
+                &http_query.id,
+                QueryOkBody {
+                    cmd: "support".to_string(),
+                    rest: serde_json::json!({ "ok": false, "feature": "opencode-http" }),
+                },
+            );
+        });
+
+        let dir_path = dir.path().to_path_buf();
+        let attach_reply = tokio::task::spawn_blocking({
+            let dir_path = dir_path.clone();
+            move || run_query(&dir_path, Some("tok_1".to_string()), "support", vec!["attach".to_string()])
+        })
+        .await
+        .unwrap()
+        .expect("a live server relays the remote reply");
+        match attach_reply {
+            QueryReply::Ok { query_ok } => assert_eq!(query_ok.rest["ok"], true),
+            other => panic!("expected QueryReply::Ok, got {other:?}"),
+        }
+
+        let http_reply = tokio::task::spawn_blocking(move || {
+            run_query(
+                &dir_path,
+                Some("tok_1".to_string()),
+                "support",
+                vec!["opencode-http".to_string()],
+            )
+        })
+        .await
+        .unwrap()
+        .expect("a live server relays the remote reply");
+        match http_reply {
+            QueryReply::Ok { query_ok } => assert_eq!(
+                query_ok.rest["ok"], false,
+                "a dead attach endpoint must relay ok:false, not be invented as true"
+            ),
+            other => panic!("expected QueryReply::Ok, got {other:?}"),
+        }
+
+        responder.await.unwrap();
         server.abort();
     }
 
