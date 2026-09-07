@@ -321,7 +321,7 @@ impl Registry {
         }
 
         let envelope = crate::wire::hello::new_ping_envelope(&ping_id, server_hostname);
-        debug::outgoing(self.debug, "ping")
+        debug::outgoing(self.debug, "registry", "ping")
             .id(&ping_id)
             .peer(token_id)
             .frame_of(|| &envelope)
@@ -333,7 +333,7 @@ impl Registry {
 
         match tokio::time::timeout(PING_TIMEOUT, rx).await {
             Ok(Ok(rtt)) => {
-                debug::incoming(self.debug, "pong")
+                debug::incoming(self.debug, "registry", "pong")
                     .id(&ping_id)
                     .peer(token_id)
                     .field("hostname", hostname.as_str())
@@ -345,7 +345,7 @@ impl Registry {
                 }
             }
             _ => {
-                debug::incoming(self.debug, "pong")
+                debug::incoming(self.debug, "registry", "pong")
                     .id(&ping_id)
                     .peer(token_id)
                     .field("outcome", "timeout")
@@ -467,7 +467,7 @@ impl Registry {
         }
 
         let envelope = crate::wire::hello::new_query_envelope(&query_id, cmd.clone(), args);
-        debug::outgoing(self.debug, "query")
+        debug::outgoing(self.debug, "registry", "query")
             .id(&query_id)
             .peer(token_id)
             .field("cmd", cmd.as_str())
@@ -480,7 +480,7 @@ impl Registry {
 
         match tokio::time::timeout(QUERY_TIMEOUT, rx).await {
             Ok(Ok(PendingQueryReply::Ok(body))) => {
-                debug::incoming(self.debug, "query_ok")
+                debug::incoming(self.debug, "registry", "query_ok")
                     .id(&query_id)
                     .peer(token_id)
                     .frame_of(|| &body)
@@ -488,7 +488,7 @@ impl Registry {
                 QueryOutcome::Ok(body)
             }
             Ok(Ok(PendingQueryReply::Err(body))) => {
-                debug::incoming(self.debug, "query")
+                debug::incoming(self.debug, "registry", "query")
                     .id(&query_id)
                     .peer(token_id)
                     .field("outcome", "err")
@@ -497,7 +497,7 @@ impl Registry {
                 QueryOutcome::Err(body)
             }
             _ => {
-                debug::incoming(self.debug, "query")
+                debug::incoming(self.debug, "registry", "query")
                     .id(&query_id)
                     .peer(token_id)
                     .field("outcome", "timeout")
@@ -594,7 +594,7 @@ impl Registry {
         let text_preview = text.clone();
         let envelope =
             crate::wire::hello::new_prompt_envelope(&prompt_id, session.clone(), text, meta);
-        debug::outgoing(self.debug, "prompt")
+        debug::outgoing(self.debug, "registry", "prompt")
             .id(&prompt_id)
             .peer(token_id)
             .field("session", session.as_str())
@@ -620,7 +620,7 @@ impl Registry {
                         .cloned()
                         .chain(reply.chunks.iter().cloned())
                         .collect();
-                    let mut event = debug::incoming(self.debug, "reply")
+                    let mut event = debug::incoming(self.debug, "registry", "reply")
                         .id(&prompt_id)
                         .peer(token_id)
                         .field("session", session.as_str())
@@ -642,7 +642,7 @@ impl Registry {
                     }
                 }
                 Ok(Some(PromptEvent::Err(body))) => {
-                    debug::incoming(self.debug, "reply")
+                    debug::incoming(self.debug, "registry", "reply")
                         .id(&prompt_id)
                         .peer(token_id)
                         .field("session", session.as_str())
@@ -653,7 +653,7 @@ impl Registry {
                     return PromptOutcome::Err(body);
                 }
                 Ok(Some(PromptEvent::Cancelled)) => {
-                    debug::incoming(self.debug, "reply")
+                    debug::incoming(self.debug, "registry", "reply")
                         .id(&prompt_id)
                         .peer(token_id)
                         .field("session", session.as_str())
@@ -663,7 +663,7 @@ impl Registry {
                     return PromptOutcome::Cancelled;
                 }
                 Ok(None) | Err(_) => {
-                    debug::incoming(self.debug, "reply")
+                    debug::incoming(self.debug, "registry", "reply")
                         .id(&prompt_id)
                         .peer(token_id)
                         .field("session", session.as_str())
@@ -765,7 +765,7 @@ impl Registry {
         }
 
         let envelope = crate::wire::hello::new_interrupt_envelope(&interrupt_id, session.clone());
-        debug::outgoing(self.debug, "interrupt")
+        debug::outgoing(self.debug, "registry", "interrupt")
             .id(&interrupt_id)
             .peer(token_id)
             .field("session", session.as_str())
@@ -778,7 +778,7 @@ impl Registry {
 
         match tokio::time::timeout(INTERRUPT_ACK_TIMEOUT, rx).await {
             Ok(Ok(())) => {
-                debug::incoming(self.debug, "ack")
+                debug::incoming(self.debug, "registry", "ack")
                     .id(&interrupt_id)
                     .peer(token_id)
                     .field("session", session.as_str())
@@ -800,7 +800,7 @@ impl Registry {
             // connection is known right away, not a "may not have
             // landed" ambiguity.
             Ok(Err(_)) => {
-                debug::incoming(self.debug, "ack")
+                debug::incoming(self.debug, "registry", "ack")
                     .id(&interrupt_id)
                     .peer(token_id)
                     .field("session", session.as_str())
@@ -818,7 +818,7 @@ impl Registry {
                 // stale `TimedOut`) is the honest report.
                 let entries = self.entries.lock().expect("registry mutex poisoned");
                 if entries.contains_key(token_id) {
-                    debug::incoming(self.debug, "ack")
+                    debug::incoming(self.debug, "registry", "ack")
                         .id(&interrupt_id)
                         .peer(token_id)
                         .field("session", session.as_str())
@@ -826,7 +826,7 @@ impl Registry {
                         .emit();
                     InterruptOutcome::TimedOut
                 } else {
-                    debug::incoming(self.debug, "ack")
+                    debug::incoming(self.debug, "registry", "ack")
                         .id(&interrupt_id)
                         .peer(token_id)
                         .field("session", session.as_str())
