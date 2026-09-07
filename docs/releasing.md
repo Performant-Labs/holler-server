@@ -45,9 +45,11 @@ looked at.
 exercises the full test-case catalog ([`#98`](https://github.com/Performant-Labs/holler-server/issues/98)),
 which includes manual and acceptance-gate cases outside CI's reach. Before tagging, also run
 the catalog itself — `ruby scripts/test-run.rb run <test-run-issue> --server-dir DIR
---client-dir DIR` (or `discover`/`exec <ID>` per case) — and make a deliberate call on whether
-this release warrants the full manual acceptance gate (real OpenCode, real model calls). A
-release note this doc, or the checklist, ever says "tests passed" off CI alone is wrong.
+--client-dir DIR` (or `discover`/`exec <ID>` per case), **run from `~/Projects/holler-server` —
+`scripts/test-run.rb` lives only in this repo, not holler-client, even when the case being run
+is an `hlrclnt-*` one** — and make a deliberate call on whether this release warrants the full
+manual acceptance gate (real OpenCode, real model calls). A release note this doc, or the
+checklist, ever says "tests passed" off CI alone is wrong.
 
 **A red test does not automatically block a release — it can be knowingly overridden.** This
 is a real, standing option, not a last resort: whoever's cutting the release can decide a
@@ -68,6 +70,32 @@ specific failure doesn't hold this release up. The one hard requirement is that 
 
 This table is the one place platform status is recorded — the checklist and any other doc
 mentioning target platforms should link here rather than repeat/restate it.
+
+## Building for a platform you don't have locally
+
+You're usually cutting a release from one machine (a Mac, say), but the platform table above
+requires binaries for more than one OS. For a platform you can't build on locally, the proven
+recipe (used for real on `v0.1.0`, building the `ubuntu-latest` binary from a Mac) is:
+
+1. SSH to a real machine running that OS — doesn't need to be dedicated to this, just needs to
+   exist and be reachable (this project used Jupiter, a real Ubuntu x86_64 box, for the Linux
+   build).
+2. If Rust isn't already installed there: `curl --proto '=https' --tlsv1.2 -sSf
+   https://sh.rustup.rs | sh -s -- -y --default-toolchain stable`.
+3. Clone the repo fresh **at the exact tag**, not `main`: `git clone --branch vX.Y.Z --depth 1
+   https://github.com/Performant-Labs/holler-server.git ~/holler-server-build` — a shallow,
+   tag-pinned clone, not a checkout of whatever that machine happened to have lying around.
+4. `cargo build --release` there, for real — not cross-compiled from the Mac.
+5. Verify on the remote machine before pulling anything back: `--version` reports the right
+   version, and `file target/release/holler-server` confirms it's a real binary for that
+   platform (e.g. `ELF 64-bit LSB pie executable, x86-64` for Linux).
+6. `scp` the verified binary back to wherever you're assembling the release's files.
+
+This is genuine cross-*building*, not cross-*compiling* — every platform's binary is actually
+built on that platform, by a real toolchain, from a real clone of the tagged commit. Don't try
+to set up cross-compilation toolchains (e.g. `cross`, manual target triples) as a shortcut; a
+real remote machine per platform is simpler and gives a binary you can trust without also
+trusting a cross-compilation toolchain's correctness.
 
 ## What a release actually produces
 
