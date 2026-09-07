@@ -31,7 +31,11 @@
 #                 (matches the test-grp-* label; the group is the hundreds
 #                 digit of the Test ID -- invocation=1000 .. load=1900.
 #                 nil on the pre-existing TC-NNN cases that predate this
-#                 field, harmless -- nothing reads it yet)
+#                 field, harmless -- nothing reads it yet. A third,
+#                 open-ended tag axis -- test-tag-*, added in issue #305 --
+#                 also exists in the catalog; consuming it as a selection
+#                 filter is issue #304's --tag/--tag-invert. Until then,
+#                 parsed-and-ignored here.)
 #   Automation  -- free-text pointer(s) to the automated assertion(s), or a
 #                 string starting with "manual" for manual-only cases
 #
