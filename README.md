@@ -124,7 +124,9 @@ Full survey, including the same-machine tools, an X sampling, and the recommenda
 
 Two hops, two protocols, and the client is the hinge. Meta-O talks to `holler-server` over the CLI; `holler-server` and `holler-client` talk **Holler protocol v1** (JSON over WebSocket, default port `41807`); `holler-client` talks **ACP v1** (JSON-RPC over stdio) to the actual coding-agent subprocess on that box. `holler-server` never speaks a harness's native API directly — that's `holler-client`'s job, on the other side of the wire.
 
-See [how server and client talk](docs/protocol/talk.md) for the interrupt and prompt/reply sequence diagrams, and the [Holler v1 spec](docs/protocol/v1.md) for the wire format itself.
+That second hop — how `holler-client` reaches the coding agent — has two shapes ([ADR 0017](docs/adr/ADR-0017.md)). **Spawn is the default**: the far box has no Herdr, and `holler-client` starts and owns the ACP subprocess itself (the description above). **Attach** is additive, for a far box that already runs Herdr with a live OpenCode TUI in a pane: `holler-client` runs as a sidecar next to that pane — never its foreground command — and drives the *existing* OpenCode session over its own HTTP control surface instead of spawning a second one. `holler-server`'s side of the wire, and the first hop, are identical either way; only how `holler-client` talks to the agent on its own box changes.
+
+See [how server and client talk](docs/protocol/talk.md) for the interrupt and prompt/reply sequence diagrams (including the attach-mode hop), and the [Holler v1 spec](docs/protocol/v1.md) for the wire format itself.
 
 ## Documentation
 
