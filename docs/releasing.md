@@ -147,35 +147,47 @@ ruled out).
 
 ## Step by step
 
+**All version-bump work (Cargo.toml, CHANGELOG.md, README.md) lands on ONE branch, named
+`release/vX.Y.Z`** — not a separate branch per file/commit. One PR, one thing to review, one
+merge. `main` is protected, so this still goes through a PR like anything else; it just isn't
+several PRs.
+
 1. Confirm the release commit (usually `main`'s tip) has a green CI run on both platforms — see
    above.
 2. Run the full test-case catalog against that commit (`test-run.rb run`/`exec`), and decide
    whether this release warrants the full manual acceptance gate — see "Were the tests run?"
    above. CI green alone is not this step.
-3. Decide the version bump (PATCH/MINOR/MAJOR) per ADR 0014's rules, from everything accumulated
+3. Gather known issues **now, before writing the CHANGELOG** — skim open `bug`-labeled (and
+   otherwise plainly real) issues in both repos, write down the exact list. This list goes into
+   the CHANGELOG's Known Issues subsection verbatim in step 7 — gathering it after would mean
+   writing that subsection twice, or worse, from memory.
+4. Branch `release/vX.Y.Z` off the release commit. Everything below (steps 5-8) happens on this
+   one branch.
+5. Decide the version bump (PATCH/MINOR/MAJOR) per ADR 0014's rules, from everything accumulated
    in `CHANGELOG.md`'s `## [Unreleased]` section since the last tag.
-4. `cargo set-version <X.Y.Z>` (or edit `Cargo.toml`'s `version` by hand) — this is the only
+6. `cargo set-version <X.Y.Z>` (or edit `Cargo.toml`'s `version` by hand) — this is the only
    source-of-truth edit; nothing else needs independent updating.
-5. Move `CHANGELOG.md`'s `## [Unreleased]` content under a new `## [X.Y.Z] - YYYY-MM-DD` heading,
-   organized per "CHANGELOG entry structure" above; leave a fresh empty `## [Unreleased]` above it.
-6. **Update `README.md`** with anything a user landing on the repo needs to know about this
+7. Move `CHANGELOG.md`'s `## [Unreleased]` content under a new `## [X.Y.Z] - YYYY-MM-DD` heading,
+   organized per "CHANGELOG entry structure" above — Known Issues subsection is step 3's list,
+   verbatim; leave a fresh empty `## [Unreleased]` above it.
+8. **Update `README.md`** with anything a user landing on the repo needs to know about this
    release: notable new features, fixes, or changes to CLI invocation (new/changed flags,
    subcommands, output shape). Not every CHANGELOG line belongs here — only what changes how
    someone actually uses the tool, the same bar as a man page going stale.
-7. Commit those file changes (`Bump version to X.Y.Z`), push, confirm CI is green on the bump
-   commit itself too.
-8. `git tag -s vX.Y.Z -m "vX.Y.Z"` (signed, annotated), `git push origin vX.Y.Z`.
-9. Check open `bug`-labeled (and otherwise plainly real) issues for anything worth a known-issue
-   line in the release notes — see "Known issues" above.
-10. `cargo build --release` on each target platform (see the platform table above); verify
+9. Commit those file changes on `release/vX.Y.Z` (one commit or several, same branch), open a PR,
+   get it merged, confirm CI is green on the merge commit itself too.
+10. `git tag -s vX.Y.Z -m "vX.Y.Z"` (signed, annotated) on the merge commit, `git push origin vX.Y.Z`.
+11. `cargo build --release` on each target platform (see the platform table above); verify
     `./target/release/holler-server --version` actually reports `X.Y.Z` before attaching anything.
-11. Create the GitHub Release from the tag (`gh release create vX.Y.Z <binaries...> --notes-file
-    <changelog excerpt>`) — the confirm-before-publish step from above.
-12. **Verify the published artifact, not just the local build.** Download the binary actually
+12. Extract `CHANGELOG.md`'s `## [X.Y.Z]` section (already complete, including Known Issues) into
+    a standalone file — that's the release notes, no new content to write.
+13. Create the GitHub Release from the tag (`gh release create vX.Y.Z <binaries...> --notes-file
+    <that extracted file>`) — the confirm-before-publish step from above.
+14. **Verify the published artifact, not just the local build.** Download the binary actually
     attached to the GitHub Release (`gh release download vX.Y.Z`), from a clean directory, and
     run `./holler-server --version` against *that* file — confirms the upload isn't corrupted,
     is the right architecture, has its executable bit set, and actually reports `X.Y.Z`. A local
-    build passing step 10 is not evidence the uploaded artifact works; only downloading and
+    build passing step 11 is not evidence the uploaded artifact works; only downloading and
     running the real thing is.
 
 For the actual checklist to run through each time (not just the narrative above), copy
