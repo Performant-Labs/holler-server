@@ -614,8 +614,8 @@ def main
       o.on('--client-dir DIR') { |v| opts[:client] = v }
       o.on('--group G') { |v| opts[:group] = v }
       o.on('--applies X') { |v| opts[:applies] = v }
-      o.on('--tag S', 'test-tag-<S> to select (OR-within, multiple allowed)') { |v| opts[:tags] = []; opts[:tags] << v }
-      o.on('--tag-invert S', 'exclude cases carrying test-tag-<S> (multiple allowed)') { |v| opts[:tag_inverts] = []; opts[:tag_inverts] << v }
+      o.on('--tag S', 'test-tag-<S> to select (OR-within, multiple allowed)') { |v| (opts[:tags] ||= []) << v }
+      o.on('--tag-invert S', 'exclude cases carrying test-tag-<S> (multiple allowed)') { |v| (opts[:tag_inverts] ||= []) << v }
       o.on('--list [FILE]', 'bare: preview resolved IDs without running; FILE: keep only those IDs') { |v| opts[:list] = v; opts[:preview] = (v.nil?) }
       o.on('--list-invert FILE', 'exclude the Test IDs listed in FILE') { |v| opts[:list_invert] = v }
       o.on('-h', '--help') { puts o.banner; exit 0 }
