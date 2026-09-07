@@ -68,7 +68,11 @@ pub fn wait_for<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> O
     }
 }
 
-fn holler_server_cmd(state_dir: &StateDir) -> Command {
+/// Builds a `holler-server` `Command` against `state_dir`, with the pepper
+/// env var already set. Exposed (not just used internally) so tests that
+/// need custom stdio/signal handling -- rather than one of the
+/// higher-level helpers below -- can still go through one place.
+pub fn holler_server_cmd(state_dir: &StateDir) -> Command {
     let mut cmd = Command::cargo_bin("holler-server").expect(
         "holler-server binary not built -- run `cargo build` (or `cargo test`, which builds it \
          automatically) before invoking harness helpers directly",
