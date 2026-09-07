@@ -60,6 +60,15 @@
 #     repo's whole `cargo test` as a conservative fallback; evidence says
 #     a fallback ran
 #
+# A `tests/<file>.rs` case additionally carrying the `test-tag-interop` label
+# (issue #313) is a real, deliberately `#[ignore]`d cross-process interop
+# test that needs a built sibling `holler-server` binary: the script builds
+# it (`cargo build --release`, memoized once per invocation) and runs
+# `cargo test --test <file> -- --ignored [<fn>]` with `HOLLER_SERVER_BIN` set
+# to the built path, instead of the plain form above -- otherwise cargo
+# reports the case `ignored` and this script's own log-parsing misreads that
+# as "did not run" -> a false `❌ fail`.
+#
 # `run` batches unit tests (issue #248): a case labeled `test-cat-unit`
 # whose Automation is a single, unqualified "<repo>: src/<path>.rs (<fn>)"
 # segment gets grouped with every other such case in the same repo and run
@@ -287,13 +296,47 @@ end
 # exactly as an individually-run case would.
 UNIT_BATCH_LABEL = 'test-cat-unit'
 
-Segment = Struct.new(:repo, :file, :fn, :lib_test, :fallback_used, :dir, :cmd, :error, keyword_init: true)
+# Cases carrying this label are real, deliberately `#[ignore]`d cross-process
+# interop tests (holler-server#94's harness) -- each spawns the REAL sibling
+# binary via a `HOLLER_SERVER_BIN` env var and only runs under `--ignored`,
+# per its own doc comment. Plain `cargo test --test <file> <fn>` reports
+# these `ignored`, and this script's own log-parsing then can't find
+# evidence they ran -- a false `❌ fail`, not a real defect (holler-server#313).
+# When a case carries this tag, parse_segment builds the sibling binary
+# (memoized per run so N interop cases in one invocation build it once) and
+# threads HOLLER_SERVER_BIN + `--ignored` into the command instead of the
+# plain form.
+INTEROP_LABEL = 'test-tag-interop'
+
+$sibling_binary_cache = {}
+
+# Builds (once per script invocation, memoized by dir) the sibling
+# holler-server release binary an interop-tagged case needs, returning its
+# path. Aborts loudly on a build failure rather than letting the case fail
+# with a confusing "HOLLER_SERVER_BIN not set" message.
+def sibling_server_binary(server_dir)
+  $sibling_binary_cache[server_dir] ||= begin
+    puts "==> building sibling holler-server binary in #{server_dir} (cargo build --release)"
+    full_cmd = 'source "$HOME/.cargo/env" 2>/dev/null; cargo build --release'
+    out, status = Open3.capture2e('bash', '-lc', full_cmd, chdir: server_dir)
+    unless status.success?
+      abort("error: failed to build sibling holler-server binary in #{server_dir} for an " \
+            "interop test:\n#{out}")
+    end
+    File.join(server_dir, 'target', 'release', 'holler-server')
+  end
+end
+
+Segment = Struct.new(:repo, :file, :fn, :lib_test, :fallback_used, :dir, :cmd, :error, :env, keyword_init: true)
 
 # Parses one ';'-separated Automation segment into a Segment describing what
 # to run, using exactly the grammar documented at the top of this file.
 # Shared by run_cases (captures output) and exec_test (streams it live) so
 # the two can't silently drift onto different grammars over time.
-def parse_segment(seg, server_dir:, client_dir:)
+# `interop:` (the case's INTEROP_LABEL membership, decided by the caller)
+# switches a `tests/<file>.rs` segment to the real `--ignored` + built-binary
+# form described at INTEROP_LABEL's definition above.
+def parse_segment(seg, server_dir:, client_dir:, interop: false)
   seg = seg.strip
   repo = file = fn = nil
   lib_test = false
@@ -315,8 +358,12 @@ def parse_segment(seg, server_dir:, client_dir:)
   return Segment.new(repo: repo, error: "[unknown repo in automation: #{repo}]\n") unless dir
   return Segment.new(repo: repo, error: "[no checkout at #{dir} for #{repo}]\n") unless Dir.exist?(dir)
 
+  env = {}
   cmd = if lib_test
           "cargo test --lib #{fn}"
+        elsif file && interop
+          env['HOLLER_SERVER_BIN'] = sibling_server_binary(server_dir)
+          fn ? "cargo test --test #{file} -- --ignored #{fn}" : "cargo test --test #{file} -- --ignored"
         elsif file
           fn ? "cargo test --test #{file} #{fn}" : "cargo test --test #{file}"
         else
@@ -324,7 +371,7 @@ def parse_segment(seg, server_dir:, client_dir:)
         end
 
   Segment.new(repo: repo, file: file, fn: fn, lib_test: lib_test,
-              fallback_used: fallback_used, dir: dir, cmd: cmd)
+              fallback_used: fallback_used, dir: dir, cmd: cmd, env: env)
 end
 
 # Runs a fully-resolved Segment's command for real via bash -lc (so
@@ -334,7 +381,7 @@ end
 # treated as a failure rather than silently recorded as a pass.
 def exec_segment_captured(seg)
   full_cmd = "source \"$HOME/.cargo/env\" 2>/dev/null; #{seg.cmd}"
-  out, status = Open3.capture2e('bash', '-lc', full_cmd, chdir: seg.dir)
+  out, status = Open3.capture2e(seg.env || {}, 'bash', '-lc', full_cmd, chdir: seg.dir)
   ok = status.success?
   if ok && seg.fn && (m = out.match(/^test result: \w+\. (\d+) passed; (\d+) failed;.*?(\d+) filtered out/))
     ok = false if m[1].to_i.zero? && m[2].to_i.zero?
@@ -447,8 +494,10 @@ def run_cases(gh, issue_number, server_dir:, client_dir:)
     fallback_used = false
     log = +''
 
+    interop = cat[:labels].include?(INTEROP_LABEL)
+
     automation.split(';').each do |raw_seg|
-      seg = parse_segment(raw_seg, server_dir: server_dir, client_dir: client_dir)
+      seg = parse_segment(raw_seg, server_dir: server_dir, client_dir: client_dir, interop: interop)
       if seg.error
         all_ok = false
         log << seg.error
@@ -530,6 +579,7 @@ end
 # Automation field for real, live, and exits 0 only if ALL passed.
 def exec_test(gh, entries, server_dir:, client_dir:)
   overall_ok = true
+
   entries.each do |cat|
     test_id = cat[:id]
     automation = cat[:automation]
@@ -539,9 +589,11 @@ def exec_test(gh, entries, server_dir:, client_dir:)
       next
     end
 
+    interop = cat[:labels].include?(INTEROP_LABEL)
+
     puts "==> #{test_id}: #{automation}"
     automation.split(';').each do |raw_seg|
-      seg = parse_segment(raw_seg, server_dir: server_dir, client_dir: client_dir)
+      seg = parse_segment(raw_seg, server_dir: server_dir, client_dir: client_dir, interop: interop)
       if seg.error
         warn seg.error
         overall_ok = false
@@ -550,7 +602,7 @@ def exec_test(gh, entries, server_dir:, client_dir:)
 
       puts "--- #{seg.repo} $ #{seg.cmd} (in #{seg.dir}) ---"
       full_cmd = "source \"$HOME/.cargo/env\" 2>/dev/null; #{seg.cmd}"
-      ok = system('bash', '-lc', full_cmd, chdir: seg.dir)
+      ok = system(seg.env || {}, 'bash', '-lc', full_cmd, chdir: seg.dir)
       overall_ok &&= ok
     end
   end
