@@ -15,8 +15,8 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::proto::{
-    Body, Envelope, HelloBody, InterruptBody, MessageType, PingBody, PongBody, PromptBody,
-    QueryBody, Role,
+    AnswerBody, Body, Envelope, HelloBody, InterruptBody, MessageType, PingBody, PongBody,
+    PromptBody, QueryBody, Role,
 };
 
 /// This binary's protocol version (spec §2): every process today has
@@ -25,16 +25,18 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Protocol features this server process actually implements: `query
 /// status` and `ping`/`pong` (issue #31), `presence`/`roster` (issue
-/// #32), `interrupt` (issue #34, ADR 0005). `token` describes the CLI's
-/// own token-management surface, which is real regardless of the wire.
-pub const SERVER_FEATURES: &[&str] = &["query", "ping", "token", "presence", "roster", "interrupt"];
+/// #32), `interrupt` (issue #34, ADR 0005), `answer` (issue #382).
+/// `token` describes the CLI's own token-management surface, which is
+/// real regardless of the wire.
+pub const SERVER_FEATURES: &[&str] =
+    &["query", "ping", "token", "presence", "roster", "interrupt", "answer"];
 
 /// The full v1 protocol-feature vocabulary (spec §9) — every id `holler
 /// caps`/`holler-server support` knows to report on, independent of what this
 /// process actually implements (see [`SERVER_FEATURES`], always a
 /// subset of this list).
 pub const PROTOCOL_FEATURES: &[&str] =
-    &["interrupt", "presence", "ping", "query", "roster", "token", "wait"];
+    &["interrupt", "answer", "presence", "ping", "query", "roster", "token", "wait"];
 
 /// The v1 harness-id vocabulary (spec §9). `holler-server` never runs a
 /// harness itself — this is the set of ids it *knows about*, not ids it
@@ -157,6 +159,24 @@ pub fn new_interrupt_envelope(id: &str, session: String) -> Envelope {
         ts: now_ts(),
         from: "server".to_string(),
         body: Body::Interrupt(InterruptBody { session }),
+    }
+}
+
+/// An `answer` envelope the registry sends to a live connection to route
+/// `holler-server answer <session> <choice>` (issue #382) by session
+/// name — a **control** frame, the same as [`new_interrupt_envelope`]:
+/// it never touches [`super::registry::Registry`]'s `pending_prompts`
+/// map, so it reaches the connection immediately even while a `prompt`
+/// round trip for the same (or a sibling) session is still in flight on
+/// the same connection's unbounded outbound channel.
+pub fn new_answer_envelope(id: &str, session: String, choice: String) -> Envelope {
+    Envelope {
+        v: 1,
+        msg_type: MessageType::Answer,
+        id: id.to_string(),
+        ts: now_ts(),
+        from: "server".to_string(),
+        body: Body::Answer(AnswerBody { session, choice }),
     }
 }
 

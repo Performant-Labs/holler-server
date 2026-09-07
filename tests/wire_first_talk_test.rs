@@ -1427,3 +1427,261 @@ fn client_detach_also_rejects_a_reconnect_attempt_with_the_old_credential() {
         assert_eq!(err["body"]["code"], "unauthenticated");
     });
 }
+
+// ---------------------------------------------------------------------
+// `holler-server answer <session> <choice>` (issue #382): the new wire
+// message type, end to end against a real `holler-server serve` process
+// and a fake wire-level client — mirrors `interrupt_*`'s test shape
+// above, since `answer` is `interrupt`'s sibling control frame.
+// ---------------------------------------------------------------------
+
+/// Answers `ping` normally; for `answer`, either sends an `ack` (session
+/// in `ack_sessions`) or a client-side `error` (session in
+/// `err_sessions`) with the given code, or silently withholds any reply
+/// at all (neither list) — standing in for "no question/permission
+/// pending" being a real, expected client-reported failure, distinct
+/// from a plain protocol `ack`/timeout.
+#[allow(clippy::too_many_arguments)]
+fn spawn_answer_responder(
+    mut write: impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + Unpin
+        + Send
+        + 'static,
+    mut read: impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin
+        + Send
+        + 'static,
+    token_id: String,
+    ack_sessions: Vec<&'static str>,
+    err_sessions: Vec<(&'static str, &'static str)>,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(Ok(Message::Text(text))) = read.next().await {
+            let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            match v["type"].as_str() {
+                Some("ping") => {
+                    let pong = json!({
+                        "v": 1, "type": "pong", "id": v["id"], "ts": "2026-09-05T00:00:00Z",
+                        "from": token_id, "body": {}
+                    });
+                    if write
+                        .send(Message::Text(pong.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Some("answer") => {
+                    seen.lock().unwrap().push(v.clone());
+                    let session = v["body"]["session"].as_str().unwrap_or_default();
+                    if ack_sessions.contains(&session) {
+                        let ack = json!({
+                            "v": 1, "type": "ack", "id": v["id"], "ts": "2026-09-05T00:00:00Z",
+                            "from": token_id, "body": { "of": v["id"] }
+                        });
+                        if write
+                            .send(Message::Text(ack.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    } else if let Some((_, code)) =
+                        err_sessions.iter().find(|(s, _)| *s == session)
+                    {
+                        let error = json!({
+                            "v": 1, "type": "error", "id": v["id"], "ts": "2026-09-05T00:00:00Z",
+                            "from": token_id,
+                            "body": { "code": code, "message": "no pending question/permission" }
+                        });
+                        if write
+                            .send(Message::Text(error.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    // Sessions in neither list are deliberately left
+                    // hanging — no ack, no error — to exercise the
+                    // "connection alive, no reply in time" timeout path.
+                }
+                _ => continue,
+            }
+        }
+    })
+}
+
+#[test]
+fn answer_acks_and_scopes_to_the_named_session_only() {
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "kiwi");
+    let (client_id, credential) = redeem(&env, &token_id, &secret, "kiwi.local");
+    let server = ServerProcess::spawn(&env);
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    #[allow(clippy::async_yields_async)]
+    let responder = rt.block_on(async {
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(server.url())
+            .await
+            .unwrap();
+        send_json(&mut ws, &auth_envelope(&token_id, &credential)).await;
+        let _server_hello = recv_json(&mut ws).await;
+        send_json(&mut ws, &client_hello_envelope(&token_id, &client_id)).await;
+
+        // Two sibling sessions on one connection — only `alpha` will
+        // ever be answered in this test.
+        send_json(
+            &mut ws,
+            &presence_envelope(
+                &token_id,
+                json!([
+                    { "name": "alpha", "harness": "opencode" },
+                    { "name": "beta", "harness": "opencode" }
+                ]),
+            ),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (write, read) = ws.split();
+        spawn_answer_responder(write, read, token_id.clone(), vec!["alpha"], vec![], seen.clone())
+    });
+
+    // `holler-server answer alpha once`, a separate CLI process, is acked.
+    let out = env.cmd().args(["answer", "alpha", "once"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("alpha"), "{stdout:?}");
+
+    // A name the roster has never heard of fails closed.
+    let unknown_out = env.cmd().args(["answer", "nope", "once"]).output().unwrap();
+    assert!(!unknown_out.status.success());
+    let unknown_stderr = String::from_utf8(unknown_out.stderr).unwrap();
+    assert!(
+        unknown_stderr.contains("unknown_session"),
+        "{unknown_stderr:?}"
+    );
+
+    rt.block_on(async {
+        responder.abort();
+        let _ = responder.await;
+    });
+    // Assert per-session scoping directly against what the responder
+    // actually saw: `beta` (the sibling session on this same connection)
+    // must never have received an `answer`, and the wire body carries
+    // the exact `choice` text through.
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0]["body"]["session"], "alpha", "{seen:?}");
+    assert_eq!(seen[0]["body"]["choice"], "once", "{seen:?}");
+}
+
+#[test]
+fn answer_reports_the_clients_own_error_when_nothing_is_pending() {
+    // The client's `holler-client` side answers with its own typed
+    // failure (no question/permission actually pending for this session
+    // right now) instead of an `ack` — this must surface as that precise
+    // error, not a confusing "may not have landed" timeout.
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "kiwi");
+    let (client_id, credential) = redeem(&env, &token_id, &secret, "kiwi.local");
+    let server = ServerProcess::spawn(&env);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    #[allow(clippy::async_yields_async)]
+    let responder = rt.block_on(async {
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(server.url())
+            .await
+            .unwrap();
+        send_json(&mut ws, &auth_envelope(&token_id, &credential)).await;
+        let _server_hello = recv_json(&mut ws).await;
+        send_json(&mut ws, &client_hello_envelope(&token_id, &client_id)).await;
+        send_json(
+            &mut ws,
+            &presence_envelope(
+                &token_id,
+                json!([{ "name": "alpha", "harness": "opencode" }]),
+            ),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (write, read) = ws.split();
+        spawn_answer_responder(
+            write,
+            read,
+            token_id.clone(),
+            vec![],
+            vec![("alpha", "no_pending_answer")],
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        )
+    });
+
+    let out = env.cmd().args(["answer", "alpha", "once"]).output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("no_pending_answer"), "{stderr:?}");
+
+    rt.block_on(async {
+        responder.abort();
+        let _ = responder.await;
+    });
+}
+
+#[test]
+fn answer_reports_timed_out_when_the_connection_never_replies() {
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "kiwi");
+    let (client_id, credential) = redeem(&env, &token_id, &secret, "kiwi.local");
+    let server = ServerProcess::spawn(&env);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    #[allow(clippy::async_yields_async)]
+    let responder = rt.block_on(async {
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(server.url())
+            .await
+            .unwrap();
+        send_json(&mut ws, &auth_envelope(&token_id, &credential)).await;
+        let _server_hello = recv_json(&mut ws).await;
+        send_json(&mut ws, &client_hello_envelope(&token_id, &client_id)).await;
+        send_json(
+            &mut ws,
+            &presence_envelope(
+                &token_id,
+                json!([{ "name": "alpha", "harness": "opencode" }]),
+            ),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (write, read) = ws.split();
+        // No session ever gets an ack or an error.
+        spawn_answer_responder(
+            write,
+            read,
+            token_id.clone(),
+            vec![],
+            vec![],
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        )
+    });
+
+    let out = env.cmd().args(["answer", "alpha", "once"]).output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap().to_lowercase();
+    assert!(
+        stderr.contains("may not have landed") && !stderr.contains("gone"),
+        "{stderr:?}"
+    );
+
+    rt.block_on(async {
+        responder.abort();
+        let _ = responder.await;
+    });
+}

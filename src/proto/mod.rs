@@ -2,7 +2,7 @@
 //!
 //! Canonical spec: `docs/protocol/v1.md`. One JSON object per WebSocket
 //! text frame: [`Envelope`] wraps a `Body` that is an extensible enum
-//! over the 14 v1 message types.
+//! over the 15 v1 message types.
 
 use serde::de::Error as _;
 use serde::Deserializer;
@@ -86,6 +86,14 @@ pub enum MessageType {
     /// server → client: cancel the turn; session lives.
     #[serde(rename = "interrupt")]
     Interrupt,
+    /// server → client: answer a pending question/permission that's
+    /// blocking the named session's turn (holler-server issue #382,
+    /// implementing the rebuild repo's original design in this codebase).
+    /// A **control** frame, mirroring `interrupt`'s shape — not a queued
+    /// `prompt`: it reaches the connection immediately, addressed by
+    /// session name via the roster the same way `prompt`/`interrupt` are.
+    #[serde(rename = "answer")]
+    Answer,
     /// client → server: session advertise + heartbeat.
     #[serde(rename = "presence")]
     Presence,
@@ -143,6 +151,7 @@ pub enum Body {
     Prompt(PromptBody),
     Reply(ReplyBody),
     Interrupt(InterruptBody),
+    Answer(AnswerBody),
     Presence(PresenceBody),
     Ping(PingBody),
     Pong(PongBody),
@@ -267,6 +276,20 @@ pub struct ReplyBody {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct InterruptBody {
     pub session: String,
+}
+
+/// `answer` body (holler-server issue #382): the named session's chosen
+/// `choice` for whichever question/permission is currently blocking its
+/// turn — an option index or the exact option label for a question, or
+/// one of `once`/`always`/`reject` for a tool-use permission gate. The
+/// wire itself carries `choice` as an opaque string; interpreting it
+/// against the actual pending request is the attached driver's job
+/// (`holler-client`'s HTTP attach driver), since only it knows which
+/// question/permission (if any) is actually pending right now.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct AnswerBody {
+    pub session: String,
+    pub choice: String,
 }
 
 /// `presence` body (spec §10). The spec does not pin a heartbeat field
@@ -513,6 +536,7 @@ impl MessageType {
             "prompt" => Some(Self::Prompt),
             "reply" => Some(Self::Reply),
             "interrupt" => Some(Self::Interrupt),
+            "answer" => Some(Self::Answer),
             "presence" => Some(Self::Presence),
             "ping" => Some(Self::Ping),
             "pong" => Some(Self::Pong),
@@ -535,6 +559,7 @@ impl MessageType {
             Self::Prompt => "prompt",
             Self::Reply => "reply",
             Self::Interrupt => "interrupt",
+            Self::Answer => "answer",
             Self::Presence => "presence",
             Self::Ping => "ping",
             Self::Pong => "pong",
@@ -567,6 +592,7 @@ impl Serialize for Body {
             Body::Prompt(b) => b.serialize(serializer),
             Body::Reply(b) => b.serialize(serializer),
             Body::Interrupt(b) => b.serialize(serializer),
+            Body::Answer(b) => b.serialize(serializer),
             Body::Presence(b) => b.serialize(serializer),
             Body::Ping(b) => b.serialize(serializer),
             Body::Pong(b) => b.serialize(serializer),
@@ -610,6 +636,9 @@ impl Body {
                 serde_json::from_value(body).map_err(|e| malformed(e.to_string()))?,
             )),
             MessageType::Interrupt => Ok(Body::Interrupt(
+                serde_json::from_value(body).map_err(|e| malformed(e.to_string()))?,
+            )),
+            MessageType::Answer => Ok(Body::Answer(
                 serde_json::from_value(body).map_err(|e| malformed(e.to_string()))?,
             )),
             MessageType::Presence => Ok(Body::Presence(

@@ -5,9 +5,9 @@
 //! query_ok flat union against the spec's exact examples).
 
 use holler_server::proto::{
-    error_for, error_for_unknown_type, decode, encode, AckBody, AuthBody, Body, DecodeError,
-    Envelope, ErrorBody, HelloBody, HelloSession, InterruptBody, MessageType, PingBody, PongBody,
-    PresenceBody, PromptBody, QueryBody, QueryOkBody, ReplyBody, Role,
+    error_for, error_for_unknown_type, decode, encode, AckBody, AnswerBody, AuthBody, Body,
+    DecodeError, Envelope, ErrorBody, HelloBody, HelloSession, InterruptBody, MessageType,
+    PingBody, PongBody, PresenceBody, PromptBody, QueryBody, QueryOkBody, ReplyBody, Role,
 };
 use serde_json::{json, Value};
 
@@ -111,6 +111,13 @@ fn round_trip_representative_bodies() {
         Body::Interrupt(InterruptBody { session: "alpha".into() }),
     );
 
+    let answer = make_envelope(
+        MessageType::Answer,
+        "01JANSWER00000000000000000",
+        "server",
+        Body::Answer(AnswerBody { session: "alpha".into(), choice: "once".into() }),
+    );
+
     // error — the spec §11 example.
     let error = Envelope {
         v: 1,
@@ -176,6 +183,7 @@ fn round_trip_representative_bodies() {
         (&prompt, "prompt"),
         (&reply, "reply"),
         (&interrupt, "interrupt"),
+        (&answer, "answer"),
         (&error, "error"),
         (&ping, "ping"),
         (&pong, "pong"),
