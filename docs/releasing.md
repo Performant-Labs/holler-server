@@ -45,9 +45,11 @@ looked at.
 exercises the full test-case catalog ([`#98`](https://github.com/Performant-Labs/holler-server/issues/98)),
 which includes manual and acceptance-gate cases outside CI's reach. Before tagging, also run
 the catalog itself — `ruby scripts/test-run.rb run <test-run-issue> --server-dir DIR
---client-dir DIR` (or `discover`/`exec <ID>` per case) — and make a deliberate call on whether
-this release warrants the full manual acceptance gate (real OpenCode, real model calls). A
-release note this doc, or the checklist, ever says "tests passed" off CI alone is wrong.
+--client-dir DIR` (or `discover`/`exec <ID>` per case), **run from `~/Projects/holler-server` —
+`scripts/test-run.rb` lives only in this repo, not holler-client, even when the case being run
+is an `hlrclnt-*` one** — and make a deliberate call on whether this release warrants the full
+manual acceptance gate (real OpenCode, real model calls). A release note this doc, or the
+checklist, ever says "tests passed" off CI alone is wrong.
 
 **A red test does not automatically block a release — it can be knowingly overridden.** This
 is a real, standing option, not a last resort: whoever's cutting the release can decide a
@@ -68,6 +70,32 @@ specific failure doesn't hold this release up. The one hard requirement is that 
 
 This table is the one place platform status is recorded — the checklist and any other doc
 mentioning target platforms should link here rather than repeat/restate it.
+
+## Building for a platform you don't have locally
+
+You're usually cutting a release from one machine (a Mac, say), but the platform table above
+requires binaries for more than one OS. For a platform you can't build on locally, the proven
+recipe (used for real on `v0.1.0`, building the `ubuntu-latest` binary from a Mac) is:
+
+1. SSH to a real machine running that OS — doesn't need to be dedicated to this, just needs to
+   exist and be reachable (this project used Jupiter, a real Ubuntu x86_64 box, for the Linux
+   build).
+2. If Rust isn't already installed there: `curl --proto '=https' --tlsv1.2 -sSf
+   https://sh.rustup.rs | sh -s -- -y --default-toolchain stable`.
+3. Clone the repo fresh **at the exact tag**, not `main`: `git clone --branch vX.Y.Z --depth 1
+   https://github.com/Performant-Labs/holler-server.git ~/holler-server-build` — a shallow,
+   tag-pinned clone, not a checkout of whatever that machine happened to have lying around.
+4. `cargo build --release` there, for real — not cross-compiled from the Mac.
+5. Verify on the remote machine before pulling anything back: `--version` reports the right
+   version, and `file target/release/holler-server` confirms it's a real binary for that
+   platform (e.g. `ELF 64-bit LSB pie executable, x86-64` for Linux).
+6. `scp` the verified binary back to wherever you're assembling the release's files.
+
+This is genuine cross-*building*, not cross-*compiling* — every platform's binary is actually
+built on that platform, by a real toolchain, from a real clone of the tagged commit. Don't try
+to set up cross-compilation toolchains (e.g. `cross`, manual target triples) as a shortcut; a
+real remote machine per platform is simpler and gives a binary you can trust without also
+trusting a cross-compilation toolchain's correctness.
 
 ## What a release actually produces
 
@@ -147,35 +175,47 @@ ruled out).
 
 ## Step by step
 
+**All version-bump work (Cargo.toml, CHANGELOG.md, README.md) lands on ONE branch, named
+`release/vX.Y.Z`** — not a separate branch per file/commit. One PR, one thing to review, one
+merge. `main` is protected, so this still goes through a PR like anything else; it just isn't
+several PRs.
+
 1. Confirm the release commit (usually `main`'s tip) has a green CI run on both platforms — see
    above.
 2. Run the full test-case catalog against that commit (`test-run.rb run`/`exec`), and decide
    whether this release warrants the full manual acceptance gate — see "Were the tests run?"
    above. CI green alone is not this step.
-3. Decide the version bump (PATCH/MINOR/MAJOR) per ADR 0014's rules, from everything accumulated
+3. Gather known issues **now, before writing the CHANGELOG** — skim open `bug`-labeled (and
+   otherwise plainly real) issues in both repos, write down the exact list. This list goes into
+   the CHANGELOG's Known Issues subsection verbatim in step 7 — gathering it after would mean
+   writing that subsection twice, or worse, from memory.
+4. Branch `release/vX.Y.Z` off the release commit. Everything below (steps 5-8) happens on this
+   one branch.
+5. Decide the version bump (PATCH/MINOR/MAJOR) per ADR 0014's rules, from everything accumulated
    in `CHANGELOG.md`'s `## [Unreleased]` section since the last tag.
-4. `cargo set-version <X.Y.Z>` (or edit `Cargo.toml`'s `version` by hand) — this is the only
+6. `cargo set-version <X.Y.Z>` (or edit `Cargo.toml`'s `version` by hand) — this is the only
    source-of-truth edit; nothing else needs independent updating.
-5. Move `CHANGELOG.md`'s `## [Unreleased]` content under a new `## [X.Y.Z] - YYYY-MM-DD` heading,
-   organized per "CHANGELOG entry structure" above; leave a fresh empty `## [Unreleased]` above it.
-6. **Update `README.md`** with anything a user landing on the repo needs to know about this
+7. Move `CHANGELOG.md`'s `## [Unreleased]` content under a new `## [X.Y.Z] - YYYY-MM-DD` heading,
+   organized per "CHANGELOG entry structure" above — Known Issues subsection is step 3's list,
+   verbatim; leave a fresh empty `## [Unreleased]` above it.
+8. **Update `README.md`** with anything a user landing on the repo needs to know about this
    release: notable new features, fixes, or changes to CLI invocation (new/changed flags,
    subcommands, output shape). Not every CHANGELOG line belongs here — only what changes how
    someone actually uses the tool, the same bar as a man page going stale.
-7. Commit those file changes (`Bump version to X.Y.Z`), push, confirm CI is green on the bump
-   commit itself too.
-8. `git tag -s vX.Y.Z -m "vX.Y.Z"` (signed, annotated), `git push origin vX.Y.Z`.
-9. Check open `bug`-labeled (and otherwise plainly real) issues for anything worth a known-issue
-   line in the release notes — see "Known issues" above.
-10. `cargo build --release` on each target platform (see the platform table above); verify
+9. Commit those file changes on `release/vX.Y.Z` (one commit or several, same branch), open a PR,
+   get it merged, confirm CI is green on the merge commit itself too.
+10. `git tag -s vX.Y.Z -m "vX.Y.Z"` (signed, annotated) on the merge commit, `git push origin vX.Y.Z`.
+11. `cargo build --release` on each target platform (see the platform table above); verify
     `./target/release/holler-server --version` actually reports `X.Y.Z` before attaching anything.
-11. Create the GitHub Release from the tag (`gh release create vX.Y.Z <binaries...> --notes-file
-    <changelog excerpt>`) — the confirm-before-publish step from above.
-12. **Verify the published artifact, not just the local build.** Download the binary actually
+12. Extract `CHANGELOG.md`'s `## [X.Y.Z]` section (already complete, including Known Issues) into
+    a standalone file — that's the release notes, no new content to write.
+13. Create the GitHub Release from the tag (`gh release create vX.Y.Z <binaries...> --notes-file
+    <that extracted file>`) — the confirm-before-publish step from above.
+14. **Verify the published artifact, not just the local build.** Download the binary actually
     attached to the GitHub Release (`gh release download vX.Y.Z`), from a clean directory, and
     run `./holler-server --version` against *that* file — confirms the upload isn't corrupted,
     is the right architecture, has its executable bit set, and actually reports `X.Y.Z`. A local
-    build passing step 10 is not evidence the uploaded artifact works; only downloading and
+    build passing step 11 is not evidence the uploaded artifact works; only downloading and
     running the real thing is.
 
 For the actual checklist to run through each time (not just the narrative above), copy

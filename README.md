@@ -139,9 +139,12 @@ See [how server and client talk](docs/protocol/talk.md) for the interrupt and pr
 
 ## Status and license
 
-The [v1 epic](https://github.com/Performant-Labs/holler-server/issues/27) is complete: all 13 builder-order stories are closed, and the shared acceptance gate — mint, join, roster, independent prompts to two live sessions, cooperative interrupt with sibling-session isolation, and clean detach — has passed end-to-end against real OpenCode sessions, not just a fixture.
+**`v0.1.0`** — first tagged release. See [`CHANGELOG.md`](CHANGELOG.md) for what's new, and its
+Known Issues section for real, currently-open gaps (interrupt/roster interaction between sibling
+sessions, `wss`/TLS not yet implemented, no Windows binary yet). See
+[`docs/releasing.md`](docs/releasing.md) for how releases are cut.
 
-A handful of small, non-blocking follow-ups from that gate run remain open: roster staleness on an explicit disconnect, an unwired `sessions` count in the status document, and an error-message wording issue on an interrupted `say`. None of them affect correctness of routing, interrupt, or isolation.
+The [v1 epic](https://github.com/Performant-Labs/holler-server/issues/27) is complete: all 13 builder-order stories are closed, and the shared acceptance gate — mint, join, roster, independent prompts to two live sessions, cooperative interrupt with sibling-session isolation, and clean detach — has passed end-to-end against real OpenCode sessions, not just a fixture. Attach mode (a second, additive way for `holler-client` to reach an agent — see Architecture above) has passed its own acceptance gate the same way.
 
 License is `AGPL-3.0-or-later` (see [`LICENSE`](LICENSE) and [ADR-0016](https://github.com/Performant-Labs/holler-server/issues/17)) — outside PRs are welcome, see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
