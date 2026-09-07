@@ -51,6 +51,22 @@
 #     repo's whole `cargo test` as a conservative fallback; evidence says
 #     a fallback ran
 #
+# `run` batches unit tests (issue #248): a case labeled `test-cat-unit`
+# whose Automation is a single, unqualified "<repo>: src/<path>.rs (<fn>)"
+# segment gets grouped with every other such case in the same repo and run
+# together as ONE `cargo test --lib` invocation instead of one subprocess
+# per case -- `--lib` already runs a repo's whole unit-test binary
+# regardless of case count, so per-case subprocesses were pure overhead.
+# Per-case results are parsed back out of that one run's `test <path> ...
+# ok|FAILED` lines (matched by bare function name, same uniqueness
+# assumption the single-case `--lib <fn>` form already relies on) and
+# recorded individually, same as an unbatched case. Anything not matching
+# that exact shape (integration cases, manual cases, multi-segment
+# automations, non-`test-cat-unit` cases) runs one at a time as before --
+# batching only ever changes *how* a result is produced, never what gets
+# recorded. `exec TEST_ID` (single-case local convenience) is unaffected;
+# batching only applies to `run`'s full pass over many cases at once.
+#
 # Usage:
 #   ruby scripts/test-run.rb discover
 #   ruby scripts/test-run.rb start [--applies server|client|both|all] [--type auto|manual|all]
@@ -90,40 +106,32 @@ end
 # ---------------------------------------------------------------------------
 def discover(gh)
   issues = gh.list_issues(REPO, labels: 'test-case', state: 'open', per_page: 100)
-  issues.flat_map do |issue|
+  issues.filter_map do |issue|
     body = issue.body || ''
-    next [] unless body.include?('| Test ID |')
-    next [] if issue.title.start_with?('Test case slot')
+    next nil unless body.include?('| Test ID |')
+    next nil if issue.title.start_with?('Test case slot')
 
-    # An `Applies to: both` case carries TWO "| Test ID |" rows in one issue
-    # (one hlrsvr-*, one hlrclnt-*, per holler-server#98's contract) -- every
-    # row becomes its own catalog entry, sharing this issue's other fields.
-    field_all(body, 'Test ID').map do |id|
-      {
-        issue: issue.number,
-        title: issue.title,
-        labels: issue.labels.map(&:name),
-        id: id,
-        applies: field(body, 'Applies to'),
-        group: field(body, 'Group'),
-        automation: field(body, 'Automation')
-      }
-    end
+    {
+      issue: issue.number,
+      title: issue.title,
+      labels: issue.labels.map(&:name),
+      id: field(body, 'Test ID'),
+      applies: field(body, 'Applies to'),
+      group: field(body, 'Group'),
+      automation: field(body, 'Automation')
+    }
   end
 end
 
 def field(body, name)
-  field_all(body, name).first
-end
+  line = body.lines.find { |l| l.strip.start_with?("| #{name} |") }
+  return nil unless line
 
-def field_all(body, name)
-  body.lines.select { |l| l.strip.start_with?("| #{name} |") }.map do |line|
-    # "| Field | Value |" -> "Value" (trim whitespace, keep everything between
-    # the second and (last) closing pipe so a Value containing "|" inside code
-    # spans isn't accidentally truncated at the wrong pipe).
-    cells = line.strip.split('|').map(&:strip).reject(&:empty?)
-    cells[1..].join(' | ')
-  end
+  # "| Field | Value |" -> "Value" (trim whitespace, keep everything between
+  # the second and (last) closing pipe so a Value containing "|" inside code
+  # spans isn't accidentally truncated at the wrong pipe).
+  cells = line.strip.split('|').map(&:strip).reject(&:empty?)
+  cells[1..].join(' | ')
 end
 
 # ---------------------------------------------------------------------------
@@ -232,6 +240,19 @@ end
 # ---------------------------------------------------------------------------
 # run: execute pending automated cases in a test-run issue for real.
 # ---------------------------------------------------------------------------
+
+# Cases carrying this label AND a single, unqualified `src/<path>.rs (<fn>)`
+# Automation field (issue #248) get batched: every such pending case for one
+# repo runs together as one `cargo test --lib` invocation instead of one
+# `cargo test --lib <fn>` subprocess per case. `--lib` already runs a
+# repo's entire unit-test binary in one process regardless of how many
+# individual tests it contains, so running N of them as N separate
+# subprocesses was pure per-process overhead multiplied by N, not N times
+# the actual test work. Batching changes only *how* a result is produced --
+# each case in the batch still gets recorded with its own status/evidence,
+# exactly as an individually-run case would.
+UNIT_BATCH_LABEL = 'test-cat-unit'
+
 Segment = Struct.new(:repo, :file, :fn, :lib_test, :fallback_used, :dir, :cmd, :error, keyword_init: true)
 
 # Parses one ';'-separated Automation segment into a Segment describing what
@@ -287,10 +308,63 @@ def exec_segment_captured(seg)
   [ok, out, status.exitstatus]
 end
 
+# Runs `cargo test --lib` once in `dir` (no `<fn>` filter -- the whole
+# unit-test binary) and parses cargo's own `test <path> ... ok|FAILED`
+# lines back into a { bare_fn_name => passed? } map, keyed on the last
+# `::`-segment of each test's full path -- the same bare-name matching
+# `cargo test --lib <fn>` already relies on elsewhere in this file (see the
+# module doc comment's note that bare names have been verified unique per
+# repo for every case introduced this way).
+def run_unit_batch(dir)
+  full_cmd = "source \"$HOME/.cargo/env\" 2>/dev/null; cargo test --lib"
+  out, = Open3.capture2e('bash', '-lc', full_cmd, chdir: dir)
+  results = {}
+  out.each_line do |line|
+    m = line.match(/^test (\S+) \.\.\. (ok|FAILED)/)
+    next unless m
+
+    results[m[1].split('::').last] = (m[2] == 'ok')
+  end
+  { out: out, results: results }
+end
+
+# Partitions `rows` into { row.id => [repo, fn] } for every pending, auto,
+# single-segment, `test-cat-unit`-labeled case whose Automation field
+# resolves to a plain lib-test Segment -- everything else (integration
+# cases, manual cases, multi-segment `; `-joined automations, anything
+# `parse_segment` can't cleanly resolve) is deliberately left out and
+# continues to run one case at a time exactly as before.
+def partition_unit_batchable(rows, catalog, server_dir:, client_dir:)
+  batchable = {}
+  rows.each do |row|
+    next unless row.status.include?('pending') && row.type.include?('auto')
+
+    cat = catalog.find { |c| c[:id] == row.id }
+    next unless cat && cat[:labels].include?(UNIT_BATCH_LABEL)
+
+    automation = cat[:automation]
+    next if automation.nil? || automation.empty? || automation =~ /\Amanual/i || automation.include?(';')
+
+    seg = parse_segment(automation, server_dir: server_dir, client_dir: client_dir)
+    next if seg.error || !seg.lib_test
+
+    batchable[row.id] = [seg.repo, seg.fn]
+  end
+  batchable
+end
+
 def run_cases(gh, issue_number, server_dir:, client_dir:)
   issue = gh.issue(REPO, issue_number)
   catalog = discover(gh)
   rows = extract_rows(issue.body)
+  dirs = { 'holler-server' => server_dir, 'holler-client' => client_dir }
+
+  batchable = partition_unit_batchable(rows, catalog, server_dir: server_dir, client_dir: client_dir)
+  batch_runs = {}
+  batchable.values.map(&:first).uniq.each do |repo|
+    puts "==> batched unit run: #{repo} (cargo test --lib)"
+    batch_runs[repo] = run_unit_batch(dirs[repo])
+  end
 
   rows.each do |row|
     unless row.status.include?('pending')
@@ -307,6 +381,30 @@ def run_cases(gh, issue_number, server_dir:, client_dir:)
 
     if automation.nil? || automation.empty? || automation =~ /\Amanual/i
       row.status = '⏳ pending — manual, use `record`'
+      next
+    end
+
+    if (repo_fn = batchable[row.id])
+      repo, fn = repo_fn
+      batch = batch_runs[repo]
+      found = batch[:results].key?(fn)
+      passed = found && batch[:results][fn]
+      ts = Time.now.utc.strftime('%Y-%m-%dT%H:%MZ')
+
+      if passed
+        row.status = '✅ pass'
+        row.evidence = "batched unit run #{ts}"
+      else
+        row.status = '❌ fail'
+        note = found ? '' : " -- test '#{fn}' not found in --lib output (renamed or removed?)"
+        row.evidence = "batched unit run #{ts} — see comment"
+        comment_body = "### Result for `#{row.id}`: #{row.status}\n\n" \
+                       "Part of a batched `cargo test --lib` run in #{repo} (issue #248)#{note}.\n\n" \
+                       "```\n#{batch[:out].lines.last(25).join}\n```"
+        comment = gh.add_comment(REPO, issue_number, comment_body)
+        row.evidence = "[#{row.evidence}](#{comment.html_url})"
+      end
+      puts "==> #{row.id}: #{row.status} (batched, #{repo})"
       next
     end
 
@@ -417,29 +515,8 @@ def exec_test(gh, test_id, server_dir:, client_dir:)
 
     puts "--- #{seg.repo} $ #{seg.cmd} (in #{seg.dir}) ---"
     full_cmd = "source \"$HOME/.cargo/env\" 2>/dev/null; #{seg.cmd}"
-
-    # Stream output live (line-by-line, as it's produced) while also
-    # buffering it -- a filter matching zero tests still exits 0 (cargo
-    # has no way to say "your filter named nothing real"), so a named-fn
-    # segment with 0 passed/0 failed must be caught the same way
-    # exec_segment_captured catches it for `run`, which a bare
-    # live-streaming `system()` call cannot do since it never sees the
-    # output at all.
-    buffer = +''
-    Open3.popen2e('bash', '-lc', full_cmd, chdir: seg.dir) do |_stdin, out_err, wait_thr|
-      out_err.each_line do |line|
-        puts line
-        buffer << line
-      end
-      ok = wait_thr.value.success?
-      if ok && seg.fn && (m = buffer.match(/^test result: \w+\. (\d+) passed; (\d+) failed;.*?(\d+) filtered out/))
-        if m[1].to_i.zero? && m[2].to_i.zero?
-          ok = false
-          warn "[named test '#{seg.fn}' did not run -- filtered out or does not exist#{seg.file ? " in #{seg.file}.rs" : ''}]"
-        end
-      end
-      overall_ok &&= ok
-    end
+    ok = system('bash', '-lc', full_cmd, chdir: seg.dir)
+    overall_ok &&= ok
   end
 
   exit(overall_ok ? 0 : 1)
