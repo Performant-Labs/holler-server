@@ -49,6 +49,12 @@ the catalog itself — `ruby scripts/test-run.rb run <test-run-issue> --server-d
 this release warrants the full manual acceptance gate (real OpenCode, real model calls). A
 release note this doc, or the checklist, ever says "tests passed" off CI alone is wrong.
 
+**A red test does not automatically block a release — it can be knowingly overridden.** This
+is a real, standing option, not a last resort: whoever's cutting the release can decide a
+specific failure doesn't hold this release up. The one hard requirement is that an override is
+**recorded, not silent** — which test, why, in the release-checklist issue (see below) — so
+"tests passed" in the release notes is never quietly covering for "we chose to ship anyway."
+
 ## Which platforms does a release target?
 
 **Don't ship a binary for a platform CI never ran the suite on.** Only `ubuntu-latest` and
