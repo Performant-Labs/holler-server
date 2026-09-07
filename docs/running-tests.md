@@ -33,7 +33,7 @@ what an automated case actually does). Cases also carry three script-selectable 
 axes — `test-grp-*` (which group), `test-cat-*` (why/when you'd run it), and `test-tag-*`
 (open-ended cross-cutting properties such as `alters-db` — see [issue #98](https://github.com/Performant-Labs/holler-server/issues/98)'s
 "Label axes" section, and issue [#304](https://github.com/Performant-Labs/holler-server/issues/304)
-for the `--tag`/`--tag-invert` selection syntax, currently being implemented).
+for the `--tag`/`--tag-invert` selection syntax, implemented in `exec` below).
 
 ### Running one ticket's test — the easy way
 
@@ -48,6 +48,36 @@ underlying test exits with, so it composes with shell scripting
 all** — no test-run issue, no comment, nothing — it's a pure local convenience. If the ID
 doesn't exist in the catalog, or it's a manual-only case with nothing automated to run, it
 says so clearly and exits non-zero rather than silently doing nothing.
+
+### Selecting what to run
+
+`exec` also takes Playwright-style selection flags, all independent **conjuncts** over the
+catalog (each one narrows the set; all of them AND together):
+
+    ruby scripts/test-run.rb exec [TEST_ID] [--group G] [--applies X] [--tag S...] [--tag-invert S...] [--list F] [--list-invert F] [--list] [--server-dir DIR] [--client-dir DIR]
+
+- A positional `TEST_ID` still works exactly as before and **composes (ANDs) with** the
+  selection flags — e.g. `exec hlrsvr-1000 --applies server` runs that one case only if
+  it also matches the flag.
+- `--group G` — the *where* axis. `G` is the full group name (`concurrency`) **or** the
+  label stem (`invoc`); both select the same subset. An unknown group **fails loudly**,
+  listing the ten valid groups.
+- `--applies X` — *server* / *client* / *both* / *all* (Playwright's `--project`). `all`
+  (or omitting it) imposes no constraint.
+- `--tag S...` / `--tag-invert S...` — the open-ended `test-tag-*` axis. `--tag` selects
+  cases carrying **any** of the named tags (OR within the flag). An unknown tag is *not*
+  an error — it simply selects nothing; an unknown `--tag-invert` excludes nothing.
+- `--list F` / `--list-invert F` — explicit Test ID lists. The file format is one Test ID
+  per line; blank lines and `#`-prefixed lines are skipped. `--list F` keeps only the
+  listed IDs; `--list-invert F` drops them.
+- **`--list` (bare, no file)** is *preview mode*: it prints each resolved Test ID with its
+  `Automation` command, one per line, plus a count — **without running anything and without
+  any GitHub write** — then exits 0.
+- If nothing is given (no positional ID and no selection flag), `exec` prints its usage
+  and exits non-zero rather than silently running the whole catalog.
+- `--grep` over case **titles is deliberately not ported** from Playwright: the open-ended
+  `test-tag-*` axis (issue #305) fills that role, so `--tag` is the intended way to narrow
+  by a property.
 
 ### Running a full test run (the release-gating process)
 

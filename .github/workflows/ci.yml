@@ -43,6 +43,12 @@ jobs:
         run: cargo test
         shell: pwsh
 
+      # Issue #304: selection logic is dependency-free (stdlib only) so it
+      # runs on the runners' preinstalled Ruby (2.6 on macOS) -- no gem install.
+      - name: test-run.rb selection (issue #304)
+        run: ruby scripts/test_selection_test.rb
+        shell: pwsh
+
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
         shell: pwsh

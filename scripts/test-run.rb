@@ -28,14 +28,17 @@
 #   Applies to  -- server / client / both
 #   Group       -- invocation / lifecycle / logging / io / platform /
 #                 concurrency / network / diagnostics / crypto / load
-#                 (matches the test-grp-* label; the group is the hundreds
-#                 digit of the Test ID -- invocation=1000 .. load=1900.
-#                 nil on the pre-existing TC-NNN cases that predate this
-#                 field, harmless -- nothing reads it yet. A third,
-#                 open-ended tag axis -- test-tag-*, added in issue #305 --
-#                 also exists in the catalog; consuming it as a selection
-#                 filter is issue #304's --tag/--tag-invert. Until then,
-#                 parsed-and-ignored here.)
+#                 (should match the case's test-grp-* label; the group is the
+#                 hundreds digit of the Test ID -- invocation=1000 ..
+#                 load=1900. nil on the pre-existing TC-NNN cases that predate
+#                 this field. exec's --group matches on the test-grp-* LABEL,
+#                 treating this field only as a fallback, because a few
+#                 catalog issues carry a stale body value that disagrees with
+#                 the label -- e.g. the io-group cases #177/#178 are labeled
+#                 test-grp-logging. A third, open-ended tag axis --
+#                 test-tag-*, added in issue #305 -- also exists in the
+#                 catalog; exec consumes it as a selection filter via
+#                 --tag/--tag-invert (issue #304).)
 #   Automation  -- free-text pointer(s) to the automated assertion(s), or a
 #                 string starting with "manual" for manual-only cases
 #
@@ -78,13 +81,23 @@
 #   ruby scripts/test-run.rb start [--applies server|client|both|all] [--type auto|manual|all]
 #   ruby scripts/test-run.rb run ISSUE --server-dir DIR --client-dir DIR
 #   ruby scripts/test-run.rb record ISSUE TEST_ID pass|fail [note]
-#   ruby scripts/test-run.rb exec TEST_ID [--server-dir DIR] [--client-dir DIR]
-#     Runs ONE test case's Automation field locally, right now, streaming
-#     real `cargo test` output live -- no GitHub write of any kind (no
-#     test-run issue, no comment). For "I have a Test ID from an issue and
-#     just want to run that one test" -- you don't need to know its
-#     file/function, just the ID (e.g. `exec hlrsvr-1000`). Exits with the
-#     same status the underlying `cargo test` exits with. --server-dir and
+#   ruby scripts/test-run.rb exec [TEST_ID] [--applies X] [--group G] [--tag S...] \
+#                                    [--tag-invert S...] [--list F] [--list-invert F] \
+#                                    [--list] [--server-dir DIR] [--client-dir DIR]
+#     Runs the selected test case(s)' Automation fields locally, right now,
+#     streaming real `cargo test` output live -- no GitHub write of any
+#     kind (no test-run issue, no comment). A positional TEST_ID still works
+#     as before (just the ID, e.g. `exec hlrsvr-1000`) and composes (ANDs)
+#     with the selection flags. The five flags --group/--applies/--tag/
+#     --tag-invert/--list are each an independent conjunct over the catalog
+#     (Playwright-style; --applies also ANDs, and --tag is OR-within,
+#     Playwright's --grep ∧ --project pattern). --list (bare, no file)
+#     PREVIEWs the resolved Test IDs + their Automation commands one per
+#     line and exits 0 without running anything or writing to GitHub.
+#     --grep over case TITLES is deliberately NOT ported -- the test-tag-*
+#     axis (issue #305) fills that role; see docs/running-tests.md. Exits
+#     with the same status the underlying `cargo test` exits with
+#     (exit 0 only if every selected case passed). --server-dir and
 #     --client-dir default to ~/Projects/holler-server and
 #     ~/Projects/holler-client (this machine's layout) if omitted.
 
@@ -92,6 +105,8 @@ require 'octokit'
 require 'time'
 require 'open3'
 require 'optparse'
+require 'set'
+require_relative 'test_selection'
 
 REPO = 'Performant-Labs/holler-server'
 MARKER_START = '<!-- test-run-fields:start -->'
@@ -510,32 +525,34 @@ end
 # and exits with the same status the underlying command(s) exit with, so
 # it composes with shell scripting ("test-run.rb exec hlrsvr-1000 || ...").
 # ---------------------------------------------------------------------------
-def exec_test(gh, test_id, server_dir:, client_dir:)
-  catalog = discover(gh)
-  cat = catalog.find { |c| c[:id] == test_id }
-  abort("error: exec: test id '#{test_id}' not found in the catalog") unless cat
-
-  automation = cat[:automation]
-  if automation.nil? || automation.empty? || automation =~ /\Amanual/i
-    abort("error: exec: #{test_id} is a manual case with no automated command to run " \
-          "(Automation: #{automation.inspect})")
-  end
-
-  puts "==> #{test_id}: #{automation}"
+# entries: the pre-resolved Array of discover() catalog Hashes to run, in
+# order (exactly one for a single positional Test ID). Runs each entry's
+# Automation field for real, live, and exits 0 only if ALL passed.
+def exec_test(gh, entries, server_dir:, client_dir:)
   overall_ok = true
-
-  automation.split(';').each do |raw_seg|
-    seg = parse_segment(raw_seg, server_dir: server_dir, client_dir: client_dir)
-    if seg.error
-      warn seg.error
+  entries.each do |cat|
+    test_id = cat[:id]
+    automation = cat[:automation]
+    if automation.nil? || automation.empty? || automation =~ /\Amanual/i
+      warn "error: exec: #{test_id} is a manual case with no automated command to run (Automation: #{automation.inspect}) -- skipping"
       overall_ok = false
       next
     end
 
-    puts "--- #{seg.repo} $ #{seg.cmd} (in #{seg.dir}) ---"
-    full_cmd = "source \"$HOME/.cargo/env\" 2>/dev/null; #{seg.cmd}"
-    ok = system('bash', '-lc', full_cmd, chdir: seg.dir)
-    overall_ok &&= ok
+    puts "==> #{test_id}: #{automation}"
+    automation.split(';').each do |raw_seg|
+      seg = parse_segment(raw_seg, server_dir: server_dir, client_dir: client_dir)
+      if seg.error
+        warn seg.error
+        overall_ok = false
+        next
+      end
+
+      puts "--- #{seg.repo} $ #{seg.cmd} (in #{seg.dir}) ---"
+      full_cmd = "source \"$HOME/.cargo/env\" 2>/dev/null; #{seg.cmd}"
+      ok = system('bash', '-lc', full_cmd, chdir: seg.dir)
+      overall_ok &&= ok
+    end
   end
 
   exit(overall_ok ? 0 : 1)
@@ -574,16 +591,81 @@ def main
     note = ARGV.shift || ''
     record(gh, issue.to_i, test_id, result, note)
   when 'exec'
-    test_id = ARGV.shift or abort('usage: exec TEST_ID [--server-dir DIR] [--client-dir DIR]')
+    # Positional TEST_ID is OPTIONAL (selection flags may stand in for it).
+    # Only shift it when the first remaining arg is NOT an option -- a bare
+    # `ARGV.shift` would otherwise grab `--group` (the first flag) as the ID
+    # on a flag-only invocation, which is exactly the mis-parse we must avoid.
+    # The pack's "no `or abort`" intent is preserved: a bare `exec` (no
+    # position, no flags) still reaches the has_selection guard below and
+    # prints usage, so it exits non-zero.
+    test_id = (ARGV.first && !ARGV.first.start_with?('-')) ? ARGV.shift : nil
     opts = {
       server: File.expand_path('~/Projects/holler-server'),
       client: File.expand_path('~/Projects/holler-client')
     }
+    # Hoisted (not block-local) so the has_selection abort below can reuse it
+    # after the OptionParser block scope has ended.
+    exec_banner = "usage: exec [TEST_ID] [--applies X] [--group G] [--tag S...] " \
+                  "[--tag-invert S...] [--list F] [--list-invert F] [--list] " \
+                  "[--server-dir DIR] [--client-dir DIR]"
     OptionParser.new do |o|
+      o.banner = exec_banner
       o.on('--server-dir DIR') { |v| opts[:server] = v }
       o.on('--client-dir DIR') { |v| opts[:client] = v }
+      o.on('--group G') { |v| opts[:group] = v }
+      o.on('--applies X') { |v| opts[:applies] = v }
+      o.on('--tag S', 'test-tag-<S> to select (OR-within, multiple allowed)') { |v| opts[:tags] = []; opts[:tags] << v }
+      o.on('--tag-invert S', 'exclude cases carrying test-tag-<S> (multiple allowed)') { |v| opts[:tag_inverts] = []; opts[:tag_inverts] << v }
+      o.on('--list [FILE]', 'bare: preview resolved IDs without running; FILE: keep only those IDs') { |v| opts[:list] = v; opts[:preview] = (v.nil?) }
+      o.on('--list-invert FILE', 'exclude the Test IDs listed in FILE') { |v| opts[:list_invert] = v }
+      o.on('-h', '--help') { puts o.banner; exit 0 }
     end.parse!(ARGV)
-    exec_test(gh, test_id, server_dir: opts[:server], client_dir: opts[:client])
+
+    has_selection = !test_id.nil? || !opts[:group].nil? || !opts[:applies].nil? ||
+                    !opts[:tags].nil? || !opts[:tag_inverts].nil? ||
+                    !opts[:list].nil? || !opts[:list_invert].nil?
+    abort("#{exec_banner}") unless has_selection
+
+    catalog = discover(gh)
+    # A positional TEST_ID narrows the catalog to that one entry (the legacy
+    # single-case path). It then ANDs with any selection flags below, so
+    # `exec <ID> --group G` runs <ID> only if <ID> also matches the flags.
+    selected = test_id ? catalog.select { |c| c[:id] == test_id } : catalog
+
+    # Which flags were given (used both to decide whether to AND them and to
+    # name them in the "no match" error). `--list` is a FILE here (its bare
+    # preview form set opts[:preview] and left opts[:list] nil).
+    active =
+      (opts[:group] ? ['group: ' + opts[:group]] : []) +
+      (opts[:applies] ? ['applies: ' + opts[:applies]] : []) +
+      (opts[:tags] ? ['tag: ' + opts[:tags].join(',')] : []) +
+      (opts[:tag_inverts] ? ['tag-invert: ' + opts[:tag_inverts].join(',')] : []) +
+      (opts[:list_invert] ? ['list-invert: ' + opts[:list_invert]] : [])
+    active = ['list: ' + opts[:list]] unless opts[:list].nil? || opts[:list] == ''
+
+    # No flags at all -> the legacy positional path: preserve today's exact
+    # message for an unknown ID, and an empty selection is impossible here.
+    if active.empty?
+      abort("error: exec: test id '#{test_id}' not found in the catalog") if test_id && selected.empty?
+    else
+      # Flags given (with or without a positional ID): apply them as a
+      # conjunction over the (possibly positional-narrowed) set.
+      sel = TestSelection.new(group: opts[:group], applies: opts[:applies], tags: opts[:tags],
+                               tag_inverts: opts[:tag_inverts],
+                               list_ids: (opts[:list] && !opts[:preview]) ? TestSelection.read_list_file(opts[:list]) : nil,
+                               list_invert_ids: opts[:list_invert] ? TestSelection.read_list_file(opts[:list_invert]) : nil)
+      selected = sel.call(selected)
+      if opts[:preview]
+        selected.each { |c| puts "#{c[:id]}  #{c[:automation] || '(none)'}" }
+        puts "#{selected.size} case(s) matched"
+        exit(0)
+      end
+      # Flags narrowed to nothing (also covers "positional ID given but the
+      # selection flags exclude it" -- e.g. `exec hlrsvr-1000 --group concurrency`).
+      abort("error: exec: no catalog cases matched the selection (#{active.join(', ')})") if selected.empty?
+    end
+
+    exec_test(gh, selected, server_dir: opts[:server], client_dir: opts[:client])
   else
     abort("usage: #{$PROGRAM_NAME} {discover|start|run|record|exec} ...")
   end
