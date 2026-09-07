@@ -1110,6 +1110,52 @@ mod tests {
         assert_eq!(views[0].client_id, result.client_id);
     }
 
+    /// hlrsvr-1804 (Security & Encryption group): a join secret is
+    /// single-use. Redeeming it once must succeed exactly as
+    /// `redeem_transitions_unused_to_bound_and_issues_client_id_and_credential`
+    /// proves; redeeming the SAME secret a second time -- even though the
+    /// `token_id`/secret pair presented is byte-for-byte identical to the
+    /// first successful redeem -- must fail closed with `AlreadyBound`,
+    /// not silently mint a second credential and not leave the record's
+    /// existing binding disturbed.
+    #[test]
+    fn redeeming_an_already_bound_token_again_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let minted = store
+            .mint_with_pepper(TEST_PEPPER, None, DEFAULT_TTL)
+            .unwrap();
+
+        let first = store
+            .redeem_with_pepper(
+                TEST_PEPPER,
+                &minted.token_id,
+                &minted.secret,
+                "kiwi.local".to_string(),
+            )
+            .unwrap();
+
+        let second = store.redeem_with_pepper(
+            TEST_PEPPER,
+            &minted.token_id,
+            &minted.secret,
+            "different-machine.local".to_string(),
+        );
+        let err = second.unwrap_err();
+        assert!(
+            matches!(&err, TokenError::AlreadyBound(id) if id == &minted.token_id),
+            "expected AlreadyBound({:?}), got {err:?}",
+            minted.token_id
+        );
+
+        // The original binding is untouched by the rejected second attempt
+        // -- still bound to the first machine/client_id, not overwritten.
+        let records = store.load().unwrap();
+        assert_eq!(records[0].state, StoredState::Bound);
+        assert_eq!(records[0].machine.as_deref(), Some("kiwi.local"));
+        assert_eq!(records[0].client_id.as_deref(), Some(first.client_id.as_str()));
+    }
+
     #[test]
     fn redeem_with_wrong_secret_fails_closed_without_mutating_state() {
         let dir = tempfile::tempdir().unwrap();
