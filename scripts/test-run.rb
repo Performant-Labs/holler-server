@@ -90,32 +90,40 @@ end
 # ---------------------------------------------------------------------------
 def discover(gh)
   issues = gh.list_issues(REPO, labels: 'test-case', state: 'open', per_page: 100)
-  issues.filter_map do |issue|
+  issues.flat_map do |issue|
     body = issue.body || ''
-    next nil unless body.include?('| Test ID |')
-    next nil if issue.title.start_with?('Test case slot')
+    next [] unless body.include?('| Test ID |')
+    next [] if issue.title.start_with?('Test case slot')
 
-    {
-      issue: issue.number,
-      title: issue.title,
-      labels: issue.labels.map(&:name),
-      id: field(body, 'Test ID'),
-      applies: field(body, 'Applies to'),
-      group: field(body, 'Group'),
-      automation: field(body, 'Automation')
-    }
+    # An `Applies to: both` case carries TWO "| Test ID |" rows in one issue
+    # (one hlrsvr-*, one hlrclnt-*, per holler-server#98's contract) -- every
+    # row becomes its own catalog entry, sharing this issue's other fields.
+    field_all(body, 'Test ID').map do |id|
+      {
+        issue: issue.number,
+        title: issue.title,
+        labels: issue.labels.map(&:name),
+        id: id,
+        applies: field(body, 'Applies to'),
+        group: field(body, 'Group'),
+        automation: field(body, 'Automation')
+      }
+    end
   end
 end
 
 def field(body, name)
-  line = body.lines.find { |l| l.strip.start_with?("| #{name} |") }
-  return nil unless line
+  field_all(body, name).first
+end
 
-  # "| Field | Value |" -> "Value" (trim whitespace, keep everything between
-  # the second and (last) closing pipe so a Value containing "|" inside code
-  # spans isn't accidentally truncated at the wrong pipe).
-  cells = line.strip.split('|').map(&:strip).reject(&:empty?)
-  cells[1..].join(' | ')
+def field_all(body, name)
+  body.lines.select { |l| l.strip.start_with?("| #{name} |") }.map do |line|
+    # "| Field | Value |" -> "Value" (trim whitespace, keep everything between
+    # the second and (last) closing pipe so a Value containing "|" inside code
+    # spans isn't accidentally truncated at the wrong pipe).
+    cells = line.strip.split('|').map(&:strip).reject(&:empty?)
+    cells[1..].join(' | ')
+  end
 end
 
 # ---------------------------------------------------------------------------
@@ -409,8 +417,29 @@ def exec_test(gh, test_id, server_dir:, client_dir:)
 
     puts "--- #{seg.repo} $ #{seg.cmd} (in #{seg.dir}) ---"
     full_cmd = "source \"$HOME/.cargo/env\" 2>/dev/null; #{seg.cmd}"
-    ok = system('bash', '-lc', full_cmd, chdir: seg.dir)
-    overall_ok &&= ok
+
+    # Stream output live (line-by-line, as it's produced) while also
+    # buffering it -- a filter matching zero tests still exits 0 (cargo
+    # has no way to say "your filter named nothing real"), so a named-fn
+    # segment with 0 passed/0 failed must be caught the same way
+    # exec_segment_captured catches it for `run`, which a bare
+    # live-streaming `system()` call cannot do since it never sees the
+    # output at all.
+    buffer = +''
+    Open3.popen2e('bash', '-lc', full_cmd, chdir: seg.dir) do |_stdin, out_err, wait_thr|
+      out_err.each_line do |line|
+        puts line
+        buffer << line
+      end
+      ok = wait_thr.value.success?
+      if ok && seg.fn && (m = buffer.match(/^test result: \w+\. (\d+) passed; (\d+) failed;.*?(\d+) filtered out/))
+        if m[1].to_i.zero? && m[2].to_i.zero?
+          ok = false
+          warn "[named test '#{seg.fn}' did not run -- filtered out or does not exist#{seg.file ? " in #{seg.file}.rs" : ''}]"
+        end
+      end
+      overall_ok &&= ok
+    end
   end
 
   exit(overall_ok ? 0 : 1)
