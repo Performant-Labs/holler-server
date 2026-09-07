@@ -119,10 +119,22 @@ pub struct ConnectionContext {
 /// opaque `Value` — see `proto::PresenceBody`'s doc comment) since it
 /// never pins one down formally. A row that doesn't fit this shape is
 /// skipped, not fatal to the frame (issue #32).
+/// Issue #256 (ADR 0017): `mode`/`harness_session_id` are optional,
+/// additive keys a client may include for an attach-mode session (omitted
+/// entirely for spawn -- see `holler-client`'s `SessionStatus`, which this
+/// mirrors). `#[derive(Deserialize)]` with no `deny_unknown_fields` already
+/// ignores any OTHER key a newer client might one day add here, which is
+/// the actual mechanism satisfying "unknown keys stay ignored, no v2" --
+/// confirmed by this module's own `presence_row_with_unknown_extra_key_is_not_fatal`
+/// test.
 #[derive(Deserialize)]
 struct PresenceSession {
     name: String,
     harness: String,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    harness_session_id: Option<String>,
 }
 
 /// Drive one accepted TCP connection through the WebSocket handshake and
@@ -582,11 +594,13 @@ async fn handle_frame(
             for raw_session in sessions {
                 match serde_json::from_value::<PresenceSession>(raw_session.clone()) {
                     Ok(session) => {
-                        if let Err(conflict) = ctx.roster.advertise(
+                        if let Err(conflict) = ctx.roster.advertise_with_mode(
                             session.name.clone(),
                             session.harness,
                             token_id,
                             client_id,
+                            session.mode,
+                            session.harness_session_id,
                         ) {
                             trace(ctx, &format!("presence: {conflict}, ignoring advertise"));
                         }

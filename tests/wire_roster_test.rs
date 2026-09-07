@@ -293,6 +293,109 @@ fn holler_roster_reflects_an_advertised_session() {
         let row = wait_for_roster_row(&env, "alpha", |r| r.is_some());
         assert_eq!(row["harness"], "opencode");
         assert_eq!(row["state"], "connected");
+        // Issue #256 (ADR 0017): a spawn-mode presence row (no `mode`/
+        // `harness_session_id` keys at all, exactly what every client
+        // before this story ever sent) must still round-trip with
+        // NEITHER key present on the roster row -- not `null`, absent --
+        // the actual regression-safety proof that adding the optional
+        // keys does not change what an old client's presence produces.
+        assert!(
+            row.get("mode").is_none(),
+            "spawn session must not carry a mode key at all: {row:?}"
+        );
+        assert!(
+            row.get("harness_session_id").is_none(),
+            "spawn session must not carry a harness_session_id key at all: {row:?}"
+        );
+    });
+}
+
+#[test]
+fn holler_roster_reflects_attach_mode_and_harness_session_id() {
+    // Issue #256 (ADR 0017): a presence row WITH the new optional keys
+    // decodes correctly and the roster reflects both, verbatim -- the
+    // "codec round-trip with the new keys" case the issue requires.
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "kiwi");
+    let (_client_id, credential) = redeem(&env, &token_id, &secret, "kiwi.local");
+    let server = ServerProcess::spawn(&env);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(server.url())
+            .await
+            .expect("client connects to the real listener");
+        send_json(&mut ws, &auth_envelope(&token_id, &credential)).await;
+        let _server_hello = recv_json(&mut ws).await;
+
+        send_json(
+            &mut ws,
+            &presence_envelope(
+                &token_id,
+                json!([{
+                    "name": "alpha",
+                    "harness": "opencode",
+                    "mode": "attach",
+                    "harness_session_id": "ses_f86736882ffe9khbj90No9ObLw"
+                }]),
+            ),
+        )
+        .await;
+
+        let row = wait_for_roster_row(&env, "alpha", |r| r.is_some());
+        assert_eq!(row["harness"], "opencode");
+        assert_eq!(row["state"], "connected");
+        assert_eq!(row["mode"], "attach");
+        assert_eq!(row["harness_session_id"], "ses_f86736882ffe9khbj90No9ObLw");
+        // ADR 0007 (address sessions, not hosts) still holds: the row is
+        // keyed by, and only by, the Holler session NAME ("alpha") --
+        // `harness_session_id` is carried purely as display/locator data
+        // alongside it, never as a second key or an alternate address.
+        assert_eq!(row["name"], "alpha");
+    });
+}
+
+#[test]
+fn presence_row_with_unknown_extra_key_is_not_fatal() {
+    // Issue #256: "unknown keys stay ignored... if current decoders
+    // reject unknown keys, that is a bug in the codec -- fix the ignore
+    // rule, do not bump v." `PresenceSession`'s `#[derive(Deserialize)]`
+    // has no `deny_unknown_fields`, so serde already ignores a key it
+    // doesn't recognize -- this proves that holds for real, on the live
+    // decode path, not just by reading the derive macro's default.
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "kiwi");
+    let (_client_id, credential) = redeem(&env, &token_id, &secret, "kiwi.local");
+    let server = ServerProcess::spawn(&env);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(server.url())
+            .await
+            .expect("client connects to the real listener");
+        send_json(&mut ws, &auth_envelope(&token_id, &credential)).await;
+        let _server_hello = recv_json(&mut ws).await;
+
+        send_json(
+            &mut ws,
+            &presence_envelope(
+                &token_id,
+                json!([{
+                    "name": "alpha",
+                    "harness": "opencode",
+                    "mode": "attach",
+                    "harness_session_id": "ses_unknown_key_test",
+                    "some_future_key_this_server_has_never_heard_of": {"nested": true}
+                }]),
+            ),
+        )
+        .await;
+
+        let row = wait_for_roster_row(&env, "alpha", |r| r.is_some());
+        assert_eq!(
+            row["mode"], "attach",
+            "the row with the unknown extra key must still decode and advertise: {row:?}"
+        );
     });
 }
 

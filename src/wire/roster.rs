@@ -159,6 +159,14 @@ struct RosterEntry {
     client_id: String,
     last_seen: Instant,
     gone_now: bool,
+    /// Issue #256 (ADR 0017): `Some("attach")` for an attach-mode session,
+    /// `None` for spawn (today's only case until a client actually
+    /// advertises otherwise). Display/locator only -- routing stays by
+    /// session name (`ADR 0007`), never by this or `harness_session_id`.
+    mode: Option<String>,
+    /// Issue #256: the OpenCode `ses_...` id an attach session is bound
+    /// to, or `None` for spawn / an attach client that omitted it.
+    harness_session_id: Option<String>,
 }
 
 impl RosterEntry {
@@ -185,6 +193,11 @@ pub struct RosterRow {
     pub client_id: String,
     pub state: RosterState,
     pub last_seen_ms_ago: u128,
+    /// Issue #256: `Some("attach")` for an attach-mode session, `None`
+    /// (displayed as spawn) otherwise. Display only -- see `RosterEntry`.
+    pub mode: Option<String>,
+    /// Issue #256: the attached OpenCode `ses_...` id, or `None`.
+    pub harness_session_id: Option<String>,
 }
 
 /// Advertising a session name already held by a **different**, still
@@ -249,6 +262,24 @@ impl Roster {
         token_id: &str,
         client_id: &str,
     ) -> Result<(), RosterConflict> {
+        self.advertise_with_mode(name, harness, token_id, client_id, None, None)
+    }
+
+    /// Same as [`Self::advertise`], plus the optional attach-mode display
+    /// fields (issue #256, ADR 0017). Kept as a separate method rather than
+    /// widening `advertise`'s own signature so every pre-existing call site
+    /// (this module's own tests included) keeps compiling unchanged --
+    /// `mode`/`harness_session_id` are new, additive information, not a
+    /// change to what advertising a session already meant.
+    pub fn advertise_with_mode(
+        &self,
+        name: String,
+        harness: String,
+        token_id: &str,
+        client_id: &str,
+        mode: Option<String>,
+        harness_session_id: Option<String>,
+    ) -> Result<(), RosterConflict> {
         let now = Instant::now();
         let mut entries = self.entries.lock().expect("roster mutex poisoned");
         if let Some(existing) = entries.get(&name) {
@@ -268,6 +299,8 @@ impl Roster {
                 client_id: client_id.to_string(),
                 last_seen: now,
                 gone_now: false,
+                mode,
+                harness_session_id,
             },
         );
         Ok(())
@@ -370,6 +403,8 @@ impl Roster {
                 client_id: e.client_id.clone(),
                 state: e.state_at(now, &self.config),
                 last_seen_ms_ago: now.saturating_duration_since(e.last_seen).as_millis(),
+                mode: e.mode.clone(),
+                harness_session_id: e.harness_session_id.clone(),
             })
             .collect();
         rows.sort_by(|a, b| a.name.cmp(&b.name));
