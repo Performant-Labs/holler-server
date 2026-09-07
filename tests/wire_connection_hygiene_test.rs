@@ -160,6 +160,52 @@ async fn recv_json(
 }
 
 // ---------------------------------------------------------------------
+// Protocol-version mismatch (hlrsvr-1707)
+// ---------------------------------------------------------------------
+
+#[test]
+fn an_unsupported_protocol_version_gets_a_precise_error_before_the_connection_closes() {
+    let env = Env::new();
+    let server = ServerProcess::spawn(&env, &[]);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(server.url())
+            .await
+            .expect("client connects to the real listener");
+
+        // A well-formed auth envelope except for `v`, which no version of
+        // this server has ever spoken -- must not be treated as a
+        // malformed/unknown-type frame (a different, less precise error),
+        // and must not just hang or silently drop the connection.
+        let future_version = json!({
+            "v": 999, "type": "auth", "id": "id-auth", "ts": "2026-09-05T00:00:00Z",
+            "from": "tok_whatever", "body": { "cred_field": "unused_version_checked_first" }
+        });
+        send_json(&mut ws, &future_version).await;
+
+        let reply = recv_json(&mut ws).await;
+        assert_eq!(reply["type"], "error", "expected an error envelope, got {reply:?}");
+        assert_eq!(
+            reply["body"]["code"], "unsupported_version",
+            "expected the precise unsupported_version code, got {reply:?}"
+        );
+
+        // Having decoded and answered, the server tears the connection
+        // down (see connection.rs's first-frame handler: it sends the
+        // error envelope, then returns) rather than waiting for a
+        // corrected retry on the same socket.
+        let outcome = tokio::time::timeout(Duration::from_secs(5), ws.next()).await;
+        match outcome {
+            Ok(None) => {}
+            Ok(Some(Err(_))) => {}
+            Ok(Some(Ok(Message::Close(_)))) => {}
+            other => panic!("expected the connection to close after the error, got {other:?}"),
+        }
+    });
+}
+
+// ---------------------------------------------------------------------
 // Frame-size cap
 // ---------------------------------------------------------------------
 
