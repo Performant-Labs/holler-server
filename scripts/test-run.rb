@@ -106,32 +106,45 @@ end
 # ---------------------------------------------------------------------------
 def discover(gh)
   issues = gh.list_issues(REPO, labels: 'test-case', state: 'open', per_page: 100)
-  issues.filter_map do |issue|
+  issues.flat_map do |issue|
     body = issue.body || ''
-    next nil unless body.include?('| Test ID |')
-    next nil if issue.title.start_with?('Test case slot')
+    next [] unless body.include?('| Test ID |')
+    next [] if issue.title.start_with?('Test case slot')
 
-    {
-      issue: issue.number,
-      title: issue.title,
-      labels: issue.labels.map(&:name),
-      id: field(body, 'Test ID'),
-      applies: field(body, 'Applies to'),
-      group: field(body, 'Group'),
-      automation: field(body, 'Automation')
-    }
+    # An `Applies to: both` case carries TWO "| Test ID |" rows in one issue
+    # (one hlrsvr-*, one hlrclnt-*, per holler-server#98's contract) -- every
+    # row becomes its own catalog entry, sharing this issue's other fields.
+    # (Restored 2026-09-07: a concurrent, unrelated PR (#250, cut before this
+    # fix originally landed in #249) squash-merged over it and silently
+    # reverted discover/field back to a single-Test-ID-row assumption --
+    # classic stale-branch-reverts-an-intervening-fix. #250's own batching
+    # feature below is untouched; it only reads discover's output.)
+    field_all(body, 'Test ID').map do |id|
+      {
+        issue: issue.number,
+        title: issue.title,
+        labels: issue.labels.map(&:name),
+        id: id,
+        applies: field(body, 'Applies to'),
+        group: field(body, 'Group'),
+        automation: field(body, 'Automation')
+      }
+    end
   end
 end
 
 def field(body, name)
-  line = body.lines.find { |l| l.strip.start_with?("| #{name} |") }
-  return nil unless line
+  field_all(body, name).first
+end
 
-  # "| Field | Value |" -> "Value" (trim whitespace, keep everything between
-  # the second and (last) closing pipe so a Value containing "|" inside code
-  # spans isn't accidentally truncated at the wrong pipe).
-  cells = line.strip.split('|').map(&:strip).reject(&:empty?)
-  cells[1..].join(' | ')
+def field_all(body, name)
+  body.lines.select { |l| l.strip.start_with?("| #{name} |") }.map do |line|
+    # "| Field | Value |" -> "Value" (trim whitespace, keep everything between
+    # the second and (last) closing pipe so a Value containing "|" inside code
+    # spans isn't accidentally truncated at the wrong pipe).
+    cells = line.strip.split('|').map(&:strip).reject(&:empty?)
+    cells[1..].join(' | ')
+  end
 end
 
 # ---------------------------------------------------------------------------
