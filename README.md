@@ -43,12 +43,17 @@ holler-server token mint --label laptop
 # 5. Still on the joining machine: `holler run` has no default sessions — every
 #    session is explicit, in a `--config` TOML file (see holler-client's README
 #    for the exact format). Without one, `run` connects but drives nothing, and
-#    every `say`/`interrupt` from here will fail `unknown_session`.
+#    every `say`/`interrupt`/`answer` from here will fail `unknown_session`.
 holler run --config sessions.toml
 
 # 6. Back here, see who's joined and talk to a session
 holler-server roster
 holler-server say <session> "hello"
+
+# 7. If the harness itself is asking a real question (e.g. an attach-mode
+#    OpenCode session's own `question`/permission tool) rather than replying
+#    with text, answer it directly instead of sending a new `say`:
+holler-server answer <session> "<option label or index>"
 ```
 
 `holler-server status`, `holler-server caps`, and `holler-server token list` are the other day-to-day operator commands; run any of them with `--help` for the full flag list.

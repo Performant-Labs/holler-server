@@ -9,11 +9,25 @@ backfilled with pre-decision history.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-07
+
 ### Enhancements
 
 - `holler-server answer <session> <choice>` control path (issue #382) — answer a
   question/permission currently blocking a session's turn, the same shape as `interrupt`
-  (a new `answer` wire message type, mirrored in `holler-client`).
+  (a new `answer` wire message type, mirrored in `holler-client`). Verified live
+  end-to-end against a real `opencode serve` instance and a real OpenCode `question`
+  tool call.
+
+### Known Issues
+
+- Spawn-mode (ACP) sessions cannot be answered yet — only attach-mode sessions support
+  it on the client side today.
+- Multi-question requests (more than one question per single request) aren't answerable
+  via a single `choice` argument.
+- The blocked state isn't yet surfaced in `roster`/`presence`/`status` — an operator
+  can't yet tell "blocked on a question" apart from "busy" without checking the
+  attached OpenCode instance directly.
 
 ## [0.1.0] - 2026-09-07
 
