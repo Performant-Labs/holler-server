@@ -49,4 +49,9 @@ Selection over the catalog composes across the independent axes. In Playwright t
 `test-grp-*` ≈ the test *describe-group* (where), `test-cat-*`/`test-tag-*` ≈ tags (why /
 open-ended property), and `Applies to` ≈ `--project`. The negative form (`--tag-invert`,
 Playwright `--grep-invert`) selects the *complement* of a tag — e.g. "everything except the
-`alters-db` cases".
+`alters-db` cases". `--applies` composes with all of them (Playwright's --grep ∧ --project
+pattern) and also scopes `start`. "Pending" means *no green recorded run yet
+for that case*: `exec`'s selection is catalog-scoped, so a no-flag `exec`
+selects every catalog case (the "all pending" default), and cases already
+green in a recorded run are still matched — a `run` skips them as up-to-date
+via the recorded state.
