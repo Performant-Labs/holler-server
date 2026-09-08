@@ -153,7 +153,7 @@ See [how server and client talk](docs/protocol/talk.md) for the interrupt and pr
 
 ## Status and license
 
-**`v0.1.1`** — latest tagged release. See [`CHANGELOG.md`](CHANGELOG.md) for what's new, and its
+**`v0.1.2`** — latest tagged release. See [`CHANGELOG.md`](CHANGELOG.md) for what's new, and its
 Known Issues section for real, currently-open gaps (interrupt/roster interaction between sibling
 sessions, `wss`/TLS not yet implemented, no Windows binary yet). See
 [`docs/releasing.md`](docs/releasing.md) for how releases are cut.
