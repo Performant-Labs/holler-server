@@ -52,9 +52,18 @@ holler-server say <session> "hello"
 
 # 7. If the harness itself is asking a real question (e.g. an attach-mode
 #    OpenCode session's own `question`/permission tool) rather than replying
-#    with text, answer it directly instead of sending a new `say`:
+#    with text, answer it directly instead of sending a new `say`. For a
+#    question, <choice> is the option's 0-based index or its exact label
+#    (case-insensitive); for a tool-use permission, it's `once`/`always`/
+#    `reject` (or an alias: `allow`/`approve`/`yes`/`y`, `deny`/`no`/`n`).
 holler-server answer <session> "<option label or index>"
 ```
+
+There's no roster/status signal yet that a session is sitting on an unanswered
+question — a blocked session just looks like a `say` that never replies. See
+[holler-client](https://github.com/Performant-Labs/holler-client)'s README for
+how a client detects and surfaces this on its own side, and this repo's
+[`CHANGELOG.md`](CHANGELOG.md) Known Issues for the exact current gap.
 
 `holler-server status`, `holler-server caps`, and `holler-server token list` are the other day-to-day operator commands; run any of them with `--help` for the full flag list.
 
@@ -144,7 +153,7 @@ See [how server and client talk](docs/protocol/talk.md) for the interrupt and pr
 
 ## Status and license
 
-**`v0.1.0`** — first tagged release. See [`CHANGELOG.md`](CHANGELOG.md) for what's new, and its
+**`v0.1.1`** — latest tagged release. See [`CHANGELOG.md`](CHANGELOG.md) for what's new, and its
 Known Issues section for real, currently-open gaps (interrupt/roster interaction between sibling
 sessions, `wss`/TLS not yet implemented, no Windows binary yet). See
 [`docs/releasing.md`](docs/releasing.md) for how releases are cut.
