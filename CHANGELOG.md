@@ -9,12 +9,21 @@ backfilled with pre-decision history.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-07
+
 ### Enhancements
 
 - `holler-server roster` now shows a `BLOCKED` column (issue #139), reflecting a new
   `session_blocked` wire message a client pushes live the moment a session's own
   question/permission status transitions — not just at the next connect/reconnect the way
   `presence` is. `roster --json` gains a matching `blocked` field.
+
+### Known Issues
+
+- A fresh connection can't supersede a dead one's still-held claim on a session name in
+  the roster, leaving that session unreachable until the stale claim ages out:
+  [#383](https://github.com/Performant-Labs/holler-server/issues/383) (related to, but a
+  distinct mechanism from, [#203](https://github.com/Performant-Labs/holler-server/issues/203)).
 
 ## [0.1.1] - 2026-09-07
 
