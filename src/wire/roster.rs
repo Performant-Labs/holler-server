@@ -167,6 +167,14 @@ struct RosterEntry {
     /// Issue #256: the OpenCode `ses_...` id an attach session is bound
     /// to, or `None` for spawn / an attach client that omitted it.
     harness_session_id: Option<String>,
+    /// Issue #139: whether the client's own driver currently reports this
+    /// session `Blocked` on a question/permission — pushed live via a
+    /// `session_blocked` frame (see [`Roster::set_blocked`]), not derived
+    /// from `last_seen`/`state_at` like connectivity. Reset to `false` on
+    /// every [`Roster::advertise_with_mode`] call (a fresh connect or
+    /// reconnect); a still-blocked session's own resync push (sent right
+    /// after `presence` on the client side) sets it back immediately.
+    blocked: bool,
 }
 
 impl RosterEntry {
@@ -198,6 +206,9 @@ pub struct RosterRow {
     pub mode: Option<String>,
     /// Issue #256: the attached OpenCode `ses_...` id, or `None`.
     pub harness_session_id: Option<String>,
+    /// Issue #139: whether this session is currently blocked on a
+    /// question/permission, as last pushed via `session_blocked`.
+    pub blocked: bool,
 }
 
 /// Advertising a session name already held by a **different**, still
@@ -301,6 +312,11 @@ impl Roster {
                 gone_now: false,
                 mode,
                 harness_session_id,
+                // Reset on every (re)advertise -- a still-blocked session's
+                // own resync `session_blocked` push (sent right after
+                // `presence` client-side) arrives immediately after and
+                // sets this back to true; see `RosterEntry::blocked`'s doc.
+                blocked: false,
             },
         );
         Ok(())
@@ -331,6 +347,19 @@ impl Roster {
             if entry.token_id == token_id {
                 entry.last_seen = now;
             }
+        }
+    }
+
+    /// Records a live `session_blocked` push (issue #139): the named
+    /// session's `Blocked` status, exactly as the client just reported it.
+    /// A no-op (not an error) for a session name the roster does not
+    /// know about — the same fail-open tolerance `presence`'s own
+    /// malformed-row handling already has, since this frame carries no
+    /// wire-level ack either.
+    pub fn set_blocked(&self, name: &str, blocked: bool) {
+        let mut entries = self.entries.lock().expect("roster mutex poisoned");
+        if let Some(entry) = entries.get_mut(name) {
+            entry.blocked = blocked;
         }
     }
 
@@ -405,6 +434,7 @@ impl Roster {
                 last_seen_ms_ago: now.saturating_duration_since(e.last_seen).as_millis(),
                 mode: e.mode.clone(),
                 harness_session_id: e.harness_session_id.clone(),
+                blocked: e.blocked,
             })
             .collect();
         rows.sort_by(|a, b| a.name.cmp(&b.name));
@@ -654,6 +684,68 @@ mod tests {
         let rows = roster.snapshot();
         assert_eq!(rows[0].client_id, "cli_2");
         assert_eq!(rows[0].state, RosterState::Connected);
+    }
+
+    #[test]
+    fn a_fresh_advertise_starts_not_blocked() {
+        let roster = Roster::new(tiny_config());
+        roster
+            .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
+            .unwrap();
+        assert!(!roster.snapshot()[0].blocked);
+    }
+
+    #[test]
+    fn set_blocked_updates_the_named_row_only() {
+        let roster = Roster::new(tiny_config());
+        roster
+            .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
+            .unwrap();
+        roster
+            .advertise("beta".into(), "opencode".into(), "tok_1", "cli_1")
+            .unwrap();
+
+        roster.set_blocked("alpha", true);
+
+        let rows = roster.snapshot();
+        let alpha = rows.iter().find(|r| r.name == "alpha").unwrap();
+        let beta = rows.iter().find(|r| r.name == "beta").unwrap();
+        assert!(alpha.blocked, "set_blocked must mark the named session");
+        assert!(!beta.blocked, "set_blocked must never affect a sibling session");
+
+        roster.set_blocked("alpha", false);
+        assert!(!roster.snapshot().iter().find(|r| r.name == "alpha").unwrap().blocked);
+    }
+
+    #[test]
+    fn set_blocked_on_an_unknown_session_is_a_no_op_not_a_panic() {
+        let roster = Roster::new(tiny_config());
+        roster
+            .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
+            .unwrap();
+        // A session name the roster has never heard of -- same fail-open
+        // tolerance `presence`'s own malformed-row handling has.
+        roster.set_blocked("nope", true);
+        assert!(!roster.snapshot()[0].blocked);
+    }
+
+    #[test]
+    fn re_advertise_resets_blocked_to_false() {
+        let roster = Roster::new(tiny_config());
+        roster
+            .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
+            .unwrap();
+        roster.set_blocked("alpha", true);
+        assert!(roster.snapshot()[0].blocked);
+
+        // A fresh (re)connect's own advertise resets this -- the client's
+        // own resync push (sent right after presence) is what sets it
+        // back to true for a session still genuinely blocked; this proves
+        // the reset half of that contract.
+        roster
+            .advertise("alpha".into(), "opencode".into(), "tok_1", "cli_1")
+            .unwrap();
+        assert!(!roster.snapshot()[0].blocked);
     }
 
     #[test]

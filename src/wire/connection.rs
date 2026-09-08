@@ -22,7 +22,7 @@ use serde::Deserialize;
 use crate::debug::{self, redact, DebugConfig};
 use crate::proto::{
     self, AuthBody, Body, DecodeError, Envelope, JoinBody, JoinOkBody, MessageType, PresenceBody,
-    QueryBody, CODE_JOIN_FAILED, CODE_UNAUTHENTICATED, CODE_UNKNOWN_TYPE,
+    QueryBody, SessionBlockedBody, CODE_JOIN_FAILED, CODE_UNAUTHENTICATED, CODE_UNKNOWN_TYPE,
 };
 use crate::token::TokenStore;
 
@@ -618,6 +618,18 @@ async fn handle_frame(
                     }
                 }
             }
+        }
+        Body::SessionBlocked(SessionBlockedBody { session, blocked }) => {
+            // No ack, no wire error for an unknown session name (issue
+            // #139) -- same fail-open tolerance `presence`'s own
+            // malformed-row handling has, since this frame carries no
+            // response either. `holler-server roster` reads this back via
+            // `Roster::snapshot`'s `blocked` column.
+            trace(
+                ctx,
+                &format!("session_blocked: {session} blocked={blocked}"),
+            );
+            ctx.roster.set_blocked(session, *blocked);
         }
         Body::Reply(reply_body) => {
             // A client answering a `prompt` this server sent (issue #33:

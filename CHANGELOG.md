@@ -9,6 +9,13 @@ backfilled with pre-decision history.
 
 ## [Unreleased]
 
+### Enhancements
+
+- `holler-server roster` now shows a `BLOCKED` column (issue #139), reflecting a new
+  `session_blocked` wire message a client pushes live the moment a session's own
+  question/permission status transitions — not just at the next connect/reconnect the way
+  `presence` is. `roster --json` gains a matching `blocked` field.
+
 ## [0.1.1] - 2026-09-07
 
 ### Enhancements

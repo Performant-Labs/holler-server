@@ -8,6 +8,7 @@ use holler_server::proto::{
     error_for, error_for_unknown_type, decode, encode, AckBody, AnswerBody, AuthBody, Body,
     DecodeError, Envelope, ErrorBody, HelloBody, HelloSession, InterruptBody, MessageType,
     PingBody, PongBody, PresenceBody, PromptBody, QueryBody, QueryOkBody, ReplyBody, Role,
+    SessionBlockedBody,
 };
 use serde_json::{json, Value};
 
@@ -164,6 +165,13 @@ fn round_trip_representative_bodies() {
         }),
     );
 
+    let session_blocked = make_envelope(
+        MessageType::SessionBlocked,
+        "01JSESSIONBLOCKED000000000",
+        "tok_7f3a",
+        Body::SessionBlocked(SessionBlockedBody { session: "alpha".into(), blocked: true }),
+    );
+
     // auth — the spec §4 first frame.
     let auth = Envelope {
         v: 1,
@@ -189,6 +197,7 @@ fn round_trip_representative_bodies() {
         (&pong, "pong"),
         (&ack, "ack"),
         (&presence, "presence"),
+        (&session_blocked, "session_blocked"),
         (&auth, "auth"),
     ] {
         let encoded = encode(envelope).expect("encode should not fail");
