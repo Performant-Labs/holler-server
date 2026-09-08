@@ -21,7 +21,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # A docs-only PR (README/CHANGELOG/docs/** with no source, test, or
+      # CI-config change) doesn't need a real Rust build/test cycle -- this
+      # keeps the job itself as a REQUIRED check that still runs and passes
+      # quickly, rather than using `paths-ignore` on the workflow trigger
+      # (which would make GitHub never create the check at all, and a
+      # required-but-never-created check permanently blocks merging).
+      - name: Detect docs-only changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'src/**'
+              - 'tests/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'scripts/**'
+              - '.github/workflows/**'
+
       - name: Install Rust
+        if: steps.filter.outputs.code == 'true'
         run: rustup toolchain install stable
         shell: pwsh
 
@@ -29,6 +49,7 @@ jobs:
       # alone (not `cargo test`, which also builds the lib) so CI goes
       # red as early as possible if the runner ever swallows a failure.
       - name: Canary (fail-fast)
+        if: steps.filter.outputs.code == 'true'
         run: cargo test --test wire_selftest
         shell: pwsh
 
@@ -36,19 +57,23 @@ jobs:
       # Mirrors the canary step so a broken #40 harness fails CI on its own,
       # rather than only surfacing in the full suite.
       - name: Wire harness scaffold (issue #40)
+        if: steps.filter.outputs.code == 'true'
         run: cargo test --test first_talk
         shell: pwsh
 
       - name: Full test suite
+        if: steps.filter.outputs.code == 'true'
         run: cargo test
         shell: pwsh
 
       # Issue #304: selection logic is dependency-free (stdlib only) so it
       # runs on the runners' preinstalled Ruby (2.6 on macOS) -- no gem install.
       - name: test-run.rb selection (issue #304)
+        if: steps.filter.outputs.code == 'true'
         run: ruby scripts/test_selection_test.rb
         shell: pwsh
 
       - name: Clippy
+        if: steps.filter.outputs.code == 'true'
         run: cargo clippy --all-targets -- -D warnings
         shell: pwsh
