@@ -253,6 +253,9 @@ pub struct RosterRowDoc {
     pub mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub harness_session_id: Option<String>,
+    /// Issue #139: whether this session is currently blocked on a
+    /// question/permission, as last pushed via `session_blocked`.
+    pub blocked: bool,
 }
 
 // ---------------------------------------------------------------------
@@ -425,6 +428,7 @@ async fn handle_control_conn(
                         last_seen_ms: r.last_seen_ms_ago,
                         mode: r.mode,
                         harness_session_id: r.harness_session_id,
+                        blocked: r.blocked,
                     })
                     .collect();
                 serde_json::to_string(&rows).expect("roster rows always serialize")

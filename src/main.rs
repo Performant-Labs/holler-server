@@ -466,7 +466,7 @@ fn print_roster_table(rows: &[RosterRowDoc]) {
     // per the issue; this does not add a new addressing scheme, SESSION
     // (the Holler session name) is still the only thing `say`/`interrupt`
     // route by.
-    const HEADERS: [&str; 7] = [
+    const HEADERS: [&str; 8] = [
         "SESSION",
         "HARNESS",
         "CLIENT_ID",
@@ -474,6 +474,7 @@ fn print_roster_table(rows: &[RosterRowDoc]) {
         "LAST_SEEN",
         "MODE",
         "HARNESS_ID",
+        "BLOCKED",
     ];
     let last_seen_cells: Vec<String> = rows
         .iter()
@@ -487,12 +488,20 @@ fn print_roster_table(rows: &[RosterRowDoc]) {
         .iter()
         .map(|r| r.harness_session_id.as_deref().unwrap_or("-"))
         .collect();
-    let rows_cells: Vec<[&str; 7]> = rows
+    // Issue #139: "blocked"/"-" rather than "true"/"false" -- a blank
+    // dash for the overwhelmingly common not-blocked case reads faster in
+    // a table an operator is scanning for the one session that needs them.
+    let blocked_cells: Vec<&str> = rows
+        .iter()
+        .map(|r| if r.blocked { "blocked" } else { "-" })
+        .collect();
+    let rows_cells: Vec<[&str; 8]> = rows
         .iter()
         .zip(last_seen_cells.iter())
         .zip(mode_cells.iter())
         .zip(harness_id_cells.iter())
-        .map(|(((r, last_seen), mode), harness_id)| {
+        .zip(blocked_cells.iter())
+        .map(|((((r, last_seen), mode), harness_id), blocked)| {
             [
                 r.name.as_str(),
                 r.harness.as_str(),
@@ -501,6 +510,7 @@ fn print_roster_table(rows: &[RosterRowDoc]) {
                 last_seen.as_str(),
                 mode,
                 harness_id,
+                blocked,
             ]
         })
         .collect();
@@ -512,7 +522,7 @@ fn print_roster_table(rows: &[RosterRowDoc]) {
         }
     }
 
-    let print_row = |cells: &[&str; 7]| {
+    let print_row = |cells: &[&str; 8]| {
         let line: Vec<String> = cells
             .iter()
             .enumerate()

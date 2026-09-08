@@ -2,7 +2,7 @@
 //!
 //! Canonical spec: `docs/protocol/v1.md`. One JSON object per WebSocket
 //! text frame: [`Envelope`] wraps a `Body` that is an extensible enum
-//! over the 15 v1 message types.
+//! over the 16 v1 message types.
 
 use serde::de::Error as _;
 use serde::Deserializer;
@@ -97,6 +97,12 @@ pub enum MessageType {
     /// client → server: session advertise + heartbeat.
     #[serde(rename = "presence")]
     Presence,
+    /// client → server: a session's `Blocked` status just transitioned,
+    /// in either direction (issue #139 — an extension beyond the
+    /// original v1 vocabulary, the same way `answer` was). Pushed live,
+    /// unlike `presence` (connect-time only).
+    #[serde(rename = "session_blocked")]
+    SessionBlocked,
     /// both: bound-socket aliveness.
     #[serde(rename = "ping")]
     Ping,
@@ -153,6 +159,7 @@ pub enum Body {
     Interrupt(InterruptBody),
     Answer(AnswerBody),
     Presence(PresenceBody),
+    SessionBlocked(SessionBlockedBody),
     Ping(PingBody),
     Pong(PongBody),
     Ack(AckBody),
@@ -300,6 +307,17 @@ pub struct PresenceBody {
     pub sessions: Vec<Value>,
 }
 
+/// `session_blocked` body (issue #139, not in the original v1 spec — an
+/// extension the same way `answer` was): the named session's `Blocked`
+/// status just changed. Unlike `presence`, this is pushed the moment the
+/// client observes the transition, in either direction, so
+/// `holler-server roster` can reflect it without waiting for a reconnect.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct SessionBlockedBody {
+    pub session: String,
+    pub blocked: bool,
+}
+
 /// `ping` body (spec §10): empty or `{hostname}`.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct PingBody {
@@ -347,7 +365,7 @@ pub enum DecodeError {
     /// Envelope `v` is present but not `1` (spec §2: a v1 server
     /// requires `v == 1`; no silent downgrade).
     UnsupportedVersion(u32),
-    /// Envelope `type` is not one of the 14 v1 types (spec §3).
+    /// Envelope `type` is not one of the 16 v1 types (spec §3).
     UnknownType,
     /// Frame is not valid JSON, or JSON that does not fit the
     /// envelope schema. `serde_json::Error` is not `Clone`, so we
@@ -386,7 +404,7 @@ pub fn encode(envelope: &Envelope) -> serde_json::Result<String> {
 /// tagging cannot reach.
 ///
 /// * A frame that is not JSON is [`DecodeError::Malformed`].
-/// * A frame whose `type` is not one of the 14 v1 types is
+/// * A frame whose `type` is not one of the 16 v1 types is
 ///   [`DecodeError::UnknownType`] (spec §3: "Do not ignore it as
 ///   success.").
 /// * A frame whose JSON is valid and `type` is known, but whose `v` is
@@ -524,7 +542,7 @@ fn parse_envelope(raw: &str) -> Result<ParsedEnvelope, DecodeError> {
 
 impl MessageType {
     /// Map a wire `type` string to a [`MessageType`]; `None` if the
-    /// string is not one of the 14 v1 types.
+    /// string is not one of the 16 v1 types.
     fn from_wire(s: &str) -> Option<Self> {
         match s {
             "join" => Some(Self::Join),
@@ -538,6 +556,7 @@ impl MessageType {
             "interrupt" => Some(Self::Interrupt),
             "answer" => Some(Self::Answer),
             "presence" => Some(Self::Presence),
+            "session_blocked" => Some(Self::SessionBlocked),
             "ping" => Some(Self::Ping),
             "pong" => Some(Self::Pong),
             "ack" => Some(Self::Ack),
@@ -561,6 +580,7 @@ impl MessageType {
             Self::Interrupt => "interrupt",
             Self::Answer => "answer",
             Self::Presence => "presence",
+            Self::SessionBlocked => "session_blocked",
             Self::Ping => "ping",
             Self::Pong => "pong",
             Self::Ack => "ack",
@@ -594,6 +614,7 @@ impl Serialize for Body {
             Body::Interrupt(b) => b.serialize(serializer),
             Body::Answer(b) => b.serialize(serializer),
             Body::Presence(b) => b.serialize(serializer),
+            Body::SessionBlocked(b) => b.serialize(serializer),
             Body::Ping(b) => b.serialize(serializer),
             Body::Pong(b) => b.serialize(serializer),
             Body::Ack(b) => b.serialize(serializer),
@@ -642,6 +663,9 @@ impl Body {
                 serde_json::from_value(body).map_err(|e| malformed(e.to_string()))?,
             )),
             MessageType::Presence => Ok(Body::Presence(
+                serde_json::from_value(body).map_err(|e| malformed(e.to_string()))?,
+            )),
+            MessageType::SessionBlocked => Ok(Body::SessionBlocked(
                 serde_json::from_value(body).map_err(|e| malformed(e.to_string()))?,
             )),
             MessageType::Ping => Ok(Body::Ping(

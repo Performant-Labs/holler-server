@@ -155,6 +155,13 @@ fn presence_envelope(token_id: &str, sessions: Value) -> Value {
     })
 }
 
+fn session_blocked_envelope(token_id: &str, session: &str, blocked: bool) -> Value {
+    json!({
+        "v": 1, "type": "session_blocked", "id": "id-session-blocked", "ts": "2026-09-05T00:00:00Z",
+        "from": token_id, "body": { "session": session, "blocked": blocked }
+    })
+}
+
 fn client_hello_envelope(token_id: &str, client_id: &str) -> Value {
     json!({
         "v": 1, "type": "hello", "id": "id-hello", "ts": "2026-09-05T00:00:00Z",
@@ -1514,6 +1521,63 @@ fn spawn_answer_responder(
             }
         }
     })
+}
+
+#[test]
+fn session_blocked_updates_the_roster_and_clears_on_a_fresh_advertise() {
+    let env = Env::new();
+    let (token_id, secret) = mint(&env, "kiwi");
+    let (client_id, credential) = redeem(&env, &token_id, &secret, "kiwi.local");
+    let server = ServerProcess::spawn(&env);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(server.url())
+            .await
+            .unwrap();
+        send_json(&mut ws, &auth_envelope(&token_id, &credential)).await;
+        let _server_hello = recv_json(&mut ws).await;
+        send_json(&mut ws, &client_hello_envelope(&token_id, &client_id)).await;
+        send_json(
+            &mut ws,
+            &presence_envelope(
+                &token_id,
+                json!([
+                    { "name": "alpha", "harness": "opencode" },
+                    { "name": "beta", "harness": "opencode" }
+                ]),
+            ),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        send_json(&mut ws, &session_blocked_envelope(&token_id, "alpha", true)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let out = env.cmd().args(["roster", "--json"]).output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let rows: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let alpha = rows.as_array().unwrap().iter().find(|r| r["name"] == "alpha").unwrap();
+        let beta = rows.as_array().unwrap().iter().find(|r| r["name"] == "beta").unwrap();
+        assert_eq!(alpha["blocked"], true, "{rows:?}");
+        assert_eq!(beta["blocked"], false, "session_blocked must not leak to a sibling; {rows:?}");
+
+        // Clearing it (a real `answer` completing) reports blocked:false.
+        send_json(&mut ws, &session_blocked_envelope(&token_id, "alpha", false)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let out = env.cmd().args(["roster", "--json"]).output().unwrap();
+        let rows: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let alpha = rows.as_array().unwrap().iter().find(|r| r["name"] == "alpha").unwrap();
+        assert_eq!(alpha["blocked"], false, "{rows:?}");
+
+        // A session name the roster has never heard of is a no-op, not a
+        // wire error or a crash -- same fail-open tolerance `presence`'s
+        // own malformed-row handling already has.
+        send_json(&mut ws, &session_blocked_envelope(&token_id, "nope", true)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let out = env.cmd().args(["roster", "--json"]).output().unwrap();
+        assert!(out.status.success(), "an unknown session_blocked target must not disrupt the connection: {out:?}");
+    });
 }
 
 #[test]

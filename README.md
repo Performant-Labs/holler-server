@@ -59,11 +59,11 @@ holler-server say <session> "hello"
 holler-server answer <session> "<option label or index>"
 ```
 
-There's no roster/status signal yet that a session is sitting on an unanswered
-question — a blocked session just looks like a `say` that never replies. See
-[holler-client](https://github.com/Performant-Labs/holler-client)'s README for
-how a client detects and surfaces this on its own side, and this repo's
-[`CHANGELOG.md`](CHANGELOG.md) Known Issues for the exact current gap.
+`holler-server roster` shows a `BLOCKED` column (issue #139) for exactly this — a
+session sitting on an unanswered question or permission is marked `blocked` there the
+moment it happens, not just at the next reconnect. See
+[holler-client](https://github.com/Performant-Labs/holler-client)'s README for how a
+client detects the block and pushes that status live.
 
 `holler-server status`, `holler-server caps`, and `holler-server token list` are the other day-to-day operator commands; run any of them with `--help` for the full flag list.
 
